@@ -187,10 +187,13 @@ def _check_classify_operand():
 
 
 def load_apk(path):
-    """Путь к APK -> androguard Analysis (dx). Долгая операция (~130с на
-    130MB multi-dex APK) — вызывать один раз и переиспользовать dx."""
-    _, _, dx = AnalyzeAPK(str(path))
-    return dx
+    """Путь к APK -> (APK, Analysis dx). Долгая операция (~130с на 130MB
+    multi-dex APK) — вызывать один раз и переиспользовать оба объекта.
+    APK нужен для идентичности сборки в отчёте (пакет/versionName/
+    versionCode из манифеста, который androguard и так уже распарсил
+    внутри AnalyzeAPK — второй проход по APK не нужен)."""
+    apk, _, dx = AnalyzeAPK(str(path))
+    return apk, dx
 
 
 def _fqcn(descriptor):
@@ -744,6 +747,11 @@ def _check_report():
     txt = report(recs)
     assert "guard_count" in txt and "no_caller" in txt.lower()
     assert "1 стражей: 1" in txt  # распределение: один reached-ключ с 1 стражем
+    # fix round 1: meta (пакет/версия) должна попасть в шапку — паритет сборки
+    # со static+dynamic, как в diff.py (Spec §4)
+    meta = {"package": "p", "versionName": "1.0", "versionCode": "42"}
+    txt_meta = report(recs, meta=meta)
+    assert "Приложение: p versionName=1.0 versionCode=42" in txt_meta
     # Ruling-H: топ источников — реальный guard входит, coroutine-флагованный — нет
     top_section = txt.split("Топ источников")[1].split("\n\n")[0]
     assert "S->isLoggedIn()Z" in top_section
@@ -770,7 +778,7 @@ def main():
     if not (args.hidden and args.apk):
         ap.error("нужны --hidden и --apk")
     keys = load_hidden(args.hidden)
-    dx = load_apk(args.apk)
+    apk_obj, dx = load_apk(args.apk)
     records = run(dx, keys)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -781,11 +789,18 @@ def main():
                 # страхуемся от нежелательных не-JSON полей при апгрейде схемы
                 f.write(json.dumps({k: v for k, v in r.items() if k != "ma"},
                                    ensure_ascii=False) + "\n")
-    txt = report(records)
+    # Spec §4: паритет сборки со static+dynamic (как diff.py) — пакет/версия
+    # из манифеста, который androguard уже распарсил внутри load_apk (без
+    # повторного полного прохода по APK).
+    meta = {"package": apk_obj.get_package(),
+            "versionName": apk_obj.get_androidversion_name(),
+            "versionCode": apk_obj.get_androidversion_code()}
+    txt = report(records, meta=meta)
     print(txt)
     if args.out:
-        Path(str(args.out).replace(".jsonl", ".report.txt")).write_text(txt, encoding="utf-8")
-        print(f"\n→ {args.out}", file=sys.stderr)
+        report_path = args.out.with_suffix(".report.txt")
+        report_path.write_text(txt, encoding="utf-8")
+        print(f"\n→ {args.out}\n→ {report_path}", file=sys.stderr)
 
 
 def _selfcheck(apk=None):
@@ -794,7 +809,7 @@ def _selfcheck(apk=None):
     _check_walk_predicates()
     _check_report()
     if apk:
-        dx = load_apk(apk)
+        _, dx = load_apk(apk)  # APK-объект здесь не нужен, только dx
         _check_androguard(dx)  # уже принимает dx (Ruling-C: без повторной загрузки APK)
         _check_slice_key(dx)
     print("selfcheck ok")
