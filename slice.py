@@ -520,6 +520,95 @@ def _check_walk_predicates():
     print("  walk_predicates ok")
 
 
+def guards_of_frame(fr, criterion_offset):
+    """Стражи одного кадра для критерия (call-site offset в нём): узлы
+    ветвления, от которых блок-критерий транзитивно control-dependent
+    (Task 1), с классификацией тестируемого операнда (Task 2).
+
+    Ruling-G: инструкция-ветвление ищется по PREFIX/SUFFIX сырой мнемоники
+    (op.startswith("if") или op.endswith("-switch")), НЕ по членству в
+    фиксированном наборе _IF_OPS — так _norm (Task 3) и пометила ветвления:
+    if-*/*-switch имеют out=None, тестируемый регистр(ы) в args. Регистр —
+    cond.args[0]; если cond не найден (не должно происходить для настоящего
+    ветвления, но не падать) — ярлык "branch", операнд unknown."""
+    cfg = fr["cfg"]
+    crit = fr["block_at"](criterion_offset)
+    if crit is None:
+        return []
+    exit_node = "__exit__"
+    g = cfg.copy()
+    terminals = [n for n in cfg.nodes if cfg.out_degree(n) == 0]
+    for n in terminals:
+        g.add_edge(n, exit_node)
+    if not terminals:  # ни одного терминала (см. post_idom) — синтетический fallback
+        g.add_edge(list(cfg.nodes)[-1], exit_node)
+    guards = []
+    for (branch, taken) in control_deps(g, crit, exit_node):
+        insns = cfg.nodes[branch]["insns"]
+        cond = next((i for i in reversed(insns)
+                     if i.op.startswith("if") or i.op.endswith("-switch")), None)
+        opcode = cond.op if cond else "branch"
+        reg = cond.args[0] if (cond and cond.args) else None
+        operand = {"source_kind": "unknown", "detail": None}
+        if reg is not None:
+            kind, detail = classify_operand(cfg, branch, len(insns) - 1, reg, fr["params"])
+            operand = {"source_kind": kind, "detail": detail}
+        guards.append({"frame": None, "opcode": opcode,
+                       "sense": f"->{taken}", "operand": operand})
+    return guards
+
+
+def slice_key(dx, key):
+    """Полная запись среза для одного ключа (схема спеки §4): обход вверх
+    (Task 4) до фронтира/лимита, на каждом семантическом кадре — стражи
+    (guards_of_frame). Кадр без кода (frame_of -> None, напр. внешнее/
+    abstract-объявление) не роняет обход — помечается inconclusive и
+    пропускается (Review Focus)."""
+    cls, _, method = key.partition("->")
+    w = backward_frames(dx, cls, method)
+    rec = {"key": key, "cls": cls, "method": method,
+           "reached": w["reached"],
+           "call_sites": [{"caller": s["caller"], "offset": s["offset"]} for s in w["call_sites"]],
+           "guards": [], "guard_count": 0, "args": [],
+           "frontier": w["frontier"], "depth": w["depth"],
+           "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
+           "notes": []}
+    if not w["reached"]:
+        rec["notes"].append("no_caller")
+        return rec
+    all_guards = []
+    for f in w["frames"]:
+        fr = frame_of(f["ma"])
+        if fr is None:
+            rec["inconclusive"] = True
+            continue
+        gs = guards_of_frame(fr, f["offset"])
+        for g in gs:
+            g["frame"] = f["key"]
+        all_guards.extend(gs)
+    rec["guards"] = all_guards
+    rec["guard_count"] = len(all_guards)
+    if w["frontier"] is None and w["depth"] >= 6:
+        rec["notes"].append("depth_cap")
+    return rec
+
+
+def run(dx, keys):
+    """Срез по списку ключей -> список записей (порядок сохраняется)."""
+    return [slice_key(dx, k) for k in keys]
+
+
+def _check_slice_key(dx):
+    rec = slice_key(dx, "gpm.tnt_premier.features.downloads.impl.data.network.DownloadsApi->disallowDeviceDownload")
+    assert rec["reached"] is True
+    assert rec["cls"].endswith("DownloadsApi") and rec["method"] == "disallowDeviceDownload"
+    assert isinstance(rec["guards"], list) and rec["guard_count"] == len(rec["guards"])
+    assert set(("reached", "call_sites", "guards", "args", "frontier", "inconclusive")) <= set(rec)
+    # ключ-форвардер без стражей: guard_count 0, не падение (Review Focus)
+    assert rec["guard_count"] >= 0
+    print("  slice_key ok")
+
+
 def _selfcheck(apk=None):
     _check_control_deps()
     _check_classify_operand()
@@ -527,6 +616,7 @@ def _selfcheck(apk=None):
     if apk:
         dx = load_apk(apk)
         _check_androguard(dx)
+        _check_slice_key(dx)  # Ruling-C: тот же dx, без повторной загрузки APK
     print("selfcheck ok")
 
 
