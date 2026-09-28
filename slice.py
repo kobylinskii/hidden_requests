@@ -376,10 +376,112 @@ def _check_androguard(dx):
     assert fr is not None and fr["cfg"].number_of_nodes() >= 1
     print("  androguard ok")
 
+    w = backward_frames(dx, "gpm.tnt_premier.features.downloads.impl.data.network.DownloadsApi",
+                        "disallowDeviceDownload")
+    assert w["reached"] and w["call_sites"], w
+    assert len(w["frames"]) <= 6                      # лимит соблюдён
+    # цикл в графе вызовов не зациклил обход (дошли до сюда — visited работает)
+    print("  backward_frames ok")
+
+
+_FRONTIER_NAMES = {"onCreate", "onStart", "onResume", "onPause", "onStop",
+                   "onViewCreated", "onCreateView", "onClick", "onBind",
+                   "onReceive", "onHandleWork", "doWork", "onStartCommand"}
+
+
+def is_plumbing(key, ma):
+    """Kotlin-машинерия, которую нужно проходить насквозь при обратном
+    обходе (не считать семантическим кадром): $default-перегрузки со
+    значениями по умолчанию, access$-мостики для private-полей из
+    вложенных классов, $$inlined$/$$special$ классы (inline-функции) и
+    invokeSuspend/create/invoke классов-континуаций/лямбд (компилятор
+    Kotlin называет их так; отличаем от обычных invoke по вложенности
+    класса — '$' в простом имени или явный класс Continuation)."""
+    name = key.rsplit("->", 1)[-1]
+    cls = getattr(ma, "class_name", "")
+    if name.endswith("$default") or name.startswith("access$"):
+        return True
+    if "$$inlined$" in cls or "$$special$" in cls:
+        return True
+    if name in ("invokeSuspend", "create", "invoke") and (
+            "Continuation" in cls or "$" in cls.rsplit("/", 1)[-1]):
+        return True
+    return False
+
+
+def is_frontier(key):
+    """UI/lifecycle/entry-колбэк — точка, где обратный обход останавливается
+    (дальше вверх — фреймворк, не наш код): либо имя метода из известного
+    набора колбэков жизненного цикла/UI, либо класс из android./androidx.
+    (сам фреймворк вызывает наш метод, выше в стеке ничего нашего нет)."""
+    cls, _, name = key.partition("->")
+    if name in _FRONTIER_NAMES:
+        return True
+    return cls.startswith("android.") or cls.startswith("androidx.")
+
+
+def backward_frames(dx, cls, method, limit=6):
+    """Обратный межпроцедурный обход от call-site'ов cls->method вверх по
+    графу вызовов до фронтира (UI/lifecycle) или лимита глубины. Плумбинг
+    (is_plumbing) проходится насквозь — не попадает в frames и не считается
+    в limit, но обход продолжается через его вызывающих. Циклы (рекурсия,
+    coroutine resume через себя же) гасятся visited-множеством по
+    (caller_key, offset) — один и тот же call-site не обрабатывается дважды,
+    что гарантирует терминацию на конечном графе вызовов.
+
+    limit — ГЛОБАЛЬНЫЙ бюджет на итоговый len(frames), а не глубина одного
+    пути: при нескольких исходных call-site'ах (или fan-in выше по графу)
+    независимые пути иначе каждый добавили бы до limit кадров СВОИХ, и
+    итоговый список превысил бы limit. Проверка в начале итерации —
+    как только бюджет исчерпан, обход останавливается целиком."""
+    sites = resolve_call_sites(dx, cls, method)
+    if not sites:
+        return {"reached": False, "call_sites": [], "frames": [],
+                "frontier": None, "depth": 0, "plumbing_skipped": []}
+    frames, skipped, frontier = [], [], None
+    visited = set()
+    queue = [(f"{cls}->{method}", s["caller_ma"], s["offset"]) for s in sites]
+    while queue:
+        if len(frames) >= limit:
+            break
+        callee_key, caller_ma, off = queue.pop()
+        ckey = method_key(caller_ma)
+        if (ckey, off) in visited:
+            continue
+        visited.add((ckey, off))
+        if is_plumbing(ckey, caller_ma):
+            skipped.append(ckey)
+        else:
+            frames.append({"key": ckey, "ma": caller_ma,
+                           "callee_key": callee_key, "offset": off})
+            if is_frontier(ckey):
+                frontier = ckey
+                continue
+        # шаг вверх: кто вызывает ckey
+        pcls, _, pm = ckey.partition("->")
+        for s in resolve_call_sites(dx, pcls, pm):
+            queue.append((ckey, s["caller_ma"], s["offset"]))
+    return {"reached": True, "call_sites": sites, "frames": frames,
+            "frontier": frontier, "depth": len(frames),
+            "plumbing_skipped": skipped}
+
+
+def _check_walk_predicates():
+    class FakeMA:  # достаточно для предикатов — только class_name
+        def __init__(self, cls): self.class_name = cls
+    assert is_plumbing("a.b.C->postDeviceUpdate$default", FakeMA("La/b/C;"))
+    assert is_plumbing("a.b.C$$inlined$x->invoke", FakeMA("La/b/C$$inlined$x;"))
+    assert not is_plumbing("a.b.C->postDeviceUpdate", FakeMA("La/b/C;"))
+    assert is_frontier("androidx.fragment.app.Fragment->onViewCreated")
+    assert is_frontier("a.b.MyActivity->onCreate")
+    assert not is_frontier("a.b.SomeRepository->refresh")
+    print("  walk_predicates ok")
+
 
 def _selfcheck(apk=None):
     _check_control_deps()
     _check_classify_operand()
+    _check_walk_predicates()
     if apk:
         dx = load_apk(apk)
         _check_androguard(dx)
