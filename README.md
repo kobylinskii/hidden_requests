@@ -25,7 +25,7 @@ BFScan печатает ровно тот же ключ. Эвристики не
 * rooted-устройство или эмулятор, `adb` видит его;
 * `frida-server` на устройстве **той же версии**, что `frida` на хосте
   (здесь: 16.7.19, окружение `/home/solidgroup/SolidLab/frida-env`);
-* `java` — для BFScan (`~/hidden_requests/requests/BFScan/target/BFScan-3.1.4.jar`, переопределяется `BFSCAN_JAR`).
+* `java` — для BFScan (`BFScan/target/BFScan-3.1.4.jar` — локальный клон https://github.com/BlackFan/BFScan, не в git; переопределяется `BFSCAN_JAR`).
 
 ```bash
 adb shell "su -c 'setsid /data/local/tmp/frida-server -D'"
