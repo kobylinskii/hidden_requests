@@ -16,7 +16,7 @@ set -euo pipefail
 
 APK=${1:?укажите путь к apk}
 OUT=${2:-${APK%.apk}_methods.md}
-JAR="$(dirname "$0")/../requests/BFScan/target/BFScan-3.1.4.jar"
+JAR=${BFSCAN_JAR:-$HOME/hidden_requests/requests/BFScan/target/BFScan-3.1.4.jar}
 
 [ -f "$JAR" ] || { echo "нет $JAR — соберите BFScan (mvn package)" >&2; exit 1; }
 

@@ -9,7 +9,7 @@ APK ──BFScan──> *_methods.md ─┐
 APK ──trace.py+hook.js──> *.dynamic.jsonl ─┘
 ```
 
-Отличие от `../compare.py` (курсовая): там статика и динамика сводились нечётким
+Отличие от `~/hidden_requests/compare.py` (курсовая): там статика и динамика сводились нечётким
 сопоставлением URL-путей со скорингом и ~10% погрешности. Здесь сопоставление
 **точное по ключу `класс->метод`**: Retrofit строит реализацию API-интерфейса
 через `java.lang.reflect.Proxy`, поэтому во Frida доступен сам объект `Method`, а
@@ -25,7 +25,7 @@ BFScan печатает ровно тот же ключ. Эвристики не
 * rooted-устройство или эмулятор, `adb` видит его;
 * `frida-server` на устройстве **той же версии**, что `frida` на хосте
   (здесь: 16.7.19, окружение `/home/solidgroup/SolidLab/frida-env`);
-* `java` — для BFScan (`../requests/BFScan/target/BFScan-3.1.4.jar`).
+* `java` — для BFScan (`~/hidden_requests/requests/BFScan/target/BFScan-3.1.4.jar`, переопределяется `BFSCAN_JAR`).
 
 ```bash
 adb shell "su -c 'setsid /data/local/tmp/frida-server -D'"
