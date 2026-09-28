@@ -468,10 +468,12 @@ def backward_frames(dx, cls, method, limit=6):
     sites = resolve_call_sites(dx, cls, method)
     if not sites:
         return {"reached": False, "call_sites": [], "frames": [],
-                "frontier": None, "depth": 0, "plumbing_skipped": []}
+                "frontier": None, "depth": 0, "plumbing_skipped": [],
+                "depth_capped": False}
     frames, skipped, frontier = [], [], None
     visited = set()
     max_depth = 0
+    depth_capped = False  # True, если ХОТЬ ОДИН путь упёрся в limit (OR по путям)
     # очередь: (callee_key, caller_ma, offset, depth) — depth путевой (per-path)
     queue = [(f"{cls}->{method}", s["caller_ma"], s["offset"], 0) for s in sites]
     while queue:
@@ -492,6 +494,7 @@ def backward_frames(dx, cls, method, limit=6):
                 continue  # путь дошёл до фронтира — выше по нему не поднимаемся
             depth += 1
             if depth >= limit:
+                depth_capped = True
                 continue  # этот путь упёрся в лимит глубины
         # шаг вверх: кто вызывает ckey
         pcls, _, pm = ckey.partition("->")
@@ -499,7 +502,7 @@ def backward_frames(dx, cls, method, limit=6):
             queue.append((ckey, s["caller_ma"], s["offset"], depth))
     return {"reached": True, "call_sites": sites, "frames": frames,
             "frontier": frontier, "depth": max_depth,
-            "plumbing_skipped": skipped}
+            "plumbing_skipped": skipped, "depth_capped": depth_capped}
 
 
 def _check_walk_predicates():
@@ -554,8 +557,40 @@ def guards_of_frame(fr, criterion_offset):
             kind, detail = classify_operand(cfg, branch, len(insns) - 1, reg, fr["params"])
             operand = {"source_kind": kind, "detail": detail}
         guards.append({"frame": None, "opcode": opcode,
-                       "sense": f"->{taken}", "operand": operand})
+                       "sense": f"->{taken}", "operand": operand, "notes": []})
     return guards
+
+
+_COROUTINE_FRAME_METHODS = {"invokeSuspend", "invoke", "create"}
+
+
+def _is_coroutine_state_guard(guard):
+    """Ruling-H (fix round 1, §5.3): страж — диспетчер state-machine корутины
+    (label/захваченный локал continuation), а не реальный activation guard,
+    если ОБА условия верны:
+      - рамка страж — invokeSuspend/invoke/create (машинерия Kotlin-continuation/
+        лямбды; матчим по ИМЕНИ метода, не по классу — класс может быть
+        обфусцирован, имя метода переживает обфускацию);
+      - тестируемый операнд — field, и владелец поля (класс перед '->' в
+        detail вида 'Lpkg/Cls;->name TYPE') совпадает с классом самой рамки
+        (self-field, не поле/вызов ДРУГОГО объекта).
+    Реальные guards (auth-проверка, feature-флаг) — invoke/field на ЧУЖОМ
+    объекте и остаются посчитанными.
+
+    ponytail: эвристика помечает self-field стражи в continuation-кадрах
+    (label + захваченные локалы); может пере-пометить настоящий guard на
+    захваченном локале и не пометить state, спрятанное не в self-field —
+    точность меряется в Task 7 (§8) на ground truth. Заодно компенсирует то,
+    что is_plumbing не ловит обфусцированные continuation-классы — такие
+    кадры здесь не отбрасываются молча, а помечаются с прозрачностью."""
+    frame_cls, _, frame_method = guard["frame"].partition("->")
+    if frame_method not in _COROUTINE_FRAME_METHODS:
+        return False
+    op = guard["operand"]
+    if op["source_kind"] != "field" or not op["detail"] or "->" not in op["detail"]:
+        return False
+    owner_desc = op["detail"].split("->", 1)[0]
+    return _fqcn(owner_desc) == frame_cls
 
 
 def slice_key(dx, key):
@@ -569,7 +604,7 @@ def slice_key(dx, key):
     rec = {"key": key, "cls": cls, "method": method,
            "reached": w["reached"],
            "call_sites": [{"caller": s["caller"], "offset": s["offset"]} for s in w["call_sites"]],
-           "guards": [], "guard_count": 0, "args": [],
+           "guards": [], "guard_count": 0, "guard_count_coroutine": 0, "args": [],
            "frontier": w["frontier"], "depth": w["depth"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "notes": []}
@@ -585,10 +620,15 @@ def slice_key(dx, key):
         gs = guards_of_frame(fr, f["offset"])
         for g in gs:
             g["frame"] = f["key"]
+            if _is_coroutine_state_guard(g):
+                g["notes"] = ["coroutine_state_machine"]
         all_guards.extend(gs)
     rec["guards"] = all_guards
-    rec["guard_count"] = len(all_guards)
-    if w["frontier"] is None and w["depth"] >= 6:
+    # Ruling-H: guard_count — только НЕ помеченные (headline-метрика); флаг —
+    # отдельным счётчиком, guards[] несёт все, включая помеченные.
+    rec["guard_count"] = sum(1 for g in all_guards if not g["notes"])
+    rec["guard_count_coroutine"] = sum(1 for g in all_guards if g["notes"])
+    if w["depth_capped"]:
         rec["notes"].append("depth_cap")
     return rec
 
@@ -602,8 +642,17 @@ def _check_slice_key(dx):
     rec = slice_key(dx, "gpm.tnt_premier.features.downloads.impl.data.network.DownloadsApi->disallowDeviceDownload")
     assert rec["reached"] is True
     assert rec["cls"].endswith("DownloadsApi") and rec["method"] == "disallowDeviceDownload"
-    assert isinstance(rec["guards"], list) and rec["guard_count"] == len(rec["guards"])
-    assert set(("reached", "call_sites", "guards", "args", "frontier", "inconclusive")) <= set(rec)
+    assert isinstance(rec["guards"], list)
+    assert rec["guard_count"] + rec["guard_count_coroutine"] == len(rec["guards"])
+    assert set(("reached", "call_sites", "guards", "args", "frontier",
+                "inconclusive", "guard_count_coroutine")) <= set(rec)
+    assert all("notes" in g for g in rec["guards"])
+    # Ruling-H (fix round 1): известный кейс несёт coroutine state-machine
+    # стражи (continuation TT->invokeSuspend/invoke, self-field label) —
+    # они помечены и НЕ входят в headline guard_count; регрессия отката
+    # флага (guard_count == len(guards)) здесь бы провалила assert.
+    assert rec["guard_count_coroutine"] > 0, rec
+    assert rec["guard_count"] < len(rec["guards"]), rec
     # ключ-форвардер без стражей: guard_count 0, не падение (Review Focus)
     assert rec["guard_count"] >= 0
     print("  slice_key ok")
