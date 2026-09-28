@@ -564,6 +564,52 @@ def guards_of_frame(fr, criterion_offset):
     return guards
 
 
+def _find_invoke(insns, cls, method):
+    """Ищет в списке Insn блока invoke*-инструкцию скрытого вызова cls->method
+    по сигнатуре callee (args[0] инструкции — человекочитаемая строка вида
+    'Lpkg/Cls;->name(...)Rtype', см. _norm/_kindstr). Сначала точное
+    совпадение владельца+имени, иначе — первое совпадение по одному имени
+    (перегрузки не различаем, как весь пайплайн). None, если не нашли."""
+    desc = "L" + cls.replace(".", "/") + ";->" + method + "("
+    name_pat = "->" + method + "("
+    fallback = None
+    for i, ins in enumerate(insns):
+        if not ins.op.startswith("invoke") or not ins.args or not ins.args[0]:
+            continue
+        sig = ins.args[0]
+        if sig.startswith(desc):
+            return i, ins
+        if fallback is None and name_pat in sig:
+            fallback = (i, ins)
+    return fallback
+
+
+def args_of_call(fr, offset, cls, method):
+    """Происхождение фактических аргументов скрытого вызова (спека §5.7) —
+    тот же классификатор источника (classify_operand), что и для guard-
+    операндов, по регистрам-аргументам invoke-инструкции. Receiver (первый
+    регистр у virtual/interface/super/direct invoke) индекс не получает —
+    индексируются только явные аргументы метода, как в сигнатуре вызова;
+    invoke-static регистры все явные, receiver нет. [] при любом сбое
+    резолва (нет кадра/блока/инструкции) — не падать (Review Focus)."""
+    block = fr["block_at"](offset)
+    if block is None:
+        return []
+    insns = fr["cfg"].nodes[block]["insns"]
+    found = _find_invoke(insns, cls, method)
+    if found is None:
+        return []
+    use_pos, ins = found
+    regs = list(ins.args[1:])
+    if regs and not ins.op.startswith("invoke-static"):
+        regs = regs[1:]  # receiver — не аргумент метода
+    out = []
+    for idx, reg in enumerate(regs):
+        kind, detail = classify_operand(fr["cfg"], block, use_pos, reg, fr["params"])
+        out.append({"index": idx, "source_kind": kind, "detail": detail})
+    return out
+
+
 _COROUTINE_FRAME_METHODS = {"invokeSuspend", "invoke", "create"}
 
 
@@ -596,6 +642,29 @@ def _is_coroutine_state_guard(guard):
     return _fqcn(owner_desc) == frame_cls
 
 
+# ponytail: грубый, но консервативный список — точность валидируется в Task 7
+# §8 на ground truth; апгрейд — расширять по факту false negative/positive.
+_FRAMEWORK_OWNER_PREFIXES = ("android.", "androidx.", "java.", "kotlin.", "kotlinx.")
+_FRAMEWORK_MEMBER_NAMES = {"ordinal", "areEqual", "checkNotNull", "checkNotNullParameter"}
+
+
+def _is_framework_guard(guard):
+    """Страж — фреймворк/компилятор-сгенерированный, не активационный (round-2
+    review): операнд invoke/field, чей владелец — android/androidx/java/
+    kotlin/kotlinx (Intrinsics сюда уже попадает — kotlin.jvm.internal.*),
+    ЛИБО имя метода/поля — известная compiler-generated проверка. ordinal
+    матчится по имени члена, а не по владельцу: enum в байткоде вызывает
+    ordinal() на СВОЁМ классе (Lpkg/MyEnum;->ordinal()I), не java.lang.Enum."""
+    op = guard["operand"]
+    if op["source_kind"] not in ("invoke", "field") or not op["detail"] or "->" not in op["detail"]:
+        return False
+    owner_desc, _, rest = op["detail"].partition("->")
+    if _fqcn(owner_desc).startswith(_FRAMEWORK_OWNER_PREFIXES):
+        return True
+    m = re.match(r"[^\s(]+", rest)
+    return bool(m) and m.group() in _FRAMEWORK_MEMBER_NAMES
+
+
 def slice_key(dx, key):
     """Полная запись среза для одного ключа (схема спеки §4): обход вверх
     (Task 4) до фронтира/лимита, на каждом семантическом кадре — стражи
@@ -607,7 +676,8 @@ def slice_key(dx, key):
     rec = {"key": key, "cls": cls, "method": method,
            "reached": w["reached"],
            "call_sites": [{"caller": s["caller"], "offset": s["offset"]} for s in w["call_sites"]],
-           "guards": [], "guard_count": 0, "guard_count_coroutine": 0, "args": [],
+           "guards": [], "guard_count": 0, "guard_count_coroutine": 0,
+           "guard_count_framework": 0, "args": [],
            "frontier": w["frontier"], "depth": w["depth"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "notes": []}
@@ -626,11 +696,25 @@ def slice_key(dx, key):
             if _is_coroutine_state_guard(g):
                 g["notes"] = ["coroutine_state_machine"]
         all_guards.extend(gs)
+    # round-2 review Fix 2: фреймворк/компилятор-стражи — та же логика флагов,
+    # что и coroutine, НЕ поверх уже coroutine-флагованных (elif через notes).
+    for g in all_guards:
+        if not g["notes"] and _is_framework_guard(g):
+            g["notes"] = ["framework"]
     rec["guards"] = all_guards
-    # Ruling-H: guard_count — только НЕ помеченные (headline-метрика); флаг —
-    # отдельным счётчиком, guards[] несёт все, включая помеченные.
+    # Ruling-H: guard_count — только НЕ помеченные (headline-метрика); каждый
+    # флаг — отдельным счётчиком по СВОЕЙ метке (не "любые notes" — теперь их
+    # два вида), guards[] несёт все стражи, включая помеченные.
     rec["guard_count"] = sum(1 for g in all_guards if not g["notes"])
-    rec["guard_count_coroutine"] = sum(1 for g in all_guards if g["notes"])
+    rec["guard_count_coroutine"] = sum(1 for g in all_guards if "coroutine_state_machine" in g["notes"])
+    rec["guard_count_framework"] = sum(1 for g in all_guards if "framework" in g["notes"])
+    # round-2 review Fix 1: происхождение аргументов скрытого вызова (спека
+    # §5.7) — по ПЕРВОМУ call-site (данных-ось не требует нескольких путей,
+    # как guard-сторона; симметрично её простоте).
+    first = w["call_sites"][0]
+    fr0 = frame_of(first["caller_ma"])
+    if fr0 is not None:
+        rec["args"] = args_of_call(fr0, first["offset"], cls, method)
     if w["depth_capped"]:
         rec["notes"].append("depth_cap")
     return rec
@@ -646,9 +730,10 @@ def _check_slice_key(dx):
     assert rec["reached"] is True
     assert rec["cls"].endswith("DownloadsApi") and rec["method"] == "disallowDeviceDownload"
     assert isinstance(rec["guards"], list)
-    assert rec["guard_count"] + rec["guard_count_coroutine"] == len(rec["guards"])
+    assert (rec["guard_count"] + rec["guard_count_coroutine"] + rec["guard_count_framework"]
+            == len(rec["guards"]))
     assert set(("reached", "call_sites", "guards", "args", "frontier",
-                "inconclusive", "guard_count_coroutine")) <= set(rec)
+                "inconclusive", "guard_count_coroutine", "guard_count_framework")) <= set(rec)
     assert all("notes" in g for g in rec["guards"])
     # Ruling-H (fix round 1): известный кейс несёт coroutine state-machine
     # стражи (continuation TT->invokeSuspend/invoke, self-field label) —
@@ -658,6 +743,10 @@ def _check_slice_key(dx):
     assert rec["guard_count"] < len(rec["guards"]), rec
     # ключ-форвардер без стражей: guard_count 0, не падение (Review Focus)
     assert rec["guard_count"] >= 0
+    # round-2 review Fix 1: известный кейс имеет явные аргументы на первом
+    # call-site — args должен быть непустым и нести схему {index,source_kind,detail}.
+    assert rec["args"], rec
+    assert set(("index", "source_kind", "detail")) <= set(rec["args"][0])
     print("  slice_key ok")
 
 
@@ -700,8 +789,10 @@ def report(records, meta=None):
     no_caller = sum(1 for r in records if not r["reached"])
     inconcl = sum(1 for r in records if r.get("inconclusive"))
     coroutine_total = sum(r.get("guard_count_coroutine", 0) for r in records)
+    framework_total = sum(r.get("guard_count_framework", 0) for r in records)
     w(f"Всего ключей: {total} | reached: {reached} | no_caller: {no_caller} | inconclusive: {inconcl}")
     w(f"Стражи state-machine корутин (флагованы, исключены из guard_count и топа источников): {coroutine_total}")
+    w(f"Стражи фреймворка/компилятора (флагованы, исключены из guard_count и топа источников): {framework_total}")
     dist = Counter(min(r["guard_count"], 4) for r in records if r["reached"])
     w("Распределение guard_count (сырьё для Таблицы IV):")
     for k in range(5):
@@ -719,7 +810,7 @@ def report(records, meta=None):
         w(f"[{tag}] {r['key']}  guards={r['guard_count']} frontier={r['frontier']} notes={r['notes']}")
         for g in r["guards"]:
             o = g["operand"]
-            flag = " [coroutine]" if g["notes"] else ""
+            flag = f" [{','.join(g['notes'])}]" if g["notes"] else ""
             w(f"    {g['opcode']} {g['sense']}  <- {o['source_kind']}:{o['detail']}  @{g['frame']}{flag}")
     return "\n".join(lines)
 
@@ -735,14 +826,19 @@ def _check_report():
              {"frame": "T->invokeSuspend", "opcode": "if-eqz", "sense": "->false",
               "operand": {"source_kind": "field", "detail": "T->label I"},
               "notes": ["coroutine_state_machine"]},
+             # round-2 review Fix 2: framework-флагованный guard — тоже не в топ
+             {"frame": "c->x", "opcode": "if-eqz", "sense": "->true",
+              "operand": {"source_kind": "invoke",
+                          "detail": "Lkotlin/jvm/internal/Intrinsics;->areEqual(Ljava/lang/Object;Ljava/lang/Object;)Z"},
+              "notes": ["framework"]},
          ],
-         "guard_count": 1, "guard_count_coroutine": 1, "args": [],
+         "guard_count": 1, "guard_count_coroutine": 1, "guard_count_framework": 1, "args": [],
          "frontier": "F->onCreate", "depth": 2, "plumbing_skipped": [],
          "inconclusive": False, "notes": []},
         {"key": "b->y", "cls": "b", "method": "y", "reached": False,
          "call_sites": [], "guards": [], "guard_count": 0, "guard_count_coroutine": 0,
-         "args": [], "frontier": None, "depth": 0, "plumbing_skipped": [],
-         "inconclusive": False, "notes": ["no_caller"]},
+         "guard_count_framework": 0, "args": [], "frontier": None, "depth": 0,
+         "plumbing_skipped": [], "inconclusive": False, "notes": ["no_caller"]},
     ]
     txt = report(recs)
     assert "guard_count" in txt and "no_caller" in txt.lower()
@@ -752,16 +848,38 @@ def _check_report():
     meta = {"package": "p", "versionName": "1.0", "versionCode": "42"}
     txt_meta = report(recs, meta=meta)
     assert "Приложение: p versionName=1.0 versionCode=42" in txt_meta
-    # Ruling-H: топ источников — реальный guard входит, coroutine-флагованный — нет
+    # Ruling-H / round-2 Fix 2: топ источников — реальный guard входит,
+    # coroutine- и framework-флагованные — нет
     top_section = txt.split("Топ источников")[1].split("\n\n")[0]
     assert "S->isLoggedIn()Z" in top_section
     assert "T->label" not in top_section
-    # построчный листинг НЕ скрывает coroutine-флагованные стражи — просто
-    # помечает их (прозрачность, не молчаливое отбрасывание)
-    assert "T->label" in txt and "[coroutine]" in txt
-    # общее число coroutine-флагованных стражей видно отдельной строкой
+    assert "Intrinsics" not in top_section
+    # построчный листинг НЕ скрывает флагованные стражи — просто помечает их
+    # (прозрачность, не молчаливое отбрасывание)
+    assert "T->label" in txt and "[coroutine_state_machine]" in txt
+    assert "[framework]" in txt
+    # общее число флагованных стражей каждого вида видно отдельной строкой
     assert "Стражи state-machine корутин" in txt and "1" in txt.split("корутин")[1].split("\n")[0]
+    assert "Стражи фреймворка/компилятора" in txt and "1" in txt.split("компилятора")[1].split("\n")[0]
     print("  report ok")
+
+
+def _check_framework_guard():
+    def g(kind, detail):
+        return {"operand": {"source_kind": kind, "detail": detail}, "notes": []}
+    # владелец — android/androidx/java/kotlin/kotlinx -> фреймворк
+    assert _is_framework_guard(g("invoke", "Landroid/view/ViewGroup;->getChildAt(I)Landroid/view/View;"))
+    assert _is_framework_guard(g("invoke", "Landroidx/fragment/app/Fragment;->getView()Landroid/view/View;"))
+    assert _is_framework_guard(g("invoke", "Ljava/lang/String;->length()I"))
+    assert _is_framework_guard(g("invoke",
+        "Lkotlin/jvm/internal/Intrinsics;->areEqual(Ljava/lang/Object;Ljava/lang/Object;)Z"))
+    assert _is_framework_guard(g("invoke", "Lkotlinx/coroutines/JobKt;->Job()Lkotlinx/coroutines/Job;"))
+    # enum ordinal на СВОЁМ (не android/kotlin) классе — матчим по имени члена
+    assert _is_framework_guard(g("invoke", "Lcom/app/Status;->ordinal()I"))
+    # обычный app-guard (auth/feature-флаг) — не фреймворк, остаётся в guard_count
+    assert not _is_framework_guard(g("invoke", "Lcom/app/SessionManager;->isLoggedIn()Z"))
+    assert not _is_framework_guard(g("field", "Lcom/app/Config;->featureX Z"))
+    print("  framework_guard ok")
 
 
 def main():
@@ -807,6 +925,7 @@ def _selfcheck(apk=None):
     _check_control_deps()
     _check_classify_operand()
     _check_walk_predicates()
+    _check_framework_guard()
     _check_report()
     if apk:
         _, dx = load_apk(apk)  # APK-объект здесь не нужен, только dx
