@@ -385,6 +385,11 @@ def _check_androguard(dx):
     # Санити-порог на runaway — доказывает, что дедуп реально работает и
     # обход не взрывается комбинаторно на графе с высоким fan-in.
     assert len(w["frames"]) < 300, w
+    # regression-guard против отката к глобальному капу на frames (round-1
+    # review, Finding 1): у отвергнутого global-cap варианта здесь было бы
+    # ровно 6 кадров — >=1 и <300 это не ловят, а >6 ловит.
+    assert len(w["frames"]) > 6, w
+    assert w["depth"] <= 6, w              # per-path лимит глубины реально соблюдён
     # цикл в графе вызовов не зациклил обход (дошли до сюда — visited работает)
     print("  backward_frames ok")
 
@@ -398,18 +403,37 @@ def is_plumbing(key, ma):
     """Kotlin-машинерия, которую нужно проходить насквозь при обратном
     обходе (не считать семантическим кадром): $default-перегрузки со
     значениями по умолчанию, access$-мостики для private-полей из
-    вложенных классов, $$inlined$/$$special$ классы (inline-функции) и
-    invokeSuspend/create/invoke классов-континуаций/лямбд (компилятор
-    Kotlin называет их так; отличаем от обычных invoke по вложенности
-    класса — '$' в простом имени или явный класс Continuation)."""
+    вложенных классов, $$inlined$/$$special$ классы (inline-функции),
+    invokeSuspend классов-континуаций и create/invoke СИНТЕТИЧЕСКИХ
+    лямбда-классов (компилятор Kotlin их так называет).
+
+    Ruling-F (round-1 review, Finding 2): create/invoke — узкий сигнал, не
+    широкий, как у invokeSuspend. '$' в простом имени класса матчит ЛЮБОЙ
+    вложенный класс (Dagger Foo$Factory.create(), ViewModelProvider.
+    Factory.create(), обычный Function1.invoke()) — такие create/invoke
+    ошибочно считались бы плумбингом и роняли guard-несущие кадры (та же
+    проблема, с которой борется Ruling-E). create/invoke — плумбинг только
+    при явном классе Continuation ЛИБО синтетическом лямбда-классе (последний
+    $-сегмент — цифры, напр. Foo$bar$1), не для обычных Factory/Function."""
     name = key.rsplit("->", 1)[-1]
     cls = getattr(ma, "class_name", "")
     if name.endswith("$default") or name.startswith("access$"):
         return True
     if "$$inlined$" in cls or "$$special$" in cls:
         return True
-    if name in ("invokeSuspend", "create", "invoke") and (
-            "Continuation" in cls or "$" in cls.rsplit("/", 1)[-1]):
+    # class_name — сырой JVM-дескриптор ('La/b/C$run$1;'), простое имя
+    # снимается по '/' и trailing ';' (иначе последний $-сегмент — "1;",
+    # isdigit() ложно фейлится на обычной цифровой лямбде).
+    simple = cls.rsplit("/", 1)[-1].rstrip(";")
+    if name == "invokeSuspend" and ("Continuation" in cls or "$" in simple):
+        return True
+    # ponytail: эвристика по имени — create/invoke считаем плумбингом только для
+    # корутинной машинерии (Continuation) либо синтетического лямбда-класса
+    # (последний $-сегмент — цифры, напр. Foo$bar$1), не для обычных Factory/Function.
+    # Точность плумбинга валидируется в Task 7 против ground truth.
+    if name in ("create", "invoke") and (
+            "Continuation" in cls
+            or ("$" in simple and simple.rsplit("$", 1)[-1].isdigit())):
         return True
     return False
 
@@ -484,6 +508,12 @@ def _check_walk_predicates():
     assert is_plumbing("a.b.C->postDeviceUpdate$default", FakeMA("La/b/C;"))
     assert is_plumbing("a.b.C$$inlined$x->invoke", FakeMA("La/b/C$$inlined$x;"))
     assert not is_plumbing("a.b.C->postDeviceUpdate", FakeMA("La/b/C;"))
+    # Ruling-F: create/invoke на ОБЫЧНОМ вложенном классе (Dagger Factory,
+    # ViewModelProvider.Factory, произвольный Function1) — НЕ плумбинг,
+    # только широкое '$' в простом имени этого больше не ловит.
+    assert not is_plumbing("a.b.C$Factory->create", FakeMA("La/b/C$Factory;"))
+    # синтетический лямбда-класс (последний $-сегмент — цифры) — плумбинг.
+    assert is_plumbing("a.b.C$run$1->invoke", FakeMA("La/b/C$run$1;"))
     assert is_frontier("androidx.fragment.app.Fragment->onViewCreated")
     assert is_frontier("a.b.MyActivity->onCreate")
     assert not is_frontier("a.b.SomeRepository->refresh")
