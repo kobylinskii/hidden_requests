@@ -379,7 +379,12 @@ def _check_androguard(dx):
     w = backward_frames(dx, "gpm.tnt_premier.features.downloads.impl.data.network.DownloadsApi",
                         "disallowDeviceDownload")
     assert w["reached"] and w["call_sites"], w
-    assert len(w["frames"]) <= 6                      # лимит соблюдён
+    assert len(w["frames"]) >= 1, w
+    # Ruling-E: лимит — per-path глубина, не общий потолок на frames; общее
+    # число кадров естественно ограничено visited-дедупом по (key, offset).
+    # Санити-порог на runaway — доказывает, что дедуп реально работает и
+    # обход не взрывается комбинаторно на графе с высоким fan-in.
+    assert len(w["frames"]) < 300, w
     # цикл в графе вызовов не зациклил обход (дошли до сюда — visited работает)
     print("  backward_frames ok")
 
@@ -423,46 +428,53 @@ def is_frontier(key):
 def backward_frames(dx, cls, method, limit=6):
     """Обратный межпроцедурный обход от call-site'ов cls->method вверх по
     графу вызовов до фронтира (UI/lifecycle) или лимита глубины. Плумбинг
-    (is_plumbing) проходится насквозь — не попадает в frames и не считается
-    в limit, но обход продолжается через его вызывающих. Циклы (рекурсия,
-    coroutine resume через себя же) гасятся visited-множеством по
-    (caller_key, offset) — один и тот же call-site не обрабатывается дважды,
-    что гарантирует терминацию на конечном графе вызовов.
+    (is_plumbing) проходится насквозь — не попадает в frames и не тратит
+    бюджет глубины (вверх от него идём с ТЕМ ЖЕ depth), но обход через его
+    вызывающих продолжается. Циклы (рекурсия, coroutine resume через себя
+    же) гасятся visited-множеством по (caller_key, offset) — один и тот же
+    call-site не обрабатывается дважды, что гарантирует терминацию на
+    конечном графе вызовов.
 
-    limit — ГЛОБАЛЬНЫЙ бюджет на итоговый len(frames), а не глубина одного
-    пути: при нескольких исходных call-site'ах (или fan-in выше по графу)
-    независимые пути иначе каждый добавили бы до limit кадров СВОИХ, и
-    итоговый список превысил бы limit. Проверка в начале итерации —
-    как только бюджет исчерпан, обход останавливается целиком."""
+    Ruling-E: limit — бюджет глубины ОДНОГО пути (как ICSE-обход
+    startActivity->onCreate), а не общий потолок на len(frames). При
+    нескольких исходных call-site'ах или fan-in выше по графу каждый путь
+    независимо идёт до своего фронтира/лимита; итоговый frames естественно
+    ограничен только visited-дедупом по (key, offset), без искусственного
+    общего капа."""
     sites = resolve_call_sites(dx, cls, method)
     if not sites:
         return {"reached": False, "call_sites": [], "frames": [],
                 "frontier": None, "depth": 0, "plumbing_skipped": []}
     frames, skipped, frontier = [], [], None
     visited = set()
-    queue = [(f"{cls}->{method}", s["caller_ma"], s["offset"]) for s in sites]
+    max_depth = 0
+    # очередь: (callee_key, caller_ma, offset, depth) — depth путевой (per-path)
+    queue = [(f"{cls}->{method}", s["caller_ma"], s["offset"], 0) for s in sites]
     while queue:
-        if len(frames) >= limit:
-            break
-        callee_key, caller_ma, off = queue.pop()
+        callee_key, caller_ma, off, depth = queue.pop()
         ckey = method_key(caller_ma)
         if (ckey, off) in visited:
             continue
         visited.add((ckey, off))
         if is_plumbing(ckey, caller_ma):
             skipped.append(ckey)
+            # плумбинг не тратит бюджет глубины — depth дальше вверх тот же
         else:
             frames.append({"key": ckey, "ma": caller_ma,
                            "callee_key": callee_key, "offset": off})
+            max_depth = max(max_depth, depth + 1)
             if is_frontier(ckey):
                 frontier = ckey
-                continue
+                continue  # путь дошёл до фронтира — выше по нему не поднимаемся
+            depth += 1
+            if depth >= limit:
+                continue  # этот путь упёрся в лимит глубины
         # шаг вверх: кто вызывает ckey
         pcls, _, pm = ckey.partition("->")
         for s in resolve_call_sites(dx, pcls, pm):
-            queue.append((ckey, s["caller_ma"], s["offset"]))
+            queue.append((ckey, s["caller_ma"], s["offset"], depth))
     return {"reached": True, "call_sites": sites, "frames": frames,
-            "frontier": frontier, "depth": len(frames),
+            "frontier": frontier, "depth": max_depth,
             "plumbing_skipped": skipped}
 
 
