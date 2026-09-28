@@ -11,11 +11,49 @@ import argparse
 import json
 import re
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 from loguru import logger
 logger.remove()  # androguard DEBUG-флуд — до его импорта
 import networkx as nx
+
+Insn = namedtuple("Insn", "op out args")
+
+
+def _kind_of(ins):
+    """Категория источника по мнемонике инструкции. Префиксное сравнение (не
+    exact-match): Task 3 положит в op СЫРУЮ мнемонику androguard
+    (ins.get_name()), а у Dalvik куча суффиксных вариантов одной операции
+    (const/4, const-string, iget-object, move-result-object, ...)."""
+    if ins.op.startswith("const"):
+        return ("const", ins.args[0] if ins.args else None)
+    if ins.op.startswith(("iget", "sget")):
+        return ("field", ins.args[0] if ins.args else None)
+    if ins.op.startswith("move-result"):
+        return ("invoke", ins.args[0] if ins.args else None)
+    return ("unknown", None)
+
+
+def classify_operand(cfg, block, use_pos, reg, params):
+    """Обратный def-use по reg от use_pos внутри block, затем в единственного
+    предшественника. >=2 предшественников без локального def -> unknown, кроме
+    параметров (они доминируют все блоки). ponytail: глубина один хоп."""
+    b, start, seen = block, use_pos - 1, set()
+    while True:
+        insns = cfg.nodes[b]["insns"]
+        for i in range(min(start, len(insns) - 1), -1, -1):
+            if insns[i].out == reg:
+                return _kind_of(insns[i])
+        if b in seen:
+            return ("param", params[reg]) if reg in params else ("unknown", None)
+        seen.add(b)
+        preds = list(cfg.predecessors(b))
+        if len(preds) == 1:
+            b = preds[0]
+            start = len(cfg.nodes[b]["insns"]) - 1
+            continue
+        return ("param", params[reg]) if reg in params else ("unknown", None)
 
 
 def post_idom(cfg, exit_node):
@@ -97,8 +135,38 @@ def _check_control_deps():
     print("  control_deps ok")
 
 
+def _check_classify_operand():
+    import networkx as nx
+
+    def one_block(insns, params=None):
+        g = nx.DiGraph(); g.add_node("B", insns=insns)
+        return g, "B", params or {}
+
+    # const
+    g,b,p = one_block([Insn("const","v0",(1,)), Insn("other",None,())])
+    assert classify_operand(g,b,1,"v0",p) == ("const",1)
+    # поле (фича-флаг)
+    g,b,p = one_block([Insn("iget","v0",("Foo->enabled",)), Insn("other",None,())])
+    assert classify_operand(g,b,1,"v0",p) == ("field","Foo->enabled")
+    # возврат метода (move-result несёт сигнатуру callee, спаренную адаптером)
+    g,b,p = one_block([Insn("move-result","v0",("Bar->isLoggedIn()Z",)), Insn("other",None,())])
+    assert classify_operand(g,b,1,"v0",p) == ("invoke","Bar->isLoggedIn()Z")
+    # параметр: нет записи, reg — параметр
+    g,b,p = one_block([Insn("other",None,())], params={"p1":0})
+    assert classify_operand(g,b,0,"p1",p) == ("param",0)
+    # phi-подобное: два предшественника пишут v0, локально нет def, не параметр
+    g = nx.DiGraph()
+    g.add_node("P1", insns=[Insn("const","v0",(1,))])
+    g.add_node("P2", insns=[Insn("const","v0",(2,))])
+    g.add_node("B",  insns=[Insn("other",None,())])
+    g.add_edge("P1","B"); g.add_edge("P2","B")
+    assert classify_operand(g,"B",0,"v0",{}) == ("unknown",None)
+    print("  classify_operand ok")
+
+
 def _selfcheck():
     _check_control_deps()
+    _check_classify_operand()
     print("selfcheck ok")
 
 
