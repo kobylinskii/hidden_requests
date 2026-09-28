@@ -11,7 +11,7 @@ import argparse
 import json
 import re
 import sys
-from collections import namedtuple
+from collections import Counter, namedtuple
 from pathlib import Path
 
 from loguru import logger
@@ -658,21 +658,147 @@ def _check_slice_key(dx):
     print("  slice_key ok")
 
 
+def load_hidden(path):
+    """out/<pkg>.hidden.jsonl (формат diff.py) -> список уникальных ключей со
+    status=hidden, порядок первого появления. Дубли — перегрузки одного и
+    того же класс->метод (diff.py схлопывает их по ключу на выходе, но не
+    дедупит внутри файла), в срезе достаточно одной записи на ключ."""
+    keys, seen = [], set()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if r.get("status") == "hidden" and r["key"] not in seen:
+            seen.add(r["key"])
+            keys.append(r["key"])
+    return keys
+
+
+def report(records, meta=None):
+    """records (из run()) -> человекочитаемый отчёт: шапка (totals),
+    распределение guard_count (сырьё для Таблицы IV), топ источников
+    стражей, построчный листинг.
+
+    Ruling-H: guard_count в записи уже "чистый" (coroutine state-machine
+    стражи исключены Task 5) — распределение использует его как есть. Топ
+    источников ДОПОЛНИТЕЛЬНО фильтрует по guard["notes"]: без этого
+    self-поля state-machine (label, захваченный continuation), которые не
+    входят в guard_count, всё равно засоряли бы список источников их
+    отдельным проходом по guards[]. Общее число флагованных стражей
+    показывается отдельной строкой — шум виден, но не смешан с headline-
+    метрикой."""
+    lines = []
+    w = lines.append
+    if meta:
+        w(f"Приложение: {meta.get('package')} versionName={meta.get('versionName')} "
+          f"versionCode={meta.get('versionCode')}")
+    total = len(records)
+    reached = sum(r["reached"] for r in records)
+    no_caller = sum(1 for r in records if not r["reached"])
+    inconcl = sum(1 for r in records if r.get("inconclusive"))
+    coroutine_total = sum(r.get("guard_count_coroutine", 0) for r in records)
+    w(f"Всего ключей: {total} | reached: {reached} | no_caller: {no_caller} | inconclusive: {inconcl}")
+    w(f"Стражи state-machine корутин (флагованы, исключены из guard_count и топа источников): {coroutine_total}")
+    dist = Counter(min(r["guard_count"], 4) for r in records if r["reached"])
+    w("Распределение guard_count (сырьё для Таблицы IV):")
+    for k in range(5):
+        label = "4+" if k == 4 else str(k)
+        w(f"  {label} стражей: {dist.get(k, 0)}")
+    src = Counter(g["operand"]["detail"] for r in records for g in r["guards"]
+                  if not g["notes"] and g["operand"]["source_kind"] in ("invoke", "field")
+                  and g["operand"]["detail"])
+    w("Топ источников стражей:")
+    for name, n in src.most_common(15):
+        w(f"  {n:3d}  {name}")
+    w("")
+    for r in records:
+        tag = "HIDDEN" if r["reached"] else "NO-CALLER"
+        w(f"[{tag}] {r['key']}  guards={r['guard_count']} frontier={r['frontier']} notes={r['notes']}")
+        for g in r["guards"]:
+            o = g["operand"]
+            flag = " [coroutine]" if g["notes"] else ""
+            w(f"    {g['opcode']} {g['sense']}  <- {o['source_kind']}:{o['detail']}  @{g['frame']}{flag}")
+    return "\n".join(lines)
+
+
+def _check_report():
+    recs = [
+        {"key": "a->x", "cls": "a", "method": "x", "reached": True,
+         "call_sites": [{"caller": "c->x", "offset": 1}],
+         "guards": [
+             {"frame": "c->x", "opcode": "if-eqz", "sense": "->true",
+              "operand": {"source_kind": "invoke", "detail": "S->isLoggedIn()Z"}, "notes": []},
+             # coroutine-флагованный self-field guard — не должен попасть в топ источников
+             {"frame": "T->invokeSuspend", "opcode": "if-eqz", "sense": "->false",
+              "operand": {"source_kind": "field", "detail": "T->label I"},
+              "notes": ["coroutine_state_machine"]},
+         ],
+         "guard_count": 1, "guard_count_coroutine": 1, "args": [],
+         "frontier": "F->onCreate", "depth": 2, "plumbing_skipped": [],
+         "inconclusive": False, "notes": []},
+        {"key": "b->y", "cls": "b", "method": "y", "reached": False,
+         "call_sites": [], "guards": [], "guard_count": 0, "guard_count_coroutine": 0,
+         "args": [], "frontier": None, "depth": 0, "plumbing_skipped": [],
+         "inconclusive": False, "notes": ["no_caller"]},
+    ]
+    txt = report(recs)
+    assert "guard_count" in txt and "no_caller" in txt.lower()
+    assert "1 стражей: 1" in txt  # распределение: один reached-ключ с 1 стражем
+    # Ruling-H: топ источников — реальный guard входит, coroutine-флагованный — нет
+    top_section = txt.split("Топ источников")[1].split("\n\n")[0]
+    assert "S->isLoggedIn()Z" in top_section
+    assert "T->label" not in top_section
+    # построчный листинг НЕ скрывает coroutine-флагованные стражи — просто
+    # помечает их (прозрачность, не молчаливое отбрасывание)
+    assert "T->label" in txt and "[coroutine]" in txt
+    # общее число coroutine-флагованных стражей видно отдельной строкой
+    assert "Стражи state-machine корутин" in txt and "1" in txt.split("корутин")[1].split("\n")[0]
+    print("  report ok")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--hidden", type=Path, help="out/<pkg>.hidden.jsonl")
+    ap.add_argument("--apk", type=Path, help="apk/<pkg>.apk (та же сборка)")
+    ap.add_argument("--out", type=Path, help="куда сохранить slice.jsonl")
+    ap.add_argument("--selfcheck", action="store_true")
+    args = ap.parse_args()
+    if args.selfcheck:
+        _selfcheck(args.apk)
+        return
+    if not (args.hidden and args.apk):
+        ap.error("нужны --hidden и --apk")
+    keys = load_hidden(args.hidden)
+    dx = load_apk(args.apk)
+    records = run(dx, keys)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        with args.out.open("w", encoding="utf-8") as f:
+            for r in records:
+                # на всякий случай — рекорд и так не содержит ma (Task 5 кладёт
+                # в call_sites/guards только {caller,offset}/операнды), но
+                # страхуемся от нежелательных не-JSON полей при апгрейде схемы
+                f.write(json.dumps({k: v for k, v in r.items() if k != "ma"},
+                                   ensure_ascii=False) + "\n")
+    txt = report(records)
+    print(txt)
+    if args.out:
+        Path(str(args.out).replace(".jsonl", ".report.txt")).write_text(txt, encoding="utf-8")
+        print(f"\n→ {args.out}", file=sys.stderr)
+
+
 def _selfcheck(apk=None):
     _check_control_deps()
     _check_classify_operand()
     _check_walk_predicates()
+    _check_report()
     if apk:
         dx = load_apk(apk)
-        _check_androguard(dx)
-        _check_slice_key(dx)  # Ruling-C: тот же dx, без повторной загрузки APK
+        _check_androguard(dx)  # уже принимает dx (Ruling-C: без повторной загрузки APK)
+        _check_slice_key(dx)
     print("selfcheck ok")
 
 
 if __name__ == "__main__":
-    if "--selfcheck" in sys.argv:
-        apk = None
-        if "--apk" in sys.argv:
-            apk = sys.argv[sys.argv.index("--apk") + 1]
-        _selfcheck(apk)
-        sys.exit(0)
+    main()
