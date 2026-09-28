@@ -293,6 +293,11 @@ def _norm(instructions):
         elif op.startswith("goto") or op.startswith("return") or op == "throw" or op == "nop":
             prev_invoke_sig = None
             out.append(Insn(op, None, tuple(regs)))
+        elif op in ("monitor-enter", "monitor-exit", "fill-array-data"):
+            # единственный регистр-операнд здесь — ЧИСТОЕ использование (lock-
+            # объект / ссылка на массив), не def; в общий else не класть.
+            prev_invoke_sig = None
+            out.append(Insn(op, None, tuple(regs)))
         else:
             prev_invoke_sig = None
             out.append(Insn(op, regs[0] if regs else None, tuple(regs[1:])))
