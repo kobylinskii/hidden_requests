@@ -52,17 +52,18 @@ def control_deps(cfg, criterion, exit_node):
                     out.append((a, b))
         return out
 
-    result, work, done = {}, [criterion], set()
+    # result — set из (branch, taken), не dict по branch: узел может быть
+    # зависим сразу от НЕСКОЛЬКИХ рёбер одного switch/when-ветвления (3+
+    # successors) — это разные прямые зависимости, а не альтернативы друг друга.
+    result, work, seen_branches = set(), [criterion], set()
     while work:
         cur = work.pop()
-        if cur in done:
-            continue
-        done.add(cur)
         for a, b in direct(cur):
-            if a not in result:
-                result[a] = b
+            result.add((a, b))
+            if a not in seen_branches:
+                seen_branches.add(a)
                 work.append(a)
-    return list(result.items())
+    return list(result)
 
 
 def _check_control_deps():
@@ -86,6 +87,13 @@ def _check_control_deps():
     g = nx.DiGraph([("E","L"),("L","BODY"),("L","AFTER"),("BODY","L"),("AFTER","X")])
     deps = dict(control_deps(g, "BODY", "X"))
     assert deps == {"L": "BODY"}, deps
+
+    # switch/when: A(3 ветви)->{B,C,D}; B->M,C->M (сходятся до ipdom(A)), D->Z
+    # напрямую; M зависим от ОБОИХ рёбер (A,B) и (A,C), но не от (A,D)
+    g = nx.DiGraph([("A","B"),("A","C"),("A","D"),("B","M"),("C","M"),
+                    ("M","Z"),("D","Z"),("Z","X")])
+    got = set(control_deps(g, "M", "X"))
+    assert got == {("A","B"),("A","C")}, got
     print("  control_deps ok")
 
 
