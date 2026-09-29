@@ -11,7 +11,8 @@ import argparse
 import json
 import re
 import sys
-from collections import Counter, namedtuple
+from collections import Counter, deque, namedtuple
+from functools import lru_cache
 from pathlib import Path
 
 from loguru import logger
@@ -34,6 +35,8 @@ def _kind_of(ins):
         return ("field", ins.args[0] if ins.args else None)
     if ins.op.startswith("move-result"):
         return ("invoke", ins.args[0] if ins.args else None)
+    if ins.op == "instance-of":  # `if (r is Result.Error)` — сигнал Server/Error handling
+        return ("instanceof", ins.args[0] if ins.args else None)
     return ("unknown", None)
 
 
@@ -207,15 +210,17 @@ def method_key(ma):
 
 
 def resolve_call_sites(dx, cls, method):
-    """Все вызовы cls->method по XREF. no_external=False — метод может быть
-    интерфейсным объявлением (у него самого нет кода, но есть xref_from от
-    реализаций/вызывающих через invoke-interface). Пусто, если метод не
+    """Все вызовы cls->method по XREF. Внешние методы не отсеиваются — метод
+    может быть интерфейсным объявлением (у него самого нет кода, но есть
+    xref_from от вызывающих через invoke-interface). Пусто, если метод не
     найден или XREF пуст (не ошибка)."""
-    desc = "L" + cls.replace(".", "/") + ";"
-    pat = "^" + re.escape(desc) + "$"
-    mpat = "^" + re.escape(method) + "$"
+    # Прямой lookup по dx.classes, не dx.find_methods: тот гоняет regex по ВСЕМ
+    # классам APK на каждый вызов, а обход зовёт резолв на каждый кадр.
+    ca = dx.classes.get("L" + cls.replace(".", "/") + ";")
     sites = []
-    for ma in dx.find_methods(classname=pat, methodname=mpat, no_external=False):
+    for ma in (ca.get_methods() if ca else ()):
+        if ma.name != method:
+            continue
         for xf in ma.get_xref_from():
             caller_ma, off = xf[1], xf[-1]
             sites.append({"caller": method_key(caller_ma),
@@ -296,11 +301,16 @@ def _norm(instructions):
         elif op.startswith("goto") or op.startswith("return") or op == "throw" or op == "nop":
             prev_invoke_sig = None
             out.append(Insn(op, None, tuple(regs)))
-        elif op in ("monitor-enter", "monitor-exit", "fill-array-data"):
+        elif op in ("monitor-enter", "monitor-exit", "fill-array-data", "check-cast"):
             # единственный регистр-операнд здесь — ЧИСТОЕ использование (lock-
-            # объект / ссылка на массив), не def; в общий else не класть.
+            # объект / ссылка на массив / check-cast — приведение на месте, def-use
+            # идёт сквозь него к исходному значению), не def; в общий else не класть.
             prev_invoke_sig = None
             out.append(Insn(op, None, tuple(regs)))
+        elif op == "instance-of":
+            prev_invoke_sig = None
+            typ = next((_kindstr(o) for o in operands if len(o) == 3), None)
+            out.append(Insn(op, regs[0] if regs else None, (typ,)))
         else:
             prev_invoke_sig = None
             out.append(Insn(op, regs[0] if regs else None, tuple(regs[1:])))
@@ -466,26 +476,33 @@ def backward_frames(dx, cls, method, limit=6):
     startActivity->onCreate), а не общий потолок на len(frames). При
     нескольких исходных call-site'ах или fan-in выше по графу каждый путь
     независимо идёт до своего фронтира/лимита; итоговый frames естественно
-    ограничен только visited-дедупом по (key, offset), без искусственного
-    общего капа."""
+    ограничен только visited-дедупом по (метод, offset), без искусственного
+    общего капа. Метод без вызывающих (не фронтир) попадает в dead_ends:
+    путь оборван, стражи выше него не видны."""
     sites = resolve_call_sites(dx, cls, method)
     if not sites:
         return {"reached": False, "call_sites": [], "frames": [],
                 "frontier": None, "depth": 0, "plumbing_skipped": [],
-                "depth_capped": False}
-    frames, skipped, frontier = [], [], None
+                "depth_capped": False, "dead_ends": []}
+    frames, skipped, frontier, dead_ends = [], [], None, []
     visited = set()
     max_depth = 0
     depth_capped = False  # True, если ХОТЬ ОДИН путь упёрся в limit (OR по путям)
-    # очередь: (callee_key, caller_ma, offset, depth) — depth путевой (per-path)
-    queue = [(f"{cls}->{method}", s["caller_ma"], s["offset"], 0) for s in sites]
+    # очередь: (callee_key, caller_ma, offset, depth) — depth путевой (per-path).
+    # 0-1 BFS (спека §5.2), не DFS: при visited-дедупе DFS мог впервые прийти в
+    # кадр по длинному пути, упереться в limit и отбросить короткий путь к нему.
+    # Здесь кадр впервые посещается на своей минимальной глубине.
+    queue = deque((f"{cls}->{method}", s["caller_ma"], s["offset"], 0) for s in sites)
     while queue:
-        callee_key, caller_ma, off, depth = queue.pop()
+        callee_key, caller_ma, off, depth = queue.popleft()
         ckey = method_key(caller_ma)
-        if (ckey, off) in visited:
+        # дедуп по самому методу, не по имени: у R8 перегрузки a(I)/a(J) — разные
+        # методы с одним ключом, склейка давала ложный fan-in (выброс 528 стражей)
+        if (caller_ma, off) in visited:
             continue
-        visited.add((ckey, off))
-        if is_plumbing(ckey, caller_ma):
+        visited.add((caller_ma, off))
+        plumbing = is_plumbing(ckey, caller_ma)
+        if plumbing:
             skipped.append(ckey)
             # плумбинг не тратит бюджет глубины — depth дальше вверх тот же
         else:
@@ -499,13 +516,27 @@ def backward_frames(dx, cls, method, limit=6):
             if depth >= limit:
                 depth_capped = True
                 continue  # этот путь упёрся в лимит глубины
-        # шаг вверх: кто вызывает ckey
-        pcls, _, pm = ckey.partition("->")
-        for s in resolve_call_sites(dx, pcls, pm):
-            queue.append((ckey, s["caller_ma"], s["offset"], depth))
+        # шаг вверх: кто вызывает именно этот метод
+        ups = [(xf[1], xf[-1]) for xf in caller_ma.get_xref_from()]
+        if not ups and caller_ma.name in _COROUTINE_FRAME_METHODS:
+            # invoke/invokeSuspend/create лямбды зовёт рантайм через интерфейс
+            # (Function*/Continuation) — XREF пуст. Точка активации лямбды — место
+            # её создания (new-instance): ViewModel/фрагмент, где вызван launch {}.
+            # ponytail: по имени метода; `operator fun invoke` без XREF у не-лямбды
+            # тоже уйдёт к new-instance (обычно DI), а R8-слитый класс лямбд
+            # (один класс + switch по id) даёт fan-in на все места создания —
+            # апгрейд: проверять суперкласс и id слитой лямбды.
+            ca = dx.classes.get(caller_ma.class_name)
+            ups = list(ca.get_xref_new_instance()) if ca else []
+        if not ups:
+            dead_ends.append(ckey)  # путь оборван не на фронтире: стражи выше не видны
+        push = queue.appendleft if plumbing else queue.append  # плумбинг: та же глубина
+        for ma, o in ups:
+            push((ckey, ma, o, depth))
     return {"reached": True, "call_sites": sites, "frames": frames,
             "frontier": frontier, "depth": max_depth,
-            "plumbing_skipped": skipped, "depth_capped": depth_capped}
+            "plumbing_skipped": skipped, "depth_capped": depth_capped,
+            "dead_ends": dead_ends}
 
 
 def _check_walk_predicates():
@@ -534,9 +565,9 @@ def guards_of_frame(fr, criterion_offset):
     Ruling-G: инструкция-ветвление ищется по PREFIX/SUFFIX сырой мнемоники
     (op.startswith("if") или op.endswith("-switch")), НЕ по членству в
     фиксированном наборе _IF_OPS — так _norm (Task 3) и пометила ветвления:
-    if-*/*-switch имеют out=None, тестируемый регистр(ы) в args. Регистр —
-    cond.args[0]; если cond не найден (не должно происходить для настоящего
-    ветвления, но не падать) — ярлык "branch", операнд unknown."""
+    if-*/*-switch имеют out=None, тестируемый регистр(ы) в args. Если cond не
+    найден (не должно происходить для настоящего ветвления, но не падать) —
+    ярлык "branch", операнд unknown."""
     cfg = fr["cfg"]
     crit = fr["block_at"](criterion_offset)
     if crit is None:
@@ -554,14 +585,30 @@ def guards_of_frame(fr, criterion_offset):
         cond = next((i for i in reversed(insns)
                      if i.op.startswith("if") or i.op.endswith("-switch")), None)
         opcode = cond.op if cond else "branch"
-        reg = cond.args[0] if (cond and cond.args) else None
-        operand = {"source_kind": "unknown", "detail": None}
-        if reg is not None:
-            kind, detail = classify_operand(cfg, branch, len(insns) - 1, reg, fr["params"])
-            operand = {"source_kind": kind, "detail": detail}
+        # спека §5.6 — каждый операнд. У if-eq/if-lt/... два регистра; источник
+        # стража — неконстантная сторона (`if (cfg.mode == 2)`: константа справа
+        # или слева), иначе первый операнд.
+        cands = [classify_operand(cfg, branch, len(insns) - 1, r, fr["params"])
+                 for r in (cond.args if cond else ())]
+        kind, detail = next((c for c in cands if c[0] not in ("const", "unknown")),
+                            cands[0] if cands else ("unknown", None))
+        operand = {"source_kind": kind, "detail": detail}
         guards.append({"frame": None, "opcode": opcode,
                        "sense": f"->{taken}", "operand": operand, "notes": []})
     return guards
+
+
+def _check_guard_operand():
+    # if-eq v0, v1 с константой в ПЕРВОМ операнде: источник стража — поле во втором
+    g = nx.DiGraph()
+    g.add_node("A", insns=[Insn("const/4", "v0", (2,)), Insn("iget", "v1", ("Lc/Cfg;->mode I",)),
+                           Insn("if-eq", None, ("v0", "v1"))])
+    g.add_node("B", insns=[Insn("invoke-interface", None, ("Lx/Api;->m()V",))])
+    g.add_node("C", insns=[Insn("return-void", None, ())])
+    g.add_edges_from([("A", "B"), ("A", "C"), ("B", "C")])
+    gs = guards_of_frame({"cfg": g, "params": {}, "block_at": lambda off: "B"}, 0)
+    assert [x["operand"] for x in gs] == [{"source_kind": "field", "detail": "Lc/Cfg;->mode I"}], gs
+    print("  guard_operand ok")
 
 
 def _find_invoke(insns, cls, method):
@@ -603,6 +650,8 @@ def args_of_call(fr, offset, cls, method):
     regs = list(ins.args[1:])
     if regs and not ins.op.startswith("invoke-static"):
         regs = regs[1:]  # receiver — не аргумент метода
+    if regs and "Lkotlin/coroutines/Continuation;)" in ins.args[0]:
+        regs = regs[:-1]  # continuation suspend-вызова — не данные запроса
     out = []
     for idx, reg in enumerate(regs):
         kind, detail = classify_operand(fr["cfg"], block, use_pos, reg, fr["params"])
@@ -642,6 +691,24 @@ def _is_coroutine_state_guard(guard):
     return _fqcn(owner_desc) == frame_cls
 
 
+@lru_cache(maxsize=None)
+def _is_continuation_class(dx, desc):
+    """Класс-континуация suspend-функции: есть invokeSuspend (переопределение
+    BaseContinuationImpl — имя переживает R8, в отличие от имени класса)."""
+    ca = dx.classes.get(desc)
+    return ca is not None and any(m.name == "invokeSuspend" for m in ca.get_methods())
+
+
+def _reads_continuation(dx, guard):
+    """Пролог стейт-машины внутри самой suspend-функции: `cont instanceof K`
+    и чтение `K.label` (у R8 — `K->E I`). Владелец поля — класс континуации,
+    а не класс кадра, поэтому _is_coroutine_state_guard его не видит."""
+    op = guard["operand"]
+    if op["source_kind"] not in ("field", "instanceof") or not op["detail"]:
+        return False
+    return _is_continuation_class(dx, str(op["detail"]).partition("->")[0])
+
+
 # ponytail: грубый, но консервативный список — точность валидируется в Task 7
 # §8 на ground truth; апгрейд — расширять по факту false negative/positive.
 _FRAMEWORK_OWNER_PREFIXES = ("android.", "androidx.", "java.", "kotlin.", "kotlinx.")
@@ -656,7 +723,7 @@ def _is_framework_guard(guard):
     матчится по имени члена, а не по владельцу: enum в байткоде вызывает
     ordinal() на СВОЁМ классе (Lpkg/MyEnum;->ordinal()I), не java.lang.Enum."""
     op = guard["operand"]
-    if op["source_kind"] not in ("invoke", "field") or not op["detail"] or "->" not in op["detail"]:
+    if op["source_kind"] not in ("invoke", "field", "instanceof") or not op["detail"]:
         return False
     owner_desc, _, rest = op["detail"].partition("->")
     if _fqcn(owner_desc).startswith(_FRAMEWORK_OWNER_PREFIXES):
@@ -682,24 +749,35 @@ def slice_key(dx, key):
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "notes": []}
     if not w["reached"]:
-        rec["notes"].append("no_caller")
+        # BFScan печатает JADX-алиасы имён (обфускация): такого класса/метода в DEX
+        # нет вовсе — это артефакт статики, а не категория No caller
+        ca = dx.classes.get("L" + cls.replace(".", "/") + ";")
+        known = ca is not None and any(m.name == method for m in ca.get_methods())
+        rec["notes"].append("no_caller" if known else "key_not_in_dex")
         return rec
-    all_guards = []
+    all_guards, seen = [], set()
     for f in w["frames"]:
         fr = frame_of(f["ma"])
         if fr is None:
             rec["inconclusive"] = True
             continue
-        gs = guards_of_frame(fr, f["offset"])
-        for g in gs:
+        for g in guards_of_frame(fr, f["offset"]):
+            # несколько call-site в одном методе делят одни и те же ветвления —
+            # одно условие считается один раз
+            sig = (id(f["ma"]), g["opcode"], g["sense"], g["operand"]["source_kind"],
+                   str(g["operand"]["detail"]))
+            if sig in seen:
+                continue
+            seen.add(sig)
             g["frame"] = f["key"]
-            if _is_coroutine_state_guard(g):
+            if _is_coroutine_state_guard(g) or _reads_continuation(dx, g):
                 g["notes"] = ["coroutine_state_machine"]
-        all_guards.extend(gs)
+            all_guards.append(g)
     # round-2 review Fix 2: фреймворк/компилятор-стражи — та же логика флагов,
     # что и coroutine, НЕ поверх уже coroutine-флагованных (elif через notes).
     for g in all_guards:
-        if not g["notes"] and _is_framework_guard(g):
+        # кадр самого фреймворка (фронтир androidx.*) — его ветвления не гейты приложения
+        if not g["notes"] and (_is_framework_guard(g) or g["frame"].startswith(_FRAMEWORK_OWNER_PREFIXES)):
             g["notes"] = ["framework"]
     rec["guards"] = all_guards
     # Ruling-H: guard_count — только НЕ помеченные (headline-метрика); каждый
@@ -717,6 +795,8 @@ def slice_key(dx, key):
         rec["args"] = args_of_call(fr0, first["offset"], cls, method)
     if w["depth_capped"]:
         rec["notes"].append("depth_cap")
+    if w["dead_ends"]:
+        rec["notes"].append("dead_end")
     return rec
 
 
@@ -786,11 +866,15 @@ def report(records, meta=None):
           f"versionCode={meta.get('versionCode')}")
     total = len(records)
     reached = sum(r["reached"] for r in records)
-    no_caller = sum(1 for r in records if not r["reached"])
+    not_in_dex = sum(1 for r in records if "key_not_in_dex" in r["notes"])
+    no_caller = sum(1 for r in records if not r["reached"]) - not_in_dex
+    dead = sum(1 for r in records if "dead_end" in r["notes"])
     inconcl = sum(1 for r in records if r.get("inconclusive"))
     coroutine_total = sum(r.get("guard_count_coroutine", 0) for r in records)
     framework_total = sum(r.get("guard_count_framework", 0) for r in records)
-    w(f"Всего ключей: {total} | reached: {reached} | no_caller: {no_caller} | inconclusive: {inconcl}")
+    w(f"Всего ключей: {total} | reached: {reached} | no_caller: {no_caller} | "
+      f"key_not_in_dex: {not_in_dex} | inconclusive: {inconcl}")
+    w(f"Обход оборван не на фронтире (dead_end, стражи выше пути не видны): {dead}")
     w(f"Стражи state-machine корутин (флагованы, исключены из guard_count и топа источников): {coroutine_total}")
     w(f"Стражи фреймворка/компилятора (флагованы, исключены из guard_count и топа источников): {framework_total}")
     dist = Counter(min(r["guard_count"], 4) for r in records if r["reached"])
@@ -799,7 +883,7 @@ def report(records, meta=None):
         label = "4+" if k == 4 else str(k)
         w(f"  {label} стражей: {dist.get(k, 0)}")
     src = Counter(g["operand"]["detail"] for r in records for g in r["guards"]
-                  if not g["notes"] and g["operand"]["source_kind"] in ("invoke", "field")
+                  if not g["notes"] and g["operand"]["source_kind"] in ("invoke", "field", "instanceof")
                   and g["operand"]["detail"])
     w("Топ источников стражей:")
     for name, n in src.most_common(15):
@@ -879,6 +963,14 @@ def _check_framework_guard():
     # обычный app-guard (auth/feature-флаг) — не фреймворк, остаётся в guard_count
     assert not _is_framework_guard(g("invoke", "Lcom/app/SessionManager;->isLoggedIn()Z"))
     assert not _is_framework_guard(g("field", "Lcom/app/Config;->featureX Z"))
+    # пролог suspend-функции: label/instanceof класса-континуации (есть invokeSuspend)
+    M = namedtuple("M", "name")
+    C = namedtuple("C", "methods")
+    C.get_methods = lambda self: self.methods
+    dx = type("DX", (), {"classes": {"Lk70;": C([M("invokeSuspend")]), "Lcom/app/Cfg;": C([M("get")])}})()
+    assert _reads_continuation(dx, g("field", "Lk70;->E I"))
+    assert _reads_continuation(dx, g("instanceof", "Lk70;"))
+    assert not _reads_continuation(dx, g("field", "Lcom/app/Cfg;->on Z"))
     print("  framework_guard ok")
 
 
@@ -897,22 +989,23 @@ def main():
         ap.error("нужны --hidden и --apk")
     keys = load_hidden(args.hidden)
     apk_obj, dx = load_apk(args.apk)
+    # Spec §4: паритет сборки со static+dynamic (как diff.py) — пакет/версия
+    # из манифеста, который androguard уже распарсил внутри load_apk.
+    meta = {"package": apk_obj.get_package(),
+            "versionName": apk_obj.get_androidversion_name(),
+            "versionCode": apk_obj.get_androidversion_code()}
+    want = next((r.get("versionCode") for r in map(json.loads, filter(str.strip,
+                 args.hidden.read_text(encoding="utf-8").splitlines()))
+                 if r.get("status") == "meta"), None)
+    if want and str(want) != str(meta["versionCode"]):
+        sys.exit(f"error: {args.hidden} снят со сборки versionCode={want}, APK — "
+                 f"{meta['versionCode']}: чужие ключи молча ушли бы в no_caller")
     records = run(dx, keys)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         with args.out.open("w", encoding="utf-8") as f:
             for r in records:
-                # на всякий случай — рекорд и так не содержит ma (Task 5 кладёт
-                # в call_sites/guards только {caller,offset}/операнды), но
-                # страхуемся от нежелательных не-JSON полей при апгрейде схемы
-                f.write(json.dumps({k: v for k, v in r.items() if k != "ma"},
-                                   ensure_ascii=False) + "\n")
-    # Spec §4: паритет сборки со static+dynamic (как diff.py) — пакет/версия
-    # из манифеста, который androguard уже распарсил внутри load_apk (без
-    # повторного полного прохода по APK).
-    meta = {"package": apk_obj.get_package(),
-            "versionName": apk_obj.get_androidversion_name(),
-            "versionCode": apk_obj.get_androidversion_code()}
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
     txt = report(records, meta=meta)
     print(txt)
     if args.out:
@@ -925,6 +1018,7 @@ def _selfcheck(apk=None):
     _check_control_deps()
     _check_classify_operand()
     _check_walk_predicates()
+    _check_guard_operand()
     _check_framework_guard()
     _check_report()
     if apk:

@@ -9,6 +9,7 @@
 import argparse
 import json
 import random
+import re
 from pathlib import Path
 
 
@@ -16,6 +17,21 @@ def pick_sample(keys, n=18, seed=42):
     """Детерминированная подвыборка ключей (без повторов, отсортирована)."""
     r = random.Random(seed)
     return sorted(r.sample(keys, min(n, len(keys))))
+
+
+def _norm(kind, detail):
+    """Страж -> сравнимый вид (kind, 'Cls.member'). Разметка в JADX пишется
+    как `Cfg.mode` / `a.b.SessionManager.isLoggedIn()`, срез — дескрипторами
+    androguard (`La/b/Cfg;->mode I`); без сведения к общему виду ни один
+    страж не совпал бы. Константы и прочее — как есть."""
+    if kind not in ("invoke", "field") or not detail:
+        return (kind, detail)
+    owner, sep, member = str(detail).partition("->")
+    if not sep:
+        owner, _, member = str(detail).rpartition(".")
+    # JADX печатает вложенный класс как Outer.Inner, байткод — Outer$Inner
+    owner = re.split(r"[/.$]", owner.rstrip(";"))[-1]
+    return (kind, f"{owner}.{re.split(r'[\s(]', member, 1)[0]}")
 
 
 def _guards_of(rec):
@@ -27,7 +43,7 @@ def _guards_of(rec):
     скоринг против этого шума обессмысливает precision/recall.
     """
     return {
-        (g["operand"]["source_kind"], g["operand"]["detail"])
+        _norm(g["operand"]["source_kind"], g["operand"]["detail"])
         for g in rec.get("guards", [])
         if not g["notes"]
     }
@@ -60,7 +76,7 @@ def main():
         print("selfcheck ok")
         return
     if a.pick:
-        import slice as sl  # sibling module (запуск из new/)
+        import slice as sl  # соседний модуль, запуск из корня репозитория
         for k in pick_sample(sl.load_hidden(a.hidden)):
             print(k)
         return
@@ -70,7 +86,7 @@ def main():
             continue
         r = json.loads(line)
         pred[r["key"]] = _guards_of(r)
-    truth = {k: {tuple(x) for x in v} for k, v in json.loads(a.truth.read_text(encoding="utf-8")).items()}
+    truth = {k: {_norm(*x) for x in v} for k, v in json.loads(a.truth.read_text(encoding="utf-8")).items()}
     print(json.dumps(score(pred, truth), indent=2, ensure_ascii=False))
 
 
@@ -88,7 +104,12 @@ def _check_scorer():
             {"operand": {"source_kind": "field", "detail": "TT->z I"}, "notes": ["coroutine_state_machine"]},
         ]
     }
-    assert _guards_of(rec) == {("invoke", "S->isLoggedIn()Z")}
+    assert _guards_of(rec) == {("invoke", "S.isLoggedIn")}
+    # разметка из JADX и дескриптор androguard сводятся к одному виду
+    assert _norm("field", "Lcom/app/Cfg;->mode I") == _norm("field", "com.app.Cfg.mode") == ("field", "Cfg.mode")
+    assert _norm("invoke", "Lcom/app/S;->isLoggedIn()Z") == _norm("invoke", "S.isLoggedIn()") == ("invoke", "S.isLoggedIn")
+    assert _norm("field", "Lcom/app/Outer$Inner;->on Z") == _norm("field", "Outer.Inner.on") == ("field", "Inner.on")
+    assert _norm("const", 2) == ("const", 2)
     print("  scorer ok")
 
 

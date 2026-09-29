@@ -175,6 +175,8 @@ def main():
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         with args.out.open("w", encoding="utf-8") as f:
+            if meta:  # версия сборки — slice.py сверит её с APK
+                f.write(json.dumps({**meta, "status": "meta"}, ensure_ascii=False) + "\n")
             for key in hidden_keys:
                 for r in by_key[key]:
                     f.write(json.dumps({**r, "status": "hidden"},
