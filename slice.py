@@ -154,6 +154,39 @@ def min_path_guards(weight, children, tops, frontier, sink):
     return fcost, (fcost <= tcost)
 
 
+def _check_cha():
+    # фейковая иерархия: C extends B implements I; I.m и B.n объявлены.
+    # xref проверяем через cha_caller_sites: вызывающий I.m() должен подтянуться
+    # к C.m() (полиморфный invoke-interface), которого в прямом xref C.m() нет.
+    class FMA:
+        def __init__(self, name, desc, cls, callers=()):
+            self.name, self.descriptor, self.class_name = name, desc, cls
+            self._callers = callers
+        def get_xref_from(self):
+            return [(None, cma, off) for cma, off in self._callers]
+    class FCA:
+        def __init__(self, ext, impl, methods, external=False):
+            self.extends, self.implements, self._m, self._ext = ext, impl, methods, external
+        def is_external(self): return self._ext
+        def get_methods(self): return self._m
+    caller = FMA("onCreate", "()V", "LA;")
+    i_m = FMA("m", "()V", "LI;", callers=[(caller, 10)])      # вызывающий висит на I.m()
+    c_m = FMA("m", "()V", "LC;")                               # у реализации прямого xref нет
+    dx = type("DX", (), {})()
+    dx.classes = {"LI;": FCA(None, [], [i_m], external=False),
+                  "LB;": FCA("Ljava/lang/Object;", [], []),
+                  "LC;": FCA("LB;", ["LI;"], [c_m])}
+    _cha_supers.cache_clear()
+    assert set(_cha_supers(dx, "LC;")) == {"LB;", "LI;"}, _cha_supers(dx, "LC;")
+    sites, used = cha_caller_sites(dx, c_m)
+    assert used and (caller, 10) in sites, (sites, used)
+    # у метода с прямым xref и без супертипов CHA ничего не добавляет
+    _cha_supers.cache_clear()
+    sites2, used2 = cha_caller_sites(dx, i_m)
+    assert used2 is False and (caller, 10) in sites2, (sites2, used2)
+    print("  cha ok")
+
+
 def _check_min_path():
     sink = "H"
     # ромб: вход E -> {A,B} -> C -> H; A несёт 2 стража, B — 0, C — 1.
@@ -300,6 +333,57 @@ def resolve_call_sites(dx, cls, method):
             sites.append({"caller": method_key(caller_ma),
                           "caller_ma": caller_ma, "offset": off})
     return sites
+
+
+@lru_cache(maxsize=None)
+def _cha_supers(dx, class_desc):
+    """Транзитивные супертипы класса (extends + implements), существующие в APK
+    (внешние/Object отбрасываются). Кэш — обход зовёт на каждый кадр, иерархия
+    у класса фиксирована."""
+    ca = dx.classes.get(class_desc)
+    if ca is None or ca.is_external():
+        return ()
+    out = []
+    supers = ([ca.extends] if ca.extends else []) + list(ca.implements)
+    for s in supers:
+        if not s or s == "Ljava/lang/Object;":
+            continue
+        out.append(s)
+        out.extend(_cha_supers(dx, s))
+    return tuple(dict.fromkeys(out))  # дедуп, порядок сохранён
+
+
+def cha_caller_sites(dx, ma):
+    """Вызывающие метода ma с учётом CHA (§7.2): помимо прямого xref_from самого
+    ma — xref_from одноимённых (name+descriptor) объявлений в его супертипах.
+    Полиморфный вызов `invoke-interface I.m()` / `invoke-super` виден в xref_from
+    интерфейсного/родительского объявления I.m(), а НЕ реализации C.m() — без
+    этого обход обрывался на реализации (dead_end).
+
+    CHA полон по достижимости (ни один вызывающий не теряется), но
+    over-approximation: вызывающие полиморфного I.m() приписываются ВСЕМ его
+    реализациям, не только настоящей. Для min-по-путям (activation_cost) это
+    смещение вниз — оговорено в методологии (docs/slice-methodology.md §7.2).
+
+    Возвращает (sites, used_cha): sites — список (caller_ma, offset);
+    used_cha=True, если CHA добавил вызывающих сверх прямого xref."""
+    direct = [(xf[1], xf[-1]) for xf in ma.get_xref_from()]
+    name, desc = ma.name, ma.descriptor
+    extra = []
+    for sdesc in _cha_supers(dx, ma.class_name):
+        sca = dx.classes.get(sdesc)
+        if sca is None:
+            continue
+        for sm in sca.get_methods():
+            if sm.name == name and sm.descriptor == desc:
+                extra.extend((xf[1], xf[-1]) for xf in sm.get_xref_from())
+    # дедуп по (объект метода, offset): CHA мог продублировать прямой xref
+    seen, sites = set(), []
+    for cma, off in direct + extra:
+        if (cma, off) not in seen:
+            seen.add((cma, off))
+            sites.append((cma, off))
+    return sites, bool(extra)
 
 
 def _reg(operand):
@@ -589,13 +673,14 @@ def backward_frames(dx, cls, method, limit=6, exported=()):
     if not sites:
         return {"reached": False, "call_sites": [], "frames": [],
                 "frontier": None, "depth": 0, "plumbing_skipped": [],
-                "depth_capped": False, "dead_ends": [], "edges": [],
+                "depth_capped": False, "dead_ends": [], "edges": [], "cha_used": False,
                 "frontier_nodes": set(), "dead_end_nodes": set(),
                 "capped_nodes": set(), "plumbing_nodes": set()}
     frames, skipped, frontier, dead_ends = [], [], None, []
     edges = []
     frontier_nodes, dead_end_nodes, capped_nodes, plumbing_nodes = set(), set(), set(), set()
     visited = set()
+    cha_used = False
     max_depth = 0
     depth_capped = False  # True, если ХОТЬ ОДИН путь упёрся в limit (OR по путям)
     nid = lambda ma, o: (id(ma), o)
@@ -631,8 +716,9 @@ def backward_frames(dx, cls, method, limit=6, exported=()):
                 depth_capped = True
                 capped_nodes.add(node)
                 continue  # этот путь упёрся в лимит глубины
-        # шаг вверх: кто вызывает именно этот метод
-        ups = [(xf[1], xf[-1]) for xf in caller_ma.get_xref_from()]
+        # шаг вверх: кто вызывает именно этот метод (с CHA — §7.2)
+        ups, used = cha_caller_sites(dx, caller_ma)
+        cha_used = cha_used or used
         if not ups and caller_ma.name in _COROUTINE_FRAME_METHODS:
             # invoke/invokeSuspend/create лямбды зовёт рантайм через интерфейс
             # (Function*/Continuation) — XREF пуст. Точка активации лямбды — место
@@ -653,7 +739,7 @@ def backward_frames(dx, cls, method, limit=6, exported=()):
     return {"reached": True, "call_sites": sites, "frames": frames,
             "frontier": frontier, "depth": max_depth,
             "plumbing_skipped": skipped, "depth_capped": depth_capped,
-            "dead_ends": dead_ends, "edges": edges,
+            "dead_ends": dead_ends, "edges": edges, "cha_used": cha_used,
             "frontier_nodes": frontier_nodes, "dead_end_nodes": dead_end_nodes,
             "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes}
 
@@ -947,6 +1033,10 @@ def slice_key(dx, key):
         rec["notes"].append("depth_cap")
     if w["dead_ends"]:
         rec["notes"].append("dead_end")
+    if w["cha_used"]:
+        # хотя бы один вызывающий найден по CHA (полиморфный вызов) — путь, а
+        # значит и activation_cost, возможно over-approximated (§7.2)
+        rec["notes"].append("cha")
     return rec
 
 
@@ -1195,6 +1285,7 @@ def main():
 
 
 def _selfcheck(apk=None):
+    _check_cha()
     _check_min_path()
     _check_control_deps()
     _check_classify_operand()
