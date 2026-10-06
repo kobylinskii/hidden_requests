@@ -109,6 +109,80 @@ def control_deps(cfg, criterion, exit_node):
     return list(result)
 
 
+def min_path_guards(weight, children, tops, frontier, sink):
+    """Минимум реальных стражей на пути UI-вход -> скрытый вызов (открытый
+    вопрос §7.1: стоимость активации = минимум по путям, а не объединение).
+
+    weight:   node_id -> число реальных (не-флагованных) стражей кадра; у плумбинга 0.
+    children: node_id -> множество node_id, которые кадр вызывает ВНИЗ к sink
+              (у call-site'ов среди children есть sink; у sink детей нет).
+    tops:     node_id максимальных кадров обхода (фронтир | dead_end | depth_cap).
+    frontier: подмножество tops — настоящие UI/lifecycle/exported-входы.
+    sink:     синтетический узел скрытого вызова, weight[sink] = 0.
+
+    dist(n) = weight(n) + min(dist(c) for c in children(n)); dist(sink)=0.
+    Веса неотрицательны -> цикл (рекурсия) путь не удешевляет; мемоизация с
+    защитой от цикла (узел в процессе обхода даёт +inf — через него конечного
+    пути нет).
+
+    Возвращает (cost, exact):
+      cost  — минимум по frontier-входам, дотянувшимся до sink; если таких нет —
+              нижняя оценка по всем tops (путь оборван, выше могли быть ещё
+              стражи); None, если ни один top не достигает sink.
+      exact — True, если cost достигнут настоящим UI-входом И ни один оборванный
+              top не дешевле (т.е. истинная стоимость не может быть ниже)."""
+    INF = float("inf")
+    memo, inprog = {sink: 0}, set()
+
+    def dist(n):
+        if n in memo:
+            return memo[n]
+        if n in inprog:
+            return INF  # цикл: этот заход конечного пути к sink не даёт
+        inprog.add(n)
+        best = min((dist(c) for c in children.get(n, ())), default=INF)
+        inprog.discard(n)
+        memo[n] = INF if best == INF else weight.get(n, 0) + best
+        return memo[n]
+
+    fcost = min((dist(f) for f in frontier), default=INF)
+    tcost = min((dist(t) for t in tops), default=INF)
+    if fcost == INF:
+        return (None if tcost == INF else tcost), False
+    # fcost конечен: истинная стоимость через UI = fcost. exact, только если ни
+    # один оборванный top не дешевле (иначе настоящий путь может быть короче).
+    return fcost, (fcost <= tcost)
+
+
+def _check_min_path():
+    sink = "H"
+    # ромб: вход E -> {A,B} -> C -> H; A несёт 2 стража, B — 0, C — 1.
+    # дешёвый путь E-B-C-H = 0+0+1 = 1 страж.
+    weight = {"E": 0, "A": 2, "B": 0, "C": 1, sink: 0}
+    children = {"E": {"A", "B"}, "A": {"C"}, "B": {"C"}, "C": {sink}}
+    cost, exact = min_path_guards(weight, children, {"E"}, {"E"}, sink)
+    assert (cost, exact) == (1, True), (cost, exact)
+
+    # оборванный путь дешевле фронтира: frontier F (1 страж) -> C(1) -> H,
+    # dead_end D (0) -> C(1) -> H. Настоящий UI-путь = 2, но через D может быть 1
+    # -> cost=2, exact=False (истинная стоимость может быть ниже).
+    weight = {"F": 1, "D": 0, "C": 1, sink: 0}
+    children = {"F": {"C"}, "D": {"C"}, "C": {sink}}
+    cost, exact = min_path_guards(weight, children, {"F", "D"}, {"F"}, sink)
+    assert (cost, exact) == (2, False), (cost, exact)
+
+    # ни один фронтир не дотянулся: только dead_end D(2)->C(1)->H -> нижняя оценка 3
+    cost, exact = min_path_guards({"D": 2, "C": 1, sink: 0},
+                                  {"D": {"C"}, "C": {sink}}, {"D"}, set(), sink)
+    assert (cost, exact) == (3, False), (cost, exact)
+
+    # цикл в графе вызовов не зацикливает и не удешевляет: A<->B, A->H, оба по 1
+    cost, exact = min_path_guards({"A": 1, "B": 1, sink: 0},
+                                  {"A": {"B", sink}, "B": {"A"}}, {"B"}, {"B"}, sink)
+    assert (cost, exact) == (2, True), (cost, exact)  # B->A->H = 1+1
+    print("  min_path ok")
+
+
 def _check_control_deps():
     import networkx as nx
     # прямая линия: стражей нет
@@ -451,51 +525,90 @@ def is_plumbing(key, ma):
     return False
 
 
-def is_frontier(key):
+def is_frontier(key, exported=()):
     """UI/lifecycle/entry-колбэк — точка, где обратный обход останавливается
-    (дальше вверх — фреймворк, не наш код): либо имя метода из известного
-    набора колбэков жизненного цикла/UI, либо класс из android./androidx.
-    (сам фреймворк вызывает наш метод, выше в стеке ничего нашего нет)."""
+    (дальше вверх — фреймворк, не наш код): имя метода из известного набора
+    колбэков жизненного цикла/UI, класс из android./androidx. (сам фреймворк
+    вызывает наш метод, выше в стеке ничего нашего нет), либо класс —
+    exported-компонент манифеста (§7.2: альтернативная точка входа — deep link,
+    виджет, вызов из другого приложения; выше по стеку наш код не идёт)."""
     cls, _, name = key.partition("->")
     if name in _FRONTIER_NAMES:
         return True
-    return cls.startswith("android.") or cls.startswith("androidx.")
+    if cls.startswith("android.") or cls.startswith("androidx."):
+        return True
+    return cls in exported
 
 
-def backward_frames(dx, cls, method, limit=6):
+def manifest_entry_classes(apk):
+    """FQCN exported-компонентов манифеста (activity/service/receiver/provider):
+    android:exported="true" ЛИБО есть intent-filter при отсутствии exported
+    (неявный exported до API 31). Это альтернативные точки входа (§7.2) —
+    фронтир обратного обхода наравне с UI-колбэками."""
+    ns = "{http://schemas.android.com/apk/res/android}"
+    out = set()
+    try:
+        root = apk.get_android_manifest_xml()
+    except Exception:
+        return out
+    for tag in ("activity", "activity-alias", "service", "receiver", "provider"):
+        for el in root.iter(tag):
+            name = el.get(ns + "name")
+            if not name:
+                continue
+            exp = el.get(ns + "exported")
+            if exp == "true" or (exp is None and el.find("intent-filter") is not None):
+                out.add(name if name[0] != "." else apk.get_package() + name)
+    return out
+
+
+SINK = ("__sink__",)  # синтетический узел скрытого вызова в графе кадров (§7.1)
+
+
+def backward_frames(dx, cls, method, limit=6, exported=()):
     """Обратный межпроцедурный обход от call-site'ов cls->method вверх по
-    графу вызовов до фронтира (UI/lifecycle) или лимита глубины. Плумбинг
-    (is_plumbing) проходится насквозь — не попадает в frames и не тратит
-    бюджет глубины (вверх от него идём с ТЕМ ЖЕ depth), но обход через его
-    вызывающих продолжается. Циклы (рекурсия, coroutine resume через себя
-    же) гасятся visited-множеством по (caller_key, offset) — один и тот же
+    графу вызовов до фронтира (UI/lifecycle/exported) или лимита глубины.
+    Плумбинг (is_plumbing) проходится насквозь — не попадает в frames и не
+    тратит бюджет глубины (вверх от него идём с ТЕМ ЖЕ depth), но обход через
+    его вызывающих продолжается. Циклы (рекурсия, coroutine resume через себя
+    же) гасятся visited-множеством по (метод, offset) — один и тот же
     call-site не обрабатывается дважды, что гарантирует терминацию на
     конечном графе вызовов.
 
     Ruling-E: limit — бюджет глубины ОДНОГО пути (как ICSE-обход
-    startActivity->onCreate), а не общий потолок на len(frames). При
-    нескольких исходных call-site'ах или fan-in выше по графу каждый путь
-    независимо идёт до своего фронтира/лимита; итоговый frames естественно
-    ограничен только visited-дедупом по (метод, offset), без искусственного
-    общего капа. Метод без вызывающих (не фронтир) попадает в dead_ends:
-    путь оборван, стражи выше него не видны."""
+    startActivity->onCreate), а не общий потолок на len(frames).
+
+    §7.1: обход строит граф кадров для минимума по путям. node = (id(ma), off)
+    (совпадает с ключом visited). edges — рёбра ВНИЗ к скрытому вызову
+    (родитель-вызывающий -> потомок-вызываемый); у исходных call-site'ов
+    потомок — SINK. Рёбра пишутся в момент ОБНАРУЖЕНИЯ (push), до дедупа, иначе
+    fan-in терялся бы. frontier_nodes / dead_end_nodes / capped_nodes —
+    максимальные кадры (входы обхода); plumbing_nodes — узлы-плумбинг
+    (вес 0 в минимуме по путям)."""
     sites = resolve_call_sites(dx, cls, method)
     if not sites:
         return {"reached": False, "call_sites": [], "frames": [],
                 "frontier": None, "depth": 0, "plumbing_skipped": [],
-                "depth_capped": False, "dead_ends": []}
+                "depth_capped": False, "dead_ends": [], "edges": [],
+                "frontier_nodes": set(), "dead_end_nodes": set(),
+                "capped_nodes": set(), "plumbing_nodes": set()}
     frames, skipped, frontier, dead_ends = [], [], None, []
+    edges = []
+    frontier_nodes, dead_end_nodes, capped_nodes, plumbing_nodes = set(), set(), set(), set()
     visited = set()
     max_depth = 0
     depth_capped = False  # True, если ХОТЬ ОДИН путь упёрся в limit (OR по путям)
-    # очередь: (callee_key, caller_ma, offset, depth) — depth путевой (per-path).
+    nid = lambda ma, o: (id(ma), o)
+    # очередь: (child_node, caller_ma, offset, depth) — depth путевой (per-path);
+    # child_node — узел, который этот кадр вызывает ВНИЗ к скрытому вызову.
     # 0-1 BFS (спека §5.2), не DFS: при visited-дедупе DFS мог впервые прийти в
     # кадр по длинному пути, упереться в limit и отбросить короткий путь к нему.
-    # Здесь кадр впервые посещается на своей минимальной глубине.
-    queue = deque((f"{cls}->{method}", s["caller_ma"], s["offset"], 0) for s in sites)
+    queue = deque((SINK, s["caller_ma"], s["offset"], 0) for s in sites)
     while queue:
-        callee_key, caller_ma, off, depth = queue.popleft()
+        child_node, caller_ma, off, depth = queue.popleft()
+        node = nid(caller_ma, off)
         ckey = method_key(caller_ma)
+        edges.append((node, child_node))  # ребро вниз к скрытому вызову (до дедупа)
         # дедуп по самому методу, не по имени: у R8 перегрузки a(I)/a(J) — разные
         # методы с одним ключом, склейка давала ложный fan-in (выброс 528 стражей)
         if (caller_ma, off) in visited:
@@ -504,17 +617,19 @@ def backward_frames(dx, cls, method, limit=6):
         plumbing = is_plumbing(ckey, caller_ma)
         if plumbing:
             skipped.append(ckey)
+            plumbing_nodes.add(node)
             # плумбинг не тратит бюджет глубины — depth дальше вверх тот же
         else:
-            frames.append({"key": ckey, "ma": caller_ma,
-                           "callee_key": callee_key, "offset": off})
+            frames.append({"key": ckey, "ma": caller_ma, "node": node, "offset": off})
             max_depth = max(max_depth, depth + 1)
-            if is_frontier(ckey):
+            if is_frontier(ckey, exported):
                 frontier = ckey
+                frontier_nodes.add(node)
                 continue  # путь дошёл до фронтира — выше по нему не поднимаемся
             depth += 1
             if depth >= limit:
                 depth_capped = True
+                capped_nodes.add(node)
                 continue  # этот путь упёрся в лимит глубины
         # шаг вверх: кто вызывает именно этот метод
         ups = [(xf[1], xf[-1]) for xf in caller_ma.get_xref_from()]
@@ -530,13 +645,17 @@ def backward_frames(dx, cls, method, limit=6):
             ups = list(ca.get_xref_new_instance()) if ca else []
         if not ups:
             dead_ends.append(ckey)  # путь оборван не на фронтире: стражи выше не видны
+            if not plumbing:
+                dead_end_nodes.add(node)
         push = queue.appendleft if plumbing else queue.append  # плумбинг: та же глубина
         for ma, o in ups:
-            push((ckey, ma, o, depth))
+            push((node, ma, o, depth))  # node — потомок (вниз к скрытому вызову) для вызывающего
     return {"reached": True, "call_sites": sites, "frames": frames,
             "frontier": frontier, "depth": max_depth,
             "plumbing_skipped": skipped, "depth_capped": depth_capped,
-            "dead_ends": dead_ends}
+            "dead_ends": dead_ends, "edges": edges,
+            "frontier_nodes": frontier_nodes, "dead_end_nodes": dead_end_nodes,
+            "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes}
 
 
 def _check_walk_predicates():
@@ -752,12 +871,13 @@ def slice_key(dx, key):
     abstract-объявление) не роняет обход — помечается inconclusive и
     пропускается (Review Focus)."""
     cls, _, method = key.partition("->")
-    w = backward_frames(dx, cls, method)
+    w = backward_frames(dx, cls, method, exported=getattr(dx, "_exported", ()))
     rec = {"key": key, "cls": cls, "method": method,
            "reached": w["reached"],
            "call_sites": [{"caller": s["caller"], "offset": s["offset"]} for s in w["call_sites"]],
            "guards": [], "guard_count": 0, "guard_count_coroutine": 0,
-           "guard_count_framework": 0, "args": [],
+           "guard_count_framework": 0, "activation_cost": None,
+           "activation_exact": False, "args": [],
            "frontier": w["frontier"], "depth": w["depth"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "notes": []}
@@ -768,38 +888,54 @@ def slice_key(dx, key):
         known = ca is not None and any(m.name == method for m in ca.get_methods())
         rec["notes"].append("no_caller" if known else "key_not_in_dex")
         return rec
-    all_guards, seen = [], set()
+    all_guards, seen, weight = [], set(), {}
     for f in w["frames"]:
         fr = frame_of(f["ma"])
         if fr is None:
             rec["inconclusive"] = True
             continue
+        node_real = 0
         for g in guards_of_frame(fr, f["offset"]):
-            # несколько call-site в одном методе делят одни и те же ветвления —
-            # одно условие считается один раз
-            sig = (id(f["ma"]), g["opcode"], g["sense"], g["operand"]["source_kind"],
-                   str(g["operand"]["detail"]))
-            if sig in seen:
-                continue
-            seen.add(sig)
             g["frame"] = f["key"]
+            # флаги coroutine/framework взаимоисключающи (elif) — одним проходом,
+            # чтобы вес кадра для минимума по путям (§7.1) считался по уже
+            # очищенным стражам.
             if _is_coroutine_state_guard(g) or _reads_continuation(dx, g):
                 g["notes"] = ["coroutine_state_machine"]
+            elif (_is_framework_guard(g) or g["frame"].startswith(_FRAMEWORK_OWNER_PREFIXES)
+                  # switch по enum: `aget ordinal` из $EnumSwitchMapping$ — таблица,
+                  # сгенерированная компилятором, а не гейт приложения (§7.3)
+                  or any("$EnumSwitchMapping$" in str(d) for d in g.get("_block_refs", ()))):
+                g["notes"] = ["framework"]
             g.pop("_block_refs", None)  # служебное, не в выход
-            all_guards.append(g)
-    # round-2 review Fix 2: фреймворк/компилятор-стражи — та же логика флагов,
-    # что и coroutine, НЕ поверх уже coroutine-флагованных (elif через notes).
-    for g in all_guards:
-        # кадр самого фреймворка (фронтир androidx.*) — его ветвления не гейты приложения
-        if not g["notes"] and (_is_framework_guard(g) or g["frame"].startswith(_FRAMEWORK_OWNER_PREFIXES)):
-            g["notes"] = ["framework"]
+            if not g["notes"]:
+                node_real += 1  # вес кадра — его СОБСТВЕННЫЕ реальные стражи
+            # для guards[]/union guard_count — межкадровый дедуп (одно условие на
+            # нескольких call-site одного метода не задваивается); на вес кадра
+            # (минимум по путям) дедуп НЕ влияет — там каждый узел считает своё.
+            sig = (id(f["ma"]), g["opcode"], g["sense"], g["operand"]["source_kind"],
+                   str(g["operand"]["detail"]))
+            if sig not in seen:
+                seen.add(sig)
+                all_guards.append(g)
+        weight[f["node"]] = node_real
     rec["guards"] = all_guards
-    # Ruling-H: guard_count — только НЕ помеченные (headline-метрика); каждый
-    # флаг — отдельным счётчиком по СВОЕЙ метке (не "любые notes" — теперь их
-    # два вида), guards[] несёт все стражи, включая помеченные.
+    # Ruling-H: union guard_count — ВЕРХНЯЯ оценка (все стражи всех путей);
+    # headline-метрика стоимости активации — activation_cost (минимум по путям).
     rec["guard_count"] = sum(1 for g in all_guards if not g["notes"])
     rec["guard_count_coroutine"] = sum(1 for g in all_guards if "coroutine_state_machine" in g["notes"])
     rec["guard_count_framework"] = sum(1 for g in all_guards if "framework" in g["notes"])
+    # §7.1: минимум реальных стражей по путям UI-вход -> скрытый вызов.
+    children = {}
+    for parent, child in w["edges"]:
+        children.setdefault(parent, set()).add(child)
+    tops = w["frontier_nodes"] | w["dead_end_nodes"] | w["capped_nodes"]
+    cost, exact = min_path_guards(weight, children, tops, w["frontier_nodes"], SINK)
+    rec["activation_cost"], rec["activation_exact"] = cost, exact
+    if cost is None:
+        # ни один top (фронтир/dead_end/depth_cap) не дотянулся до скрытого вызова:
+        # все пути обрываются на плумбинге — стоимость активации не определена
+        rec["notes"].append("no_semantic_entry")
     # round-2 review Fix 1: происхождение аргументов скрытого вызова (спека
     # §5.7) — по ПЕРВОМУ call-site (данных-ось не требует нескольких путей,
     # как guard-сторона; симметрично её простоте).
@@ -826,9 +962,12 @@ def _check_slice_key(dx):
     assert isinstance(rec["guards"], list)
     assert (rec["guard_count"] + rec["guard_count_coroutine"] + rec["guard_count_framework"]
             == len(rec["guards"]))
-    assert set(("reached", "call_sites", "guards", "args", "frontier",
-                "inconclusive", "guard_count_coroutine", "guard_count_framework")) <= set(rec)
+    assert set(("reached", "call_sites", "guards", "args", "frontier", "inconclusive",
+                "guard_count_coroutine", "guard_count_framework",
+                "activation_cost", "activation_exact")) <= set(rec)
     assert all("notes" in g for g in rec["guards"])
+    # §7.1: минимум по путям не больше объединения (union) — верхней оценки
+    assert rec["activation_cost"] is None or rec["activation_cost"] <= rec["guard_count"], rec
     # Ruling-H (fix round 1): известный кейс несёт coroutine state-machine
     # стражи (continuation TT->invokeSuspend/invoke, self-field label) —
     # они помечены и НЕ входят в headline guard_count; регрессия отката
@@ -892,10 +1031,24 @@ def report(records, meta=None):
     w(f"Стражи state-machine корутин (флагованы, исключены из guard_count и топа источников): {coroutine_total}")
     w(f"Стражи фреймворка/компилятора (флагованы, исключены из guard_count и топа источников): {framework_total}")
     dist = Counter(min(r["guard_count"], 4) for r in records if r["reached"])
-    w("Распределение guard_count (сырьё для Таблицы IV):")
+    w("Распределение guard_count — ВЕРХНЯЯ оценка, объединение стражей всех путей:")
     for k in range(5):
         label = "4+" if k == 4 else str(k)
         w(f"  {label} стражей: {dist.get(k, 0)}")
+    # §7.1: минимум по путям — стоимость активации. Таблица IV строится ТОЛЬКО по
+    # ключам с activation_exact (путь дошёл до UI-входа); остальные — нижняя оценка.
+    exact = [r for r in records if r["reached"] and r.get("activation_exact")]
+    lower = [r for r in records if r["reached"] and not r.get("activation_exact")
+             and r.get("activation_cost") is not None]
+    adist = Counter(min(r["activation_cost"], 4) for r in exact)
+    w(f"Стоимость активации (минимум по путям), ТОЧНО (путь до UI-входа): {len(exact)} ключей — "
+      f"это и есть Таблица IV:")
+    for k in range(5):
+        label = "4+" if k == 4 else str(k)
+        w(f"  {label} стражей: {adist.get(k, 0)}")
+    w(f"Нижняя оценка (обход не дошёл до UI-входа, истинная стоимость не меньше): {len(lower)} ключей")
+    undet = sum(1 for r in records if r["reached"] and r.get("activation_cost") is None)
+    w(f"Стоимость не определена (обход завершился только на плумбинге, нет семантического входа): {undet} ключей")
     src = Counter(g["operand"]["detail"] for r in records for g in r["guards"]
                   if not g["notes"] and g["operand"]["source_kind"] in ("invoke", "field", "instanceof")
                   and g["operand"]["detail"])
@@ -905,7 +1058,10 @@ def report(records, meta=None):
     w("")
     for r in records:
         tag = "HIDDEN" if r["reached"] else "NO-CALLER"
-        w(f"[{tag}] {r['key']}  guards={r['guard_count']} frontier={r['frontier']} notes={r['notes']}")
+        ac = r.get("activation_cost")
+        acs = (f"{ac}{'' if r.get('activation_exact') else '+'}" if ac is not None else "?")
+        w(f"[{tag}] {r['key']}  activation_cost={acs} guard_count(union)={r['guard_count']} "
+          f"frontier={r['frontier']} notes={r['notes']}")
         for g in r["guards"]:
             o = g["operand"]
             flag = f" [{','.join(g['notes'])}]" if g["notes"] else ""
@@ -1012,6 +1168,7 @@ def main():
         ap.error("нужны --hidden и --apk")
     keys = load_hidden(args.hidden)
     apk_obj, dx = load_apk(args.apk)
+    dx._exported = manifest_entry_classes(apk_obj)  # §7.2: exported — фронтир обхода
     # Spec §4: паритет сборки со static+dynamic (как diff.py) — пакет/версия
     # из манифеста, который androguard уже распарсил внутри load_apk.
     meta = {"package": apk_obj.get_package(),
@@ -1038,6 +1195,7 @@ def main():
 
 
 def _selfcheck(apk=None):
+    _check_min_path()
     _check_control_deps()
     _check_classify_operand()
     _check_walk_predicates()

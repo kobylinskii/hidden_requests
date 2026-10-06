@@ -103,6 +103,16 @@ def report(static, called, http, meta=None, verbose=False):
     w(f"Вызвано в рантайме:                      {len(found_keys)}")
     pct = f" ({len(hidden_keys) / len(by_key) * 100:.1f}%)" if by_key else ""
     w(f"СКРЫТО (ни разу не вызвано):             {len(hidden_keys)}{pct}")
+    # hook.js слой 1 ловит только Retrofit/Ktorfit-вызовы через java.lang.reflect.Proxy.
+    # Если в рантайме не перехвачено НИ ОДНОГО ключа, а статика непуста — прокси-хук,
+    # вероятно, не сработал (Ktorfit с codegen-бэкендом строит вызовы без Proxy, либо
+    # retrofit2 переименован R8). Тогда ВСЕ ключи ложно выглядят скрытыми.
+    if by_key and not called:
+        w("")
+        w("[!] ВНИМАНИЕ: в рантайме не перехвачено ни одного ключа класс->метод, а в")
+        w("    статике они есть. hook.js слой 1 вешается на Proxy.newProxyInstance —")
+        w("    Ktorfit (codegen без Proxy) или переименованный R8 retrofit2 он не ловит,")
+        w("    и тогда весь список «скрытых» — артефакт непойманного слоя, а не результат.")
     w("")
 
     w("-" * 78)
