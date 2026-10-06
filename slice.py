@@ -121,9 +121,9 @@ def min_path_guards(weight, children, tops, frontier, sink):
     sink:     синтетический узел скрытого вызова, weight[sink] = 0.
 
     dist(n) = weight(n) + min(dist(c) for c in children(n)); dist(sink)=0.
-    Веса неотрицательны -> цикл (рекурсия) путь не удешевляет; мемоизация с
-    защитой от цикла (узел в процессе обхода даёт +inf — через него конечного
-    пути нет).
+    Веса неотрицательны -> задача шортест-пат: Дейкстра от sink по обратным
+    рёбрам (итеративно, без рекурсии — граф кадров с CHA бывает глубже лимита
+    стека Python; циклы Дейкстра обрабатывает естественно, не удешевляя путь).
 
     Возвращает (cost, exact):
       cost  — минимум по frontier-входам, дотянувшимся до sink; если таких нет —
@@ -131,22 +131,26 @@ def min_path_guards(weight, children, tops, frontier, sink):
               стражи); None, если ни один top не достигает sink.
       exact — True, если cost достигнут настоящим UI-входом И ни один оборванный
               top не дешевле (т.е. истинная стоимость не может быть ниже)."""
+    import heapq
     INF = float("inf")
-    memo, inprog = {sink: 0}, set()
+    parents = {}  # обратные рёбра: child -> множество его родителей (вызывающих)
+    for p, cs in children.items():
+        for c in cs:
+            parents.setdefault(c, set()).add(p)
+    dist = {sink: 0}
+    pq, cnt = [(0, 0, sink)], 1  # cnt — тай-брейк, чтобы heap не сравнивал узлы
+    while pq:
+        d, _, n = heapq.heappop(pq)
+        if d > dist.get(n, INF):
+            continue
+        for p in parents.get(n, ()):
+            nd = weight.get(p, 0) + d
+            if nd < dist.get(p, INF):
+                dist[p] = nd
+                heapq.heappush(pq, (nd, cnt, p)); cnt += 1
 
-    def dist(n):
-        if n in memo:
-            return memo[n]
-        if n in inprog:
-            return INF  # цикл: этот заход конечного пути к sink не даёт
-        inprog.add(n)
-        best = min((dist(c) for c in children.get(n, ())), default=INF)
-        inprog.discard(n)
-        memo[n] = INF if best == INF else weight.get(n, 0) + best
-        return memo[n]
-
-    fcost = min((dist(f) for f in frontier), default=INF)
-    tcost = min((dist(t) for t in tops), default=INF)
+    fcost = min((dist.get(f, INF) for f in frontier), default=INF)
+    tcost = min((dist.get(t, INF) for t in tops), default=INF)
     if fcost == INF:
         return (None if tcost == INF else tcost), False
     # fcost конечен: истинная стоимость через UI = fcost. exact, только если ни
@@ -335,6 +339,19 @@ def resolve_call_sites(dx, cls, method):
     return sites
 
 
+_CHA_FANIN_CAP = 16      # больше вызывающих у полиморфного метода -> общий интерфейс, не граница
+_FRAME_BUDGET = 4000     # потолок кадров на ключ: гарантия завершения при взрывном fan-in
+# Лимит глубины пути. Проверено на TNT: углубление НЕ помогает покрытию. При
+# limit=12 точных ключей стало меньше (29->27), шум стражей вырос в 5-13x, а
+# dead_end 100->115 — глубже обход лишь проходит больше промежуточных кадров и
+# упирается в общие DI/clean-arch интерфейсы (их CHA режет по _CHA_FANIN_CAP), не
+# доходя до UI; заодно более дешёвые оборванные top'ы демотируют бывшие точные
+# ключи. Ограничитель покрытия здесь архитектурный (shared-interface routing), не
+# глубина — его пробил бы points-to/RTA (whole-app, отвергнут в дизайне §2.1/§11),
+# а не CHA. limit=6 даёт лучший баланс точность/шум.
+_DEPTH_LIMIT = 6
+
+
 @lru_cache(maxsize=None)
 def _cha_supers(dx, class_desc):
     """Транзитивные супертипы класса (extends + implements), существующие в APK
@@ -365,25 +382,38 @@ def cha_caller_sites(dx, ma):
     реализациям, не только настоящей. Для min-по-путям (activation_cost) это
     смещение вниз — оговорено в методологии (docs/slice-methodology.md §7.2).
 
+    CHA применяется ТОЛЬКО когда прямой xref пуст (реальный тупик) — именно там
+    он нужен для покрытия. Применять его к кадрам, у которых вызывающие и так
+    есть, значило бы тянуть вызывающих интерфейса для каждого кадра — fan-in
+    взрывается, а стоимость смещается вниз сильнее.
+
+    Потолок fan-in (`_CHA_FANIN_CAP`): если у супер-объявления БОЛЬШЕ потолка
+    вызывающих — это общий/утилитный интерфейс (Repo-база, Function, use-case),
+    не граница активации конкретного запроса. CHA для него бессмыслен
+    (over-approximation на сотни мест) и взрывоопасен (каскадный fan-in не
+    завершается) — кадр остаётся тупиком (честная нижняя оценка activation_cost).
+
     Возвращает (sites, used_cha): sites — список (caller_ma, offset);
-    used_cha=True, если CHA добавил вызывающих сверх прямого xref."""
+    used_cha=True, если вызывающие найдены по CHA (прямой xref был пуст)."""
     direct = [(xf[1], xf[-1]) for xf in ma.get_xref_from()]
+    if direct:
+        return direct, False
     name, desc = ma.name, ma.descriptor
-    extra = []
+    seen, sites = set(), []
     for sdesc in _cha_supers(dx, ma.class_name):
         sca = dx.classes.get(sdesc)
         if sca is None:
             continue
         for sm in sca.get_methods():
             if sm.name == name and sm.descriptor == desc:
-                extra.extend((xf[1], xf[-1]) for xf in sm.get_xref_from())
-    # дедуп по (объект метода, offset): CHA мог продублировать прямой xref
-    seen, sites = set(), []
-    for cma, off in direct + extra:
-        if (cma, off) not in seen:
-            seen.add((cma, off))
-            sites.append((cma, off))
-    return sites, bool(extra)
+                for xf in sm.get_xref_from():
+                    cma, off = xf[1], xf[-1]
+                    if (cma, off) not in seen:
+                        seen.add((cma, off))
+                        sites.append((cma, off))
+                        if len(sites) > _CHA_FANIN_CAP:
+                            return [], False  # общий интерфейс — не граница, тупик
+    return sites, bool(sites)
 
 
 def _reg(operand):
@@ -555,12 +585,12 @@ def _check_androguard(dx):
     # число кадров естественно ограничено visited-дедупом по (key, offset).
     # Санити-порог на runaway — доказывает, что дедуп реально работает и
     # обход не взрывается комбинаторно на графе с высоким fan-in.
-    assert len(w["frames"]) < 300, w
+    assert len(w["frames"]) < _FRAME_BUDGET + 1, w
     # regression-guard против отката к глобальному капу на frames (round-1
     # review, Finding 1): у отвергнутого global-cap варианта здесь было бы
-    # ровно 6 кадров — >=1 и <300 это не ловят, а >6 ловит.
+    # ровно limit кадров — >=1 и <budget это не ловят, а >6 ловит.
     assert len(w["frames"]) > 6, w
-    assert w["depth"] <= 6, w              # per-path лимит глубины реально соблюдён
+    assert w["depth"] <= _DEPTH_LIMIT, w   # per-path лимит глубины реально соблюдён
     # цикл в графе вызовов не зациклил обход (дошли до сюда — visited работает)
     print("  backward_frames ok")
 
@@ -649,7 +679,7 @@ def manifest_entry_classes(apk):
 SINK = ("__sink__",)  # синтетический узел скрытого вызова в графе кадров (§7.1)
 
 
-def backward_frames(dx, cls, method, limit=6, exported=()):
+def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, exported=()):
     """Обратный межпроцедурный обход от call-site'ов cls->method вверх по
     графу вызовов до фронтира (UI/lifecycle/exported) или лимита глубины.
     Плумбинг (is_plumbing) проходится насквозь — не попадает в frames и не
@@ -674,13 +704,14 @@ def backward_frames(dx, cls, method, limit=6, exported=()):
         return {"reached": False, "call_sites": [], "frames": [],
                 "frontier": None, "depth": 0, "plumbing_skipped": [],
                 "depth_capped": False, "dead_ends": [], "edges": [], "cha_used": False,
-                "frontier_nodes": set(), "dead_end_nodes": set(),
+                "budget_hit": False, "frontier_nodes": set(), "dead_end_nodes": set(),
                 "capped_nodes": set(), "plumbing_nodes": set()}
     frames, skipped, frontier, dead_ends = [], [], None, []
     edges = []
     frontier_nodes, dead_end_nodes, capped_nodes, plumbing_nodes = set(), set(), set(), set()
     visited = set()
     cha_used = False
+    budget_hit = False
     max_depth = 0
     depth_capped = False  # True, если ХОТЬ ОДИН путь упёрся в limit (OR по путям)
     nid = lambda ma, o: (id(ma), o)
@@ -699,6 +730,11 @@ def backward_frames(dx, cls, method, limit=6, exported=()):
         if (caller_ma, off) in visited:
             continue
         visited.add((caller_ma, off))
+        if len(visited) > _FRAME_BUDGET:
+            # взрывной fan-in (общий интерфейс проскочил потолок): обход не
+            # должен виснуть — обрываем, ключ честно помечается budget_hit
+            budget_hit = True
+            break
         plumbing = is_plumbing(ckey, caller_ma)
         if plumbing:
             skipped.append(ckey)
@@ -740,6 +776,7 @@ def backward_frames(dx, cls, method, limit=6, exported=()):
             "frontier": frontier, "depth": max_depth,
             "plumbing_skipped": skipped, "depth_capped": depth_capped,
             "dead_ends": dead_ends, "edges": edges, "cha_used": cha_used,
+            "budget_hit": budget_hit,
             "frontier_nodes": frontier_nodes, "dead_end_nodes": dead_end_nodes,
             "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes}
 
@@ -1017,7 +1054,8 @@ def slice_key(dx, key):
         children.setdefault(parent, set()).add(child)
     tops = w["frontier_nodes"] | w["dead_end_nodes"] | w["capped_nodes"]
     cost, exact = min_path_guards(weight, children, tops, w["frontier_nodes"], SINK)
-    rec["activation_cost"], rec["activation_exact"] = cost, exact
+    # обход оборван по бюджету -> граф неполон, в точную Таблицу IV не берём
+    rec["activation_cost"], rec["activation_exact"] = cost, exact and not w["budget_hit"]
     if cost is None:
         # ни один top (фронтир/dead_end/depth_cap) не дотянулся до скрытого вызова:
         # все пути обрываются на плумбинге — стоимость активации не определена
@@ -1037,6 +1075,10 @@ def slice_key(dx, key):
         # хотя бы один вызывающий найден по CHA (полиморфный вызов) — путь, а
         # значит и activation_cost, возможно over-approximated (§7.2)
         rec["notes"].append("cha")
+    if w["budget_hit"]:
+        # обход упёрся в потолок кадров (взрывной fan-in) — граф неполон,
+        # activation_cost ненадёжен; ключ честно помечается
+        rec["notes"].append("budget_hit")
     return rec
 
 
