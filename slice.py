@@ -593,8 +593,14 @@ def guards_of_frame(fr, criterion_offset):
         kind, detail = next((c for c in cands if c[0] not in ("const", "unknown")),
                             cands[0] if cands else ("unknown", None))
         operand = {"source_kind": kind, "detail": detail}
-        guards.append({"frame": None, "opcode": opcode,
-                       "sense": f"->{taken}", "operand": operand, "notes": []})
+        # дескрипторы полей/типов, читаемых в самом блоке ветвления: нужны для
+        # распознавания метки корутины `if ((label & MIN_INT) != 0)`, где
+        # операнд — результат and-int (unknown), а само поле-метку читает iget.
+        block_refs = [i.args[0] for i in insns
+                      if i.op.startswith(("iget", "sget", "instance-of"))
+                      and i.args and i.args[0]]
+        guards.append({"frame": None, "opcode": opcode, "sense": f"->{taken}",
+                       "operand": operand, "notes": [], "_block_refs": block_refs})
     return guards
 
 
@@ -700,13 +706,20 @@ def _is_continuation_class(dx, desc):
 
 
 def _reads_continuation(dx, guard):
-    """Пролог стейт-машины внутри самой suspend-функции: `cont instanceof K`
-    и чтение `K.label` (у R8 — `K->E I`). Владелец поля — класс континуации,
-    а не класс кадра, поэтому _is_coroutine_state_guard его не видит."""
+    """Пролог стейт-машины внутри самой suspend-функции: `cont instanceof K`,
+    чтение `K.label` (у R8 — `K->E I`) и знаковая проверка метки
+    `if ((label & MIN_INT) != 0)`. Владелец поля — класс континуации, а не
+    класс кадра, поэтому _is_coroutine_state_guard его не видит."""
     op = guard["operand"]
-    if op["source_kind"] not in ("field", "instanceof") or not op["detail"]:
-        return False
-    return _is_continuation_class(dx, str(op["detail"]).partition("->")[0])
+    if op["source_kind"] in ("field", "instanceof") and op["detail"]:
+        if _is_continuation_class(dx, str(op["detail"]).partition("->")[0]):
+            return True
+    # знаковая проверка метки: тестируемый регистр — результат and-int (unknown),
+    # но само поле-метку читает iget в том же блоке ветвления.
+    if op["source_kind"] == "unknown":
+        return any(_is_continuation_class(dx, str(d).partition("->")[0])
+                   for d in guard.get("_block_refs", ()))
+    return False
 
 
 # ponytail: грубый, но консервативный список — точность валидируется в Task 7
@@ -772,6 +785,7 @@ def slice_key(dx, key):
             g["frame"] = f["key"]
             if _is_coroutine_state_guard(g) or _reads_continuation(dx, g):
                 g["notes"] = ["coroutine_state_machine"]
+            g.pop("_block_refs", None)  # служебное, не в выход
             all_guards.append(g)
     # round-2 review Fix 2: фреймворк/компилятор-стражи — та же логика флагов,
     # что и coroutine, НЕ поверх уже coroutine-флагованных (elif через notes).
@@ -971,6 +985,15 @@ def _check_framework_guard():
     assert _reads_continuation(dx, g("field", "Lk70;->E I"))
     assert _reads_continuation(dx, g("instanceof", "Lk70;"))
     assert not _reads_continuation(dx, g("field", "Lcom/app/Cfg;->on Z"))
+    # знаковая проверка метки: операнд unknown (результат and-int), но блок
+    # читает поле-метку класса-континуации -> плумбинг
+    sign = {"operand": {"source_kind": "unknown", "detail": None}, "notes": [],
+            "_block_refs": ["Lk70;->E I"]}
+    assert _reads_continuation(dx, sign)
+    # тот же unknown, но блок читает поле обычного класса -> настоящий страж
+    real = {"operand": {"source_kind": "unknown", "detail": None}, "notes": [],
+            "_block_refs": ["Lcom/app/Cfg;->flag Z"]}
+    assert not _reads_continuation(dx, real)
     print("  framework_guard ok")
 
 
