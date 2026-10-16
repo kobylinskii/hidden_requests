@@ -309,6 +309,15 @@ def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
                 if _retrofit_hit(message.get("payload") or {}, rec["key"]):
                     seen["hit"] = True
 
+        # Приложения с анти-frida само-завершаются через секунды после старта:
+        # сессия/скрипт умирают в окне ожидания, и тогда ЛЮБОЙ exports-вызов
+        # кидает "script has been destroyed". Поэтому каждый device-вызов — под
+        # своим guard'ом, а fired берём из асинхронного seen["hit"] (его ставит
+        # хендлер hook.js, когда наш форс-вызов дёргает Proxy.invoke) — он валиден,
+        # даже если приложение умерло до snapshot. _SETTLE даёт Retrofit построить
+        # прокси до arm (иначе call_retrofit не найдёт инстанс). Пилот-правка, §15.
+        res, snap, exc = {}, None, []
+        _SETTLE = 1.0
         try:
             session = device.attach(pid)
             hook_script = session.create_script((HERE / "hook.js").read_text(encoding="utf-8"))
@@ -317,10 +326,16 @@ def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
             agent = session.create_script((HERE / "activate.js").read_text(encoding="utf-8"))
             agent.load()
             device.resume(pid)
-            agent.exports_sync.capture_on(rec["key"])
-            res = agent.exports_sync.arm(json.dumps(plan))
+            time.sleep(_SETTLE)
+            try: agent.exports_sync.capture_on(rec["key"])
+            except Exception as e: exc.append("capture_on: " + str(e))
+            try: res = agent.exports_sync.arm(json.dumps(plan))
+            except Exception as e: exc.append("arm: " + str(e))
             time.sleep(wait_t)
-            snap = agent.exports_sync.snapshot()
+            try: snap = agent.exports_sync.snapshot()
+            except Exception as e: exc.append("snapshot: " + str(e))
+        except Exception as e:
+            exc.append("session: " + str(e))
         finally:
             if session is not None:
                 try: session.detach()
@@ -328,11 +343,11 @@ def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
             try: device.kill(pid)
             except Exception: pass
         # fired — ключ-точный оракул из hook.js (Proxy.invoke по cls->method).
-        # snap — advisory-артефакт для repr/отладки; его привязка к key — доработка
-        # пилотной фазы, пока не делаем её строгим условием fired.
+        # snap — advisory-артефакт; строгая привязка к key — доработка пилотной фазы.
         fired = seen["hit"]
         real = fired and _params_real(plan, snap)
-        return {"stage": stage, "valid": True, "exceptions": res.get("exceptions", []),
+        exc = (res.get("exceptions", []) if isinstance(res, dict) else []) + exc
+        return {"stage": stage, "valid": True, "exceptions": exc,
                 "fired": fired, "real_params": real, "request": snap, "plan": plan}
 
     return run_stage
