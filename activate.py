@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Forced activation of hidden HTTP requests via Frida."""
 
-import json, sys, os, argparse
+import json, sys, os, argparse, re, urllib.request
 from pathlib import Path
 
 try:
@@ -164,6 +164,52 @@ def build_prompt(rec, stage, smali):
         f"Контракт вывода:\n{_SCHEMA_DOC}\n\n"
         f'Сейчас сгенерируй план для stage={stage}. Поле "stage" в ответе должно быть {stage}.'
     )
+
+
+def parse_plan(text):
+    """Срезает markdown-забор, парсит JSON из текста. ValueError на мусоре."""
+    t = text.strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", t, re.S)
+    if m:
+        t = m.group(1).strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        a, b = t.find("{"), t.rfind("}")
+        if 0 <= a < b:
+            try:
+                return json.loads(t[a:b + 1])
+            except json.JSONDecodeError:
+                pass
+    raise ValueError(f"LLM вернул неразбираемый план: {text[:200]!r}")
+
+
+def _urllib_transport(url, headers, body):
+    """HTTP POST через stdlib urllib."""
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.read().decode("utf-8")
+
+
+def generate_plan(prompt, backend="openai", *, transport=None, manual_path=None):
+    """Генерирует план через LLM (openai) или читает вручную (manual)."""
+    if backend == "manual":
+        src = Path(manual_path) if manual_path else None
+        if not src or not src.exists():
+            raise SystemExit(f"manual-бэкенд: нет файла с планом {manual_path!r}.\n"
+                             f"Вставьте ответ LLM в этот файл и повторите.")
+        return parse_plan(src.read_text(encoding="utf-8"))
+    url = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
+    model = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat-v3-0324:free")
+    key = os.environ.get("LLM_API_KEY")
+    if not key:
+        raise SystemExit("нет LLM_API_KEY в окружении (или используйте --backend manual)")
+    body = json.dumps({"model": model, "temperature": 0,
+                       "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    raw = (transport or _urllib_transport)(url, headers, body)
+    content = json.loads(raw)["choices"][0]["message"]["content"]
+    return parse_plan(content)
 
 
 def dex_member_exists(dx):
@@ -395,10 +441,41 @@ def _check_method_smali(dx):
     print("  method_smali ok")
 
 
+def _check_parse_plan():
+    assert parse_plan('{"a":1}') == {"a": 1}
+    assert parse_plan('```json\n{"a":1}\n```') == {"a": 1}       # забор срезан
+    assert parse_plan('бла\n{"a": 1}\nбла') == {"a": 1}          # JSON среди текста
+    try:
+        parse_plan("не json вовсе"); assert False
+    except ValueError:
+        pass
+    print("  parse_plan ok")
+
+def _check_generate_plan():
+    captured = {}
+    def fake_transport(url, headers, body):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["body"] = json.loads(body)
+        return json.dumps({"choices": [{"message": {"content": '{"stage": 0}'}}]})
+    os.environ["LLM_API_KEY"] = "k"
+    os.environ["LLM_MODEL"] = "m"
+    os.environ["LLM_BASE_URL"] = "https://x/v1/chat/completions"
+    plan = generate_plan("PROMPT", backend="openai", transport=fake_transport)
+    assert plan == {"stage": 0}
+    assert captured["body"]["model"] == "m"
+    assert captured["body"]["messages"][0]["content"] == "PROMPT"
+    assert captured["headers"]["Authorization"] == "Bearer k"
+    assert captured["headers"]["Content-Type"] == "application/json"
+    print("  generate_plan ok")
+
+
 def _selfcheck(apk=None):
     _check_validate_plan()
     _check_real_guards()
     _check_build_prompt()
+    _check_parse_plan()
+    _check_generate_plan()
     if apk is not None:
         if load_apk is None:
             raise RuntimeError("slice module not available; cannot test with real APK")
