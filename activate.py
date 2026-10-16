@@ -806,6 +806,7 @@ def main():
     ap.add_argument("--apk", type=Path)
     ap.add_argument("--package", help="пакет для spawn (по умолчанию — из манифеста APK)")
     ap.add_argument("--keys", nargs="*", help="подмножество ключей; по умолч. activation_exact")
+    ap.add_argument("--keys-file", type=Path, help="файл со списком ключей (по одному в строке)")
     ap.add_argument("--backend", default="openai", choices=["openai", "manual", "mech"],
                     help="openai=LLM, manual=план из файла, mech=механический без LLM")
     ap.add_argument("--manual-plan", type=Path, help="файл с планом для --backend manual")
@@ -822,8 +823,11 @@ def main():
         ap.error("нужны --slice и --apk")
     recs = [json.loads(l) for l in args.slice.read_text(encoding="utf-8").splitlines() if l.strip()]
     recs = [r for r in recs if r.get("key")]
-    if args.keys:
-        recs = [r for r in recs if r["key"] in set(args.keys)]
+    keyset = set(args.keys or [])
+    if args.keys_file and args.keys_file.exists():
+        keyset |= {k.strip() for k in args.keys_file.read_text(encoding="utf-8").splitlines() if k.strip()}
+    if keyset:
+        recs = [r for r in recs if r["key"] in keyset]
     else:
         recs = [r for r in recs if r.get("activation_exact")]
     results = []
