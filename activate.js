@@ -85,19 +85,51 @@ function applyField(f) {
     }
 }
 
+// Trivial Continuation для вызова Kotlin suspend-функций из Frida: большинство
+// Retrofit-методов современного Kotlin-приложения — suspend (последний параметр
+// kotlin.coroutines.Continuation). Нас интересует факт формирования/отправки
+// запроса, не результат — resumeWith no-op (spec §14.4).
+var _cont = null;
+function makeContinuation() {
+    if (_cont !== null) return _cont;
+    var ctx = Java.use('kotlin.coroutines.EmptyCoroutineContext').INSTANCE.value;
+    var Cont = Java.registerClass({
+        name: 'frida.ActivationContinuation',
+        implements: [Java.use('kotlin.coroutines.Continuation')],
+        methods: {
+            getContext: function () { return ctx; },
+            resumeWith: function (result) { }
+        }
+    });
+    _cont = Cont.$new();
+    return _cont;
+}
+
+function argTypesOf(ov) {
+    if (ov.argumentTypes) return ov.argumentTypes;
+    if (ov.overloads && ov.overloads.length === 1) return ov.overloads[0].argumentTypes;
+    return null;
+}
+
+// Вызвать перегрузку на receiver; если метод suspend (на один аргумент больше и
+// последний — Continuation), а план его не передал, дослать наш Continuation.
+function invokeOverload(ov, receiver, args) {
+    var types = argTypesOf(ov);
+    if (types && types.length === args.length + 1 &&
+        types[types.length - 1].className === 'kotlin.coroutines.Continuation') {
+        args = args.concat([makeContinuation()]);
+    }
+    return ov.call.apply(ov, [receiver].concat(args));
+}
+
 function doTrigger(t, args) {
     var C = jclass(t.cls);
     if (t.kind === 'call_retrofit') {
         var inst = proxyByIface[t.cls] || proxyByIface[t.cls.replace(/\./g, '/')];
         if (!inst) throw new Error('прокси-инстанс ' + t.cls + ' ещё не создан');
-        return overloadBySig(C, t.method, t.sig).call(inst, ...args);
+        return invokeOverload(overloadBySig(C, t.method, t.sig), inst, args);
     }
-    if (t.suspend) {  // suspend: дать трезвый Continuation и прокрутить через runBlocking
-        // ponytail: простейший путь — вызвать метод внутри runBlocking-замыкания.
-        // ограничение: часть suspend-сигнатур потребует ручного Continuation (spec §14.4).
-        throw new Error('suspend-триггер требует Continuation — см. процедуру пилота');
-    }
-    return overloadBySig(C, t.method, t.sig).call(C.$new(), ...args);
+    return invokeOverload(overloadBySig(C, t.method, t.sig), C.$new(), args);
 }
 
 rpc.exports = {
@@ -120,12 +152,40 @@ rpc.exports = {
     }
 };
 
-// Кэш прокси-инстансов + снимок исходящего запроса целевого ключа.
+// Key-exact оракул: хук InvocationHandler.invoke эмитит {t:'retrofit',cls,m} на
+// КАЖДЫЙ вызов Retrofit-метода (в т.ч. наш форс-вызов) — перенесён из hook.js
+// внутрь activate.js, чтобы сессия активации грузила ОДИН скрипт (двойной хук
+// Proxy.newProxyInstance из hook.js+activate.js рекурсивно роняет приложение).
+var hookedHandlers = {};
+function hookHandlerInvoke(name) {
+    if (hookedHandlers[name]) return;
+    hookedHandlers[name] = true;
+    var H; try { H = Java.use(name); } catch (e) { return; }
+    var ovs; try { ovs = H.invoke.overloads; } catch (e) { return; }
+    ovs.forEach(function (o) {
+        o.implementation = function (proxy, method, args) {
+            try {
+                if (method !== null) {
+                    send({ t: 'retrofit', cls: method.getDeclaringClass().getName(), m: method.getName() });
+                }
+            } catch (e) {}
+            return o.call(this, proxy, method, args);
+        };
+    });
+}
+
+// Кэш прокси-инстансов + оракул + снимок исходящего запроса целевого ключа.
 Java.perform(function () {
     var Proxy = Java.use('java.lang.reflect.Proxy');
     Proxy.newProxyInstance.implementation = function (l, ifaces, h) {
         var r = this.newProxyInstance(l, ifaces, h);
-        try { for (var i = 0; i < ifaces.length; i++) proxyByIface[ifaces[i].getName()] = r; } catch (e) {}
+        // Java.retain: иначе прокси-обёртка, взятая внутри хука, протухает к моменту
+        // arm ("Wrapper is disposed") — нужна долгоживущая ссылка.
+        try { var rr = Java.retain(r); for (var i = 0; i < ifaces.length; i++) proxyByIface[ifaces[i].getName()] = rr; } catch (e) {}
+        try {
+            var hc = h !== null ? h.$className : null;
+            if (hc && hc !== 'libcore.reflect.AnnotationFactory') hookHandlerInvoke(hc);
+        } catch (e) {}
         return r;
     };
     installOkHttpCapture(60);

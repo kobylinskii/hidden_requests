@@ -284,6 +284,13 @@ def run_key(rec, stages, run_stage):
 HERE = Path(__file__).resolve().parent
 
 
+def _agent(name):
+    """Путь к Frida-агенту: скомпилированный build/<name> (frida 17 — bundle с
+    frida-java-bridge, т.к. frida 17 убрал глобал Java), иначе исходник (frida 16/arm)."""
+    b = HERE / "build" / name
+    return b if b.exists() else HERE / name
+
+
 def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
     """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
     import frida/trace здесь, а не на верху модуля — offline-пути (--selfcheck
@@ -320,14 +327,12 @@ def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
         _SETTLE = 1.0
         try:
             session = device.attach(pid)
-            # prelude.js ПЕРВЫМ: глушит само-завершение приложения при детекте frida
-            # (TNT зовёт System.exit/killProcess и умирает за ~0.5с без него).
-            prelude = session.create_script((HERE / "prelude.js").read_text(encoding="utf-8"))
-            prelude.load()
-            hook_script = session.create_script((HERE / "hook.js").read_text(encoding="utf-8"))
-            hook_script.on("message", _on_hook_msg)
-            hook_script.load()
-            agent = session.create_script((HERE / "activate.js").read_text(encoding="utf-8"))
+            # ТОЛЬКО activate.js: он сам кэширует прокси, несёт key-exact оракул
+            # (эмитит {t:'retrofit',cls,m}) и снимает запрос. hook.js НЕ грузим —
+            # двойной хук Proxy.newProxyInstance (hook.js+activate.js) рекурсивно
+            # роняет приложение на этом ART. Оракул слушаем на самом activate.js.
+            agent = session.create_script(_agent("activate.js").read_text(encoding="utf-8"))
+            agent.on("message", _on_hook_msg)
             agent.load()
             device.resume(pid)
             time.sleep(_SETTLE)
