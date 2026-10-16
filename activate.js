@@ -30,11 +30,30 @@ function coerce(v) {
     return v;
 }
 
+function sigArgClassNames(sig) {
+    var m = /^\(([^)]*)\)/.exec(sig);
+    if (!m) return null;
+    var s = m[1], out = [], i = 0;
+    var prim = {Z:'boolean',B:'byte',S:'short',C:'char',I:'int',J:'long',F:'float',D:'double'};
+    while (i < s.length) {
+        var arr = '';
+        while (s[i] === '[') { arr += '[]'; i++; }
+        var c = s[i];
+        if (c === 'L') {
+            var e = s.indexOf(';', i);
+            out.push(s.substring(i + 1, e).replace(/\//g, '.') + arr);
+            i = e + 1;
+        } else { out.push((prim[c] || c) + arr); i++; }
+    }
+    return out;
+}
+
 function overloadBySig(clazz, method, sig) {
     var ov = clazz[method].overloads;
+    var want = sigArgClassNames(sig);
     for (var i = 0; i < ov.length; i++) {
-        var a = ov[i].argumentTypes.map(function (t) { return t.className; }).join(',');
-        if ('(' + a + ')' === sig.replace(/^(\(.*?\)).*$/, '$1')) return ov[i];
+        var a = ov[i].argumentTypes.map(function (t) { return t.className; });
+        if (want !== null && a.length === want.length && a.join(',') === want.join(',')) return ov[i];
     }
     return clazz[method];  // единственная перегрузка
 }
@@ -62,7 +81,6 @@ function doTrigger(t, args) {
         return overloadBySig(C, t.method, t.sig).call(inst, ...args);
     }
     if (t.suspend) {  // suspend: дать трезвый Continuation и прокрутить через runBlocking
-        var BK = Java.use('kotlinx.coroutines.BuildersKt');
         // ponytail: простейший путь — вызвать метод внутри runBlocking-замыкания.
         // ограничение: часть suspend-сигнатур потребует ручного Continuation (spec §14.4).
         throw new Error('suspend-триггер требует Continuation — см. процедуру пилота');
@@ -78,8 +96,11 @@ rpc.exports = {
         Java.perform(function () {
             (plan.overrides || []).forEach(function (o) { try { applyOverride(o); } catch (e) { ex.push('override ' + o.cls + '->' + o.method + ': ' + e); } });
             (plan.fields || []).forEach(function (f) { try { applyField(f); } catch (e) { ex.push('field ' + f.cls + '.' + f.name + ': ' + e); } });
-            var args = (plan.args || []).sort(function (a, b) { return a.index - b.index; })
+            var args = [];
+            try {
+                args = (plan.args || []).sort(function (a, b) { return a.index - b.index; })
                                         .map(function (a) { return coerce(a.value); });
+            } catch (e) { ex.push('args: ' + e); args = []; }
             if (plan.raw_js) { try { (1, eval)(plan.raw_js); } catch (e) { ex.push('raw_js: ' + e); } }
             try { doTrigger(plan.trigger, args); } catch (e) { ex.push('trigger: ' + e); }
         });
@@ -95,15 +116,33 @@ Java.perform(function () {
         try { for (var i = 0; i < ifaces.length; i++) proxyByIface[ifaces[i].getName()] = r; } catch (e) {}
         return r;
     };
+    installOkHttpCapture(60);
+});
+
+function installOkHttpCapture(attemptsLeft) {
     try {
         var Ok = Java.use('okhttp3.OkHttpClient');
         Ok.newCall.implementation = function (req) {
             try {
                 if (cap.key && cap.hit === null) {
-                    cap.hit = { key: cap.key, method: req.method(), url: req.url().toString(), body: null };
+                    var body = null;
+                    try {
+                        var rb = req.body();
+                        if (rb !== null) {
+                            var Buffer = Java.use('okio.Buffer');
+                            var buf = Buffer.$new();
+                            rb.writeTo(buf);
+                            body = buf.readUtf8();
+                        }
+                    } catch (e) { body = '<unreadable>'; }
+                    cap.hit = { key: cap.key, method: req.method(), url: req.url().toString(), body: body };
                 }
             } catch (e) {}
             return this.newCall(req);
         };
-    } catch (e) {}
-});
+        return;
+    } catch (e) {
+        if (attemptsLeft <= 0) return;
+        setTimeout(function () { installOkHttpCapture(attemptsLeft - 1); }, 1000);
+    }
+}
