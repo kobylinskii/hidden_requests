@@ -320,6 +320,31 @@ def _params_real(plan, snap):
     return not synth or bool(plan.get("trigger", {}).get("kind") in ("invoke", "trigger_entry"))
 
 
+def report(results):
+    """HTTP-аналог Таблицы IV ICSE 2025: распределение ключей по минимальной
+    ступени уровня (б) {0,1,2,none} + уровень (а) отдельно + оговорка о
+    несопоставимости с RQ3 (активити vs сетевые вызовы, другой стенд)."""
+    n = len(results)
+    reached = sum(r["reached"] for r in results)
+    real = sum(r["activated_real"] for r in results)
+    from collections import Counter
+    dist = Counter(r["min_stage"] for r in results if r["activated_real"])
+    none = n - real
+    L = [f"Всего ключей: {n}",
+         f"(а) достижим (запрос ушёл, параметры любые): {reached}/{n}",
+         f"(б) активирован с реальными параметрами:     {real}/{n}",
+         "",
+         "HTTP-аналог Таблицы IV — минимальная ступень уровня (б):",
+         f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
+         f"  ступень 1 (вызывающий + стражи):   {dist.get(1,0)}",
+         f"  ступень 2 (UI-фронтир):            {dist.get(2,0)}",
+         f"  не активирован (нужна продвинутая техника/сервер): {none}",
+         "",
+         "Оговорка: сравнение с RQ3/Таблицей IV ICSE 2025 — качественное; "
+         "метрики несопоставимы напрямую (активити vs сетевые вызовы, другой стенд).",]
+    return "\n".join(L)
+
+
 def _check_validate_plan():
     # фейковый DEX: класс A с методом m(()Z) и полем c (I)
     present = {("A", "method", "m", "()Z"), ("A", "field", "c", "I")}
@@ -576,6 +601,19 @@ def _check_staging():
     print("  staging ok")
 
 
+def _check_report():
+    results = [
+        {"key": "a", "reached": True, "activated_real": True, "min_stage": 0},
+        {"key": "b", "reached": True, "activated_real": True, "min_stage": 1},
+        {"key": "c", "reached": True, "activated_real": False, "min_stage": None},
+    ]
+    txt = report(results)
+    assert "ступень 0" in txt and "ступень 1" in txt
+    assert "достижим" in txt                    # уровень (а) отдельно
+    assert "RQ3" in txt and "несопостав" in txt.lower()  # оговорка
+    print("  report ok")
+
+
 def _selfcheck(apk=None):
     _check_validate_plan()
     _check_real_guards()
@@ -583,6 +621,7 @@ def _selfcheck(apk=None):
     _check_parse_plan()
     _check_generate_plan()
     _check_staging()
+    _check_report()
     if apk is not None:
         if load_apk is None:
             raise RuntimeError("slice module not available; cannot test with real APK")
@@ -593,12 +632,49 @@ def _selfcheck(apk=None):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Принудительная активация скрытых запросов")
+    ap.add_argument("--slice", type=Path, help="out/<pkg>.slice.jsonl")
+    ap.add_argument("--apk", type=Path)
+    ap.add_argument("--keys", nargs="*", help="подмножество ключей; по умолч. activation_exact")
+    ap.add_argument("--backend", default="openai", choices=["openai", "manual"])
+    ap.add_argument("--manual-plan", type=Path, help="файл с планом для --backend manual")
+    ap.add_argument("--wait", type=float, default=5.0, help="окно ожидания сетевого события, сек")
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--dry-run", action="store_true", help="prompt+plan+validate без устройства")
     ap.add_argument("--selfcheck", action="store_true")
-    ap.add_argument("--apk", help="APK path for DEX-gated tests (slow, ~130s)")
     args = ap.parse_args()
     if args.selfcheck:
         _selfcheck(apk=args.apk)
+        return
+    if not (args.slice and args.apk):
+        ap.error("нужны --slice и --apk")
+    recs = [json.loads(l) for l in args.slice.read_text(encoding="utf-8").splitlines() if l.strip()]
+    recs = [r for r in recs if r.get("key")]
+    if args.keys:
+        recs = [r for r in recs if r["key"] in set(args.keys)]
+    else:
+        recs = [r for r in recs if r.get("activation_exact")]
+    apk_obj, dx = load_apk(args.apk)
+    results = []
+    if args.dry_run:
+        me = dex_member_exists(dx)
+        for r in recs:
+            prompt = build_prompt(r, 0, {r["cls"] + "->" + r["method"]:
+                                         method_smali(dx, r["cls"], r["method"])})
+            plan = generate_plan(prompt, backend=args.backend, manual_path=args.manual_plan)
+            print(f"[{r['key']}] проблемы плана: {validate_plan(plan, me) or 'нет'}")
+        return
+    run_stage = activate_on_device(dx, apk_obj.get_package(), args.backend, args.wait, args.manual_plan)
+    for r in recs:
+        results.append(run_key(r, stages=(0, 1, 2), run_stage=run_stage))
+    txt = report(results)
+    print(txt)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        with args.out.open("w", encoding="utf-8") as f:
+            for r in results:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        args.out.with_suffix(".report.txt").write_text(txt, encoding="utf-8")
 
 
 if __name__ == "__main__":
