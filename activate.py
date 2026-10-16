@@ -371,7 +371,7 @@ def _agent(name):
     return b if b.exists() else HERE / name
 
 
-def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None):
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False):
     """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
     только когда dx реально нужен (валидация overrides/fields, smali для openai-
@@ -382,6 +382,8 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
     import frida, time, trace
     _me = {}
     def me(cls, kind, name, sig):
+        if skip_dx:                              # без DEX-валидации (кривой член упадёт на устройстве)
+            return True
         if "f" not in _me:
             _me["f"] = dex_member_exists(dx_provider())
         return _me["f"](cls, kind, name, sig)
@@ -391,10 +393,15 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         if backend == "mech":
             plan = make_plan(rec, stage)        # детерминированно из среза, без dx/LLM
         else:
-            # manual-бэкенд игнорирует промпт → не трогаем dx/smali (не грузим APK)
-            prompt = "" if backend == "manual" else build_prompt(
-                rec, stage, {rec["cls"] + "->" + rec["method"]:
-                             method_smali(dx_provider(), rec["cls"], rec["method"])})
+            # manual и skip_dx игнорируют dx/smali (не грузим тяжёлый androguard);
+            # у openai smali синка обычно пуст (интерфейс) — главный сигнал в срезе.
+            if backend == "manual":
+                prompt = ""
+            elif skip_dx:
+                prompt = build_prompt(rec, stage, {})
+            else:
+                prompt = build_prompt(rec, stage, {rec["cls"] + "->" + rec["method"]:
+                                                   method_smali(dx_provider(), rec["cls"], rec["method"])})
             plan = generate_plan(prompt, backend=backend, manual_path=manual_path)
         probs = validate_plan(plan, me)
         if probs:
@@ -807,6 +814,9 @@ def main():
     ap.add_argument("--package", help="пакет для spawn (по умолчанию — из манифеста APK)")
     ap.add_argument("--keys", nargs="*", help="подмножество ключей; по умолч. activation_exact")
     ap.add_argument("--keys-file", type=Path, help="файл со списком ключей (по одному в строке)")
+    ap.add_argument("--skip-dx", action="store_true",
+                    help="не грузить androguard dx: пустой smali в промпте + пропуск DEX-валидации "
+                         "(кривой член падает на устройстве). Для openai на тяжёлом/свопящем APK.")
     ap.add_argument("--backend", default="openai", choices=["openai", "manual", "mech"],
                     help="openai=LLM, manual=план из файла, mech=механический без LLM")
     ap.add_argument("--manual-plan", type=Path, help="файл с планом для --backend manual")
@@ -853,7 +863,7 @@ def main():
             h = json.loads(l)
             if h.get("status") == "hidden" and h.get("path"):
                 paths.setdefault(h["key"], h["path"])
-    run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan, paths)
+    run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan, paths, args.skip_dx)
     for r in recs:
         results.append(run_key(r, stages=(0, 1, 2), run_stage=run_stage))
     txt = report(results)
