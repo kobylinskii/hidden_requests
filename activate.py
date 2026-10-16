@@ -9,6 +9,15 @@ try:
 except ImportError:
     load_apk = None
 
+
+def _package_of(apk_path):
+    """Имя пакета из манифеста APK — быстрый парс (без тяжёлого androguard
+    Analysis на 138MB), чтобы знать пакет для spawn, не загружая dx."""
+    from loguru import logger
+    logger.remove()
+    from androguard.core.apk import APK
+    return APK(str(apk_path)).get_package()
+
 _STAGE_KINDS = {0: "call_retrofit", 1: "invoke", 2: "trigger_entry"}
 _REQUIRED = ("key", "stage", "overrides", "fields", "args", "trigger", "rationale")
 
@@ -291,17 +300,27 @@ def _agent(name):
     return b if b.exists() else HERE / name
 
 
-def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None):
     """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
-    import frida/trace здесь, а не на верху модуля — offline-пути (--selfcheck
-    без --apk, --dry-run) должны работать без установленного frida."""
+    dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
+    только когда dx реально нужен (валидация overrides/fields, smali для openai-
+    промпта). Для manual call_retrofit dx не нужен → APK не грузится (иначе прогон
+    упирается в тяжёлую androguard-загрузку).
+    import frida/trace здесь, а не на верху модуля — offline-пути должны работать
+    без установленного frida."""
     import frida, time, trace
-    me = dex_member_exists(dx)
+    _me = {}
+    def me(cls, kind, name, sig):
+        if "f" not in _me:
+            _me["f"] = dex_member_exists(dx_provider())
+        return _me["f"](cls, kind, name, sig)
     device = trace.pick_device(None)
 
     def run_stage(rec, stage):
-        prompt = build_prompt(rec, stage, {rec["cls"] + "->" + rec["method"]:
-                                           method_smali(dx, rec["cls"], rec["method"])})
+        # manual-бэкенд игнорирует промпт → не трогаем dx/smali (не грузим APK)
+        prompt = "" if backend == "manual" else build_prompt(
+            rec, stage, {rec["cls"] + "->" + rec["method"]:
+                         method_smali(dx_provider(), rec["cls"], rec["method"])})
         plan = generate_plan(prompt, backend=backend, manual_path=manual_path)
         probs = validate_plan(plan, me)
         if probs:
@@ -711,6 +730,7 @@ def main():
     ap = argparse.ArgumentParser(description="Принудительная активация скрытых запросов")
     ap.add_argument("--slice", type=Path, help="out/<pkg>.slice.jsonl")
     ap.add_argument("--apk", type=Path)
+    ap.add_argument("--package", help="пакет для spawn (по умолчанию — из манифеста APK)")
     ap.add_argument("--keys", nargs="*", help="подмножество ключей; по умолч. activation_exact")
     ap.add_argument("--backend", default="openai", choices=["openai", "manual"])
     ap.add_argument("--manual-plan", type=Path, help="файл с планом для --backend manual")
@@ -730,17 +750,22 @@ def main():
         recs = [r for r in recs if r["key"] in set(args.keys)]
     else:
         recs = [r for r in recs if r.get("activation_exact")]
-    apk_obj, dx = load_apk(args.apk)
     results = []
+    dxbox = {}
+    def dx_provider():
+        if "dx" not in dxbox:
+            dxbox["dx"] = load_apk(args.apk)[1]
+        return dxbox["dx"]
     if args.dry_run:
-        me = dex_member_exists(dx)
+        me = dex_member_exists(dx_provider())
         for r in recs:
             prompt = build_prompt(r, 0, {r["cls"] + "->" + r["method"]:
-                                         method_smali(dx, r["cls"], r["method"])})
+                                         method_smali(dx_provider(), r["cls"], r["method"])})
             plan = generate_plan(prompt, backend=args.backend, manual_path=args.manual_plan)
             print(f"[{r['key']}] проблемы плана: {validate_plan(plan, me) or 'нет'}")
         return
-    run_stage = activate_on_device(dx, apk_obj.get_package(), args.backend, args.wait, args.manual_plan)
+    pkg = args.package or _package_of(args.apk)
+    run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan)
     for r in recs:
         results.append(run_key(r, stages=(0, 1, 2), run_stage=run_stage))
     txt = report(results)
