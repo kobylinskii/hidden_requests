@@ -95,6 +95,76 @@ def validate_plan(plan, member_exists):
 
     return probs
 
+_NOISE_NOTES = {"coroutine_state_machine", "framework"}
+
+def real_guards(rec):
+    """Стражи среза без шумовых (coroutine state machine, framework-утиль
+    типа Kotlin Intrinsics) — то, что реально нужно обойти/подделать."""
+    return [g for g in rec.get("guards", [])
+            if not (_NOISE_NOTES & set(g.get("notes", [])))]
+
+
+def method_smali(dx, cls, method):
+    """fqcn + имя метода -> smali-текст (строки 'mnemonic operand').
+    Пусто, если класс/метод не найден или у метода нет кода (внешнее
+    объявление/abstract — как и в slice.frame_of)."""
+    ca = dx.classes.get("L" + cls.replace(".", "/") + ";")
+    if ca is None:
+        return ""
+    out = []
+    for ma in ca.get_methods():
+        if ma.name != method:
+            continue
+        m = ma.get_method()
+        code = m.get_code() if m is not None and hasattr(m, "get_code") else None
+        if code is None:
+            continue
+        for ins in code.get_bc().get_instructions():
+            out.append(f"{ins.get_name()} {ins.get_output()}")
+    return "\n".join(out)
+
+
+_STAGE_DOC = {
+    0: "Ступень 0 — call_retrofit: прямой вызов скрытого Retrofit-метода, стражи игнорируются, аргументы по провенанс-стратегии.",
+    1: "Ступень 1 — invoke: вызвать ближайший call_site, заглушив реальные стражи на пути; приложение само строит реальные аргументы.",
+    2: "Ступень 2 — trigger_entry: дёрнуть UI-фронтир, заглушив все реальные стражи пути.",
+}
+_SCHEMA_DOC = '''Выдай СТРОГО один JSON-объект, без markdown-забора, без текста вокруг:
+{"key": str, "stage": 0|1|2,
+ "overrides": [{"cls","method","sig","ret"}],   // заглушить return метода-стража
+ "fields":    [{"cls","name","sig","value","instance"?}],
+ "args":      [{"index", "value"}],
+ "trigger":   {"kind": "call_retrofit"|"invoke"|"trigger_entry", "cls","method","sig","suspend"?},
+ "raw_js":    null,
+ "rationale": str}  // по-русски: почему эти значения ведут к вызову
+value — примитив JSON либо: {"$new":"cls","args":[...]} | {"$choose":"cls"} (живой инстанс из кучи, предпочтительно ради реальных параметров) | {"$enum":"cls.FIELD"} | {"$null":"cls"}.
+kind обязан соответствовать stage: 0->call_retrofit, 1->invoke, 2->trigger_entry.'''
+
+def build_prompt(rec, stage, smali):
+    """Срез (запись из out/<pkg>.slice.jsonl) + ступень + smali нужных
+    кадров -> текст промпта для LLM. Шумовые стражи (coroutine/framework)
+    отфильтрованы через real_guards — LLM видит только то, что реально
+    нужно обойти."""
+    rg = real_guards(rec)
+    ctx = {"key": rec["key"], "cls": rec["cls"], "method": rec["method"],
+           "stage": stage,
+           "call_sites": rec.get("call_sites", []),
+           "real_guards": rg, "args": rec.get("args", []),
+           "frontier": rec.get("frontier"), "activation_cost": rec.get("activation_cost")}
+    smali_txt = "\n\n".join(f"### smali {k}\n{v}" for k, v in smali.items() if v)
+    return (
+        "Ты генерируешь план принудительной активации скрытого HTTP-запроса Android-приложения "
+        "на стенде исследователя. Главная цель — чтобы запрос ушёл С РЕАЛЬНЫМИ ПАРАМЕТРАМИ "
+        "(значения, которые приложение подставило бы само), поэтому предпочитай $choose и прогон "
+        "через логику приложения, а не синтетические болванки.\n\n"
+        f"{_STAGE_DOC[stage]}\n\n"
+        f"Срез скрытого вызова (JSON):\n{json.dumps(ctx, ensure_ascii=False, indent=2)}\n\n"
+        f"Декомпиляция (smali) нужных кадров:\n{smali_txt}\n\n"
+        f"Контракт вывода:\n{_SCHEMA_DOC}\n\n"
+        f'Сейчас сгенерируй план для stage={stage}. Поле "stage" в ответе должно быть {stage}.'
+    )
+
+
 def dex_member_exists(dx):
     """member_exists поверх androguard dx. Сверяет имя И сигнатуру (R8-перегрузки)."""
     def me(cls, kind, name, sig):
@@ -268,13 +338,72 @@ def _check_dex_member_exists(dx):
     print("  dex_member_exists ok")
 
 
+def _check_real_guards():
+    rec = {"guards": [
+        {"frame": "A->m", "opcode": "if-nez", "operand": {"source_kind": "invoke",
+         "detail": "Lp/S;->isX()Z"}, "notes": []},
+        {"frame": "B->invokeSuspend", "opcode": "if-eqz", "operand": {"source_kind": "field",
+         "detail": "Lp/B;->A I"}, "notes": ["coroutine_state_machine"]},
+        {"frame": "C->k", "opcode": "if-nez", "operand": {"source_kind": "invoke",
+         "detail": "Lkotlin/jvm/internal/Intrinsics;->areEqual"}, "notes": ["framework"]},
+    ]}
+    rg = real_guards(rec)
+    assert len(rg) == 1 and rg[0]["frame"] == "A->m", rg
+    print("  real_guards ok")
+
+
+def _check_build_prompt():
+    rec = {"key": "p.IAcc->upd", "cls": "p.IAcc", "method": "upd",
+           "call_sites": [{"caller": "p.Mgr->enable", "offset": 28}],
+           "guards": [{"frame": "p.Mgr->enable", "opcode": "if-nez",
+                       "operand": {"source_kind": "invoke", "detail": "Lp/S;->isX()Z"},
+                       "notes": []},
+                      {"frame": "b->invokeSuspend", "opcode": "if-eqz",
+                       "operand": {"source_kind": "field", "detail": "Lb;->A I"},
+                       "notes": ["coroutine_state_machine"]}],
+           "args": [{"index": 0, "source_kind": "unknown", "detail": None}],
+           "frontier": "ui.Btn->onClick", "activation_cost": 1}
+    p = build_prompt(rec, stage=1, smali={"p.Mgr->enable": "0x0 invoke ..."})
+    assert "p.IAcc->upd" in p
+    assert "isX()Z" in p                      # реальный страж в промпте
+    assert "coroutine_state_machine" not in p # шумовой отфильтрован
+    assert '"stage": 1' in p or '"stage":1' in p
+    assert "call_retrofit" in p and "invoke" in p and "trigger_entry" in p  # схема ступеней
+    print("  build_prompt ok")
+
+
+def _check_method_smali(dx):
+    """method_smali на реальном DEX: найти метод с кодом, проверить, что
+    выход непустой и похож на smali-строки 'mnemonic operand'."""
+    found = None
+    for class_desc, ca in dx.classes.items():
+        cls = class_desc[1:-1].replace("/", ".") if class_desc.startswith("L") and class_desc.endswith(";") else class_desc
+        for ma in ca.get_methods():
+            txt = method_smali(dx, cls, ma.name)
+            if txt:
+                found = (cls, ma.name, txt)
+                break
+        if found:
+            break
+    assert found is not None, "не нашлось ни одного метода с кодом в DEX"
+    cls, method, txt = found
+    assert isinstance(txt, str) and txt.strip(), txt
+    lines = txt.splitlines()
+    assert any(len(line.split(" ", 1)) == 2 and line.split(" ", 1)[0] for line in lines), \
+        f"нет строки вида 'mnemonic operand' в smali {cls}->{method}:\n{txt}"
+    print("  method_smali ok")
+
+
 def _selfcheck(apk=None):
     _check_validate_plan()
+    _check_real_guards()
+    _check_build_prompt()
     if apk is not None:
         if load_apk is None:
             raise RuntimeError("slice module not available; cannot test with real APK")
         apk_obj, dx = load_apk(apk)
         _check_dex_member_exists(dx)
+        _check_method_smali(dx)
     print("все проверки activate.py прошли")
 
 
