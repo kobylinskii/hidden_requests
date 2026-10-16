@@ -320,6 +320,10 @@ def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
         _SETTLE = 1.0
         try:
             session = device.attach(pid)
+            # prelude.js ПЕРВЫМ: глушит само-завершение приложения при детекте frida
+            # (TNT зовёт System.exit/killProcess и умирает за ~0.5с без него).
+            prelude = session.create_script((HERE / "prelude.js").read_text(encoding="utf-8"))
+            prelude.load()
             hook_script = session.create_script((HERE / "hook.js").read_text(encoding="utf-8"))
             hook_script.on("message", _on_hook_msg)
             hook_script.load()
