@@ -239,6 +239,79 @@ def dex_member_exists(dx):
         return False
     return me
 
+
+def run_key(rec, stages, run_stage):
+    """Ступенчатая петля по одному скрытому вызову: пробует stages по порядку,
+    останавливается на первой ступени с real_params==True (уровень б).
+    Исключение run_stage не роняет петлю — фиксируется и пробуется следующая ступень."""
+    out = {"key": rec["key"], "reached": False, "activated_real": False,
+           "min_stage": None, "stages": []}
+    for stage in stages:
+        try:
+            r = run_stage(rec, stage)
+        except Exception as e:
+            r = {"stage": stage, "valid": False, "exceptions": [str(e)],
+                 "fired": False, "real_params": False, "request": None}
+        out["stages"].append(r)
+        if r.get("fired"):
+            out["reached"] = True
+        if r.get("real_params"):
+            out["activated_real"] = True
+            out["min_stage"] = stage
+            break
+    return out
+
+
+HERE = Path(__file__).resolve().parent
+
+
+def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
+    """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
+    import frida/trace здесь, а не на верху модуля — offline-пути (--selfcheck
+    без --apk, --dry-run) должны работать без установленного frida."""
+    import frida, time, trace
+    me = dex_member_exists(dx)
+    device = trace.pick_device(None)
+
+    def run_stage(rec, stage):
+        prompt = build_prompt(rec, stage, {rec["cls"] + "->" + rec["method"]:
+                                           method_smali(dx, rec["cls"], rec["method"])})
+        plan = generate_plan(prompt, backend=backend, manual_path=manual_path)
+        probs = validate_plan(plan, me)
+        if probs:
+            return {"stage": stage, "valid": False, "exceptions": probs,
+                    "fired": False, "real_params": False, "request": None, "plan": plan}
+        pid = device.spawn([pkg]); session = device.attach(pid)
+        for js in ("hook.js", "activate.js"):
+            s = session.create_script((HERE / js).read_text(encoding="utf-8"))
+            s.load()
+            if js == "activate.js":
+                agent = s
+        device.resume(pid)
+        agent.exports_sync.capture_on(rec["key"])
+        res = agent.exports_sync.arm(json.dumps(plan))
+        time.sleep(wait_t)
+        snap = agent.exports_sync.snapshot()
+        session.detach()
+        fired = snap is not None
+        real = fired and _params_real(plan, snap)
+        return {"stage": stage, "valid": True, "exceptions": res.get("exceptions", []),
+                "fired": fired, "real_params": real, "request": snap, "plan": plan}
+
+    return run_stage
+
+
+def _params_real(plan, snap):
+    """Уровень (б): хоть один аргумент не синтетический ($choose/прогон) И запрос непуст.
+    Порог (spec §15, открытый вопрос): нет args через $new/примитив-болванку."""
+    if not snap or not snap.get("url"):
+        return False
+    synth = any(isinstance(a.get("value"), (int, float, str, bool)) or
+                (isinstance(a.get("value"), dict) and "$new" in a["value"])
+                for a in plan.get("args", []))
+    return not synth or bool(plan.get("trigger", {}).get("kind") in ("invoke", "trigger_entry"))
+
+
 def _check_validate_plan():
     # фейковый DEX: класс A с методом m(()Z) и полем c (I)
     present = {("A", "method", "m", "()Z"), ("A", "field", "c", "I")}
@@ -470,12 +543,38 @@ def _check_generate_plan():
     print("  generate_plan ok")
 
 
+def _check_staging():
+    rec = {"key": "p.A->m", "cls": "p.A", "method": "m"}
+    # fired на ступени 0, но параметры синтетические; реальные — только на ступени 1
+    def fake_run(rec, stage):
+        return {"stage": stage, "valid": True, "exceptions": [],
+                "fired": stage in (0, 1),
+                "real_params": stage == 1,
+                "request": {"url": "/x"} if stage in (0, 1) else None}
+    out = run_key(rec, stages=(0, 1, 2), run_stage=fake_run)
+    assert out["reached"] is True                 # уровень (а): ушло на ст.0
+    assert out["activated_real"] is True          # уровень (б)
+    assert out["min_stage"] == 1                  # минимальная ступень уровня (б)
+    assert len(out["stages"]) == 2                # 2 остановил не пробовали
+
+    # исключение ступени не роняет петлю (Review Focus: suspend/Continuation)
+    def boom(rec, stage):
+        if stage == 0: raise RuntimeError("frida boom")
+        return {"stage": stage, "valid": True, "exceptions": [], "fired": True,
+                "real_params": True, "request": {"url": "/y"}}
+    out2 = run_key(rec, stages=(0, 1), run_stage=boom)
+    assert out2["activated_real"] is True and out2["min_stage"] == 1
+    assert "frida boom" in out2["stages"][0]["exceptions"][0]
+    print("  staging ok")
+
+
 def _selfcheck(apk=None):
     _check_validate_plan()
     _check_real_guards()
     _check_build_prompt()
     _check_parse_plan()
     _check_generate_plan()
+    _check_staging()
     if apk is not None:
         if load_apk is None:
             raise RuntimeError("slice module not available; cannot test with real APK")
