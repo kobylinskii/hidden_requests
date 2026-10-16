@@ -56,6 +56,9 @@ def validate_plan(plan, member_exists):
         if cls is None or method is None or sig is None:
             probs.append(f"override без ключей cls/method/sig: {ov!r}")
             continue
+        if not all(isinstance(v, str) for v in (cls, method, sig)):
+            probs.append(f"override: cls/method/sig не строки: {ov!r}")
+            continue
         if not member_exists(cls, "method", method, sig):
             probs.append(f"override: нет метода {cls}->{method}{sig}")
 
@@ -74,6 +77,9 @@ def validate_plan(plan, member_exists):
         if cls is None or name is None or sig is None:
             probs.append(f"field без ключей cls/name/sig: {fl!r}")
             continue
+        if not all(isinstance(v, str) for v in (cls, name, sig)):
+            probs.append(f"field: cls/name/sig не строки: {fl!r}")
+            continue
         if not member_exists(cls, "field", name, sig):
             probs.append(f"field: нет поля {cls}->{name} {sig}")
 
@@ -89,6 +95,8 @@ def validate_plan(plan, member_exists):
         tsig = trig.get("sig")
         if tcls is None or tmethod is None or tsig is None:
             probs.append(f"trigger без ключей cls/method/sig: {trig!r}")
+        elif not all(isinstance(v, str) for v in (tcls, tmethod, tsig)):
+            probs.append(f"trigger: cls/method/sig не строки: {trig!r}")
         else:
             if not member_exists(tcls, "method", tmethod, tsig):
                 probs.append(f"trigger: нет метода {tcls}->{tmethod}{tsig}")
@@ -207,8 +215,14 @@ def generate_plan(prompt, backend="openai", *, transport=None, manual_path=None)
     body = json.dumps({"model": model, "temperature": 0,
                        "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    raw = (transport or _urllib_transport)(url, headers, body)
-    content = json.loads(raw)["choices"][0]["message"]["content"]
+    try:
+        raw = (transport or _urllib_transport)(url, headers, body)
+    except Exception as e:
+        raise RuntimeError(f"LLM transport failed ({model} @ {url}): {e}") from e
+    try:
+        content = json.loads(raw)["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"LLM response unparsable: {e}; raw={raw[:200]!r}") from e
     return parse_plan(content)
 
 
@@ -238,6 +252,11 @@ def dex_member_exists(dx):
             return False
         return False
     return me
+
+
+def _retrofit_hit(payload, key):
+    """True if a hook.js NDJSON event is a Retrofit proxy call of the target key."""
+    return payload.get("t") == "retrofit" and f"{payload.get('cls')}->{payload.get('m')}" == key
 
 
 def run_key(rec, stages, run_stage):
@@ -283,13 +302,20 @@ def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
                     "fired": False, "real_params": False, "request": None, "plan": plan}
         pid = device.spawn([pkg])
         session = None
+        seen = {"hit": False}
+
+        def _on_hook_msg(message, data):
+            if message.get("type") == "send":
+                if _retrofit_hit(message.get("payload") or {}, rec["key"]):
+                    seen["hit"] = True
+
         try:
             session = device.attach(pid)
-            for js in ("hook.js", "activate.js"):
-                s = session.create_script((HERE / js).read_text(encoding="utf-8"))
-                s.load()
-                if js == "activate.js":
-                    agent = s
+            hook_script = session.create_script((HERE / "hook.js").read_text(encoding="utf-8"))
+            hook_script.on("message", _on_hook_msg)
+            hook_script.load()
+            agent = session.create_script((HERE / "activate.js").read_text(encoding="utf-8"))
+            agent.load()
             device.resume(pid)
             agent.exports_sync.capture_on(rec["key"])
             res = agent.exports_sync.arm(json.dumps(plan))
@@ -301,7 +327,10 @@ def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
                 except Exception: pass
             try: device.kill(pid)
             except Exception: pass
-        fired = snap is not None
+        # fired — ключ-точный оракул из hook.js (Proxy.invoke по cls->method).
+        # snap — advisory-артефакт для repr/отладки; его привязка к key — доработка
+        # пилотной фазы, пока не делаем её строгим условием fired.
+        fired = seen["hit"]
         real = fired and _params_real(plan, snap)
         return {"stage": stage, "valid": True, "exceptions": res.get("exceptions", []),
                 "fired": fired, "real_params": real, "request": snap, "plan": plan}
@@ -428,7 +457,19 @@ def _check_validate_plan():
     assert len(probs) > 0, probs
     assert any("cls" in p or "trigger" in p for p in probs), probs
 
+    # override cls is wrong-typed (int, not str) -> problem, not AttributeError
+    bad_ov_type = {**good, "overrides": [{"cls": 123, "method": "m", "sig": "()Z"}]}
+    probs = validate_plan(bad_ov_type, me)   # не должно бросать AttributeError
+    assert len(probs) > 0, probs
+
     print("  validate_plan ok")
+
+
+def _check_retrofit_hit():
+    assert _retrofit_hit({"t": "retrofit", "cls": "p.A", "m": "m"}, "p.A->m")
+    assert not _retrofit_hit({"t": "retrofit", "cls": "p.A", "m": "n"}, "p.A->m")
+    assert not _retrofit_hit({"t": "http", "url": "/x"}, "p.A->m")
+    print("  retrofit_hit ok")
 
 
 def _check_dex_member_exists(dx):
@@ -573,6 +614,16 @@ def _check_generate_plan():
     assert captured["body"]["messages"][0]["content"] == "PROMPT"
     assert captured["headers"]["Authorization"] == "Bearer k"
     assert captured["headers"]["Content-Type"] == "application/json"
+
+    # transport failure (e.g. 429) surfaces as a labeled RuntimeError, not a bare HTTPError
+    def boom(*a):
+        raise urllib.error.HTTPError("https://x", 429, "Too Many Requests", {}, None)
+    try:
+        generate_plan("PROMPT", backend="openai", transport=boom)
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        msg = str(e).lower()
+        assert "transport" in msg or "llm" in msg, msg
     print("  generate_plan ok")
 
 
@@ -616,6 +667,7 @@ def _check_report():
 
 def _selfcheck(apk=None):
     _check_validate_plan()
+    _check_retrofit_hit()
     _check_real_guards()
     _check_build_prompt()
     _check_parse_plan()
