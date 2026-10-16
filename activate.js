@@ -30,20 +30,32 @@ function coerce(v) {
     return v;
 }
 
+// Массивы отдаём в JNI/Class.getName()-форме ([I, [Ljava.lang.String;, [[I —
+// именно так Frida кладёт их в argumentTypes[i].className); точный формат
+// на разных Android/ART-версиях — pilot-verified на устройстве (spec §14.4).
 function sigArgClassNames(sig) {
     var m = /^\(([^)]*)\)/.exec(sig);
     if (!m) return null;
     var s = m[1], out = [], i = 0;
     var prim = {Z:'boolean',B:'byte',S:'short',C:'char',I:'int',J:'long',F:'float',D:'double'};
     while (i < s.length) {
-        var arr = '';
-        while (s[i] === '[') { arr += '[]'; i++; }
-        var c = s[i];
-        if (c === 'L') {
+        var dims = 0;
+        while (s[i] === '[') { dims++; i++; }
+        var base;
+        if (s[i] === 'L') {
             var e = s.indexOf(';', i);
-            out.push(s.substring(i + 1, e).replace(/\//g, '.') + arr);
+            var cls = s.substring(i + 1, e).replace(/\//g, '.');
             i = e + 1;
-        } else { out.push((prim[c] || c) + arr); i++; }
+            // array keeps the JNI L...; wrapper; a bare object type is unwrapped (Frida className)
+            base = dims > 0 ? ('L' + cls + ';') : cls;
+        } else {
+            var c = s[i]; i++;
+            // array keeps the primitive letter (I/Z/...); a bare primitive is its name
+            base = dims > 0 ? c : (prim[c] || c);
+        }
+        var prefix = '';
+        for (var d = 0; d < dims; d++) prefix += '[';
+        out.push(prefix + base);
     }
     return out;
 }
