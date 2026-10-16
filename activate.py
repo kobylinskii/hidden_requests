@@ -68,7 +68,7 @@ def validate_plan(plan, member_exists):
         if not all(isinstance(v, str) for v in (cls, method, sig)):
             probs.append(f"override: cls/method/sig не строки: {ov!r}")
             continue
-        if not member_exists(cls, "method", method, sig):
+        if sig != "*" and not member_exists(cls, "method", method, sig):
             probs.append(f"override: нет метода {cls}->{method}{sig}")
 
     # Guard fields: must be list
@@ -89,7 +89,7 @@ def validate_plan(plan, member_exists):
         if not all(isinstance(v, str) for v in (cls, name, sig)):
             probs.append(f"field: cls/name/sig не строки: {fl!r}")
             continue
-        if not member_exists(cls, "field", name, sig):
+        if sig != "*" and not member_exists(cls, "field", name, sig):
             probs.append(f"field: нет поля {cls}->{name} {sig}")
 
     # Guard args: must be list (no validation of contents required)
@@ -106,9 +106,8 @@ def validate_plan(plan, member_exists):
             probs.append(f"trigger без ключей cls/method/sig: {trig!r}")
         elif not all(isinstance(v, str) for v in (tcls, tmethod, tsig)):
             probs.append(f"trigger: cls/method/sig не строки: {trig!r}")
-        else:
-            if not member_exists(tcls, "method", tmethod, tsig):
-                probs.append(f"trigger: нет метода {tcls}->{tmethod}{tsig}")
+        elif tsig != "*" and not member_exists(tcls, "method", tmethod, tsig):
+            probs.append(f"trigger: нет метода {tcls}->{tmethod}{tsig}")
 
     return probs
 
@@ -235,6 +234,64 @@ def generate_plan(prompt, backend="openai", *, transport=None, manual_path=None)
     return parse_plan(content)
 
 
+# --- Механический генератор планов (без LLM) ------------------------------
+# Прогон всех ключей без LLM-ключа: детерминированные планы по ступеням.
+# stage 0 — прямой вызов Retrofit-метода (zero-arg + авто-Continuation для suspend);
+# stage 1 — invoke ближайшего call_site + эвристический форс реальных стражей;
+# stage 2 — trigger_entry фронтира + форс всех стражей. Триггеры/оверрайды
+# name-based (sig="*") — сигнатур в срезе нет, overloadBySig берёт единств.
+# перегрузку. Эвристика стражей («успех»: boolean->true, объект->null) груба:
+# надёжный выбор ветви требует LLM/анализа кода, поэтому stage 1-2 — best-effort.
+
+def _split(k):
+    i = k.rsplit("->", 1)
+    return (i[0], i[1]) if len(i) == 2 else (k, "")
+
+def _guard_overrides(rec):
+    out, seen = [], set()
+    for g in real_guards(rec):
+        op = g.get("operand") or {}
+        if op.get("source_kind") != "invoke":
+            continue
+        m = re.match(r"^L([^;]+);->([^(]+)\(.*\)(.+)$", op.get("detail") or "")
+        if not m:
+            continue
+        cls = m.group(1).replace("/", "."); meth = m.group(2); ret = m.group(3)
+        if cls + "->" + meth in seen:
+            continue
+        seen.add(cls + "->" + meth)
+        if ret == "Z":
+            val = True
+        elif ret.startswith("L") or ret.startswith("["):
+            val = {"$null": "x"}
+        else:
+            continue
+        out.append({"cls": cls, "method": meth, "sig": "*", "ret": val})
+    return out
+
+def make_plan(rec, stage):
+    cls, method, key = rec["cls"], rec["method"], rec["key"]
+    p = {"key": key, "stage": stage, "overrides": [], "fields": [], "args": [],
+         "raw_js": None, "rationale": ""}
+    if stage == 0:
+        p["trigger"] = {"kind": "call_retrofit", "cls": cls, "method": method, "sig": "*"}
+        p["rationale"] = "mech stage0: прямой вызов Retrofit-метода (zero-arg + авто-Continuation)"
+    elif stage == 1:
+        cs = rec.get("call_sites") or []
+        ccls, cm = _split(cs[0]["caller"]) if cs else (cls, method)
+        p["trigger"] = {"kind": "invoke", "cls": ccls, "method": cm, "sig": "*"}
+        p["overrides"] = _guard_overrides(rec)
+        p["rationale"] = "mech stage1: invoke ближайшего call_site + форс стражей (эвристика)"
+    else:
+        fcls, fm = _split(rec.get("frontier") or "")
+        if not fm:
+            fcls, fm = cls, method
+        p["trigger"] = {"kind": "trigger_entry", "cls": fcls, "method": fm, "sig": "*"}
+        p["overrides"] = _guard_overrides(rec)
+        p["rationale"] = "mech stage2: trigger_entry фронтира + форс всех стражей (эвристика)"
+    return p
+
+
 def dex_member_exists(dx):
     """member_exists поверх androguard dx. Сверяет имя И сигнатуру (R8-перегрузки)."""
     def me(cls, kind, name, sig):
@@ -300,7 +357,7 @@ def _agent(name):
     return b if b.exists() else HERE / name
 
 
-def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None):
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None):
     """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
     только когда dx реально нужен (валидация overrides/fields, smali для openai-
@@ -317,11 +374,14 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None):
     device = trace.pick_device(None)
 
     def run_stage(rec, stage):
-        # manual-бэкенд игнорирует промпт → не трогаем dx/smali (не грузим APK)
-        prompt = "" if backend == "manual" else build_prompt(
-            rec, stage, {rec["cls"] + "->" + rec["method"]:
-                         method_smali(dx_provider(), rec["cls"], rec["method"])})
-        plan = generate_plan(prompt, backend=backend, manual_path=manual_path)
+        if backend == "mech":
+            plan = make_plan(rec, stage)        # детерминированно из среза, без dx/LLM
+        else:
+            # manual-бэкенд игнорирует промпт → не трогаем dx/smali (не грузим APK)
+            prompt = "" if backend == "manual" else build_prompt(
+                rec, stage, {rec["cls"] + "->" + rec["method"]:
+                             method_smali(dx_provider(), rec["cls"], rec["method"])})
+            plan = generate_plan(prompt, backend=backend, manual_path=manual_path)
         probs = validate_plan(plan, me)
         if probs:
             return {"stage": stage, "valid": False, "exceptions": probs,
@@ -355,7 +415,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None):
             agent.load()
             device.resume(pid)
             time.sleep(_SETTLE)
-            try: agent.exports_sync.capture_on(rec["key"])
+            try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
             except Exception as e: exc.append("capture_on: " + str(e))
             try: res = agent.exports_sync.arm(json.dumps(plan))
             except Exception as e: exc.append("arm: " + str(e))
@@ -732,8 +792,10 @@ def main():
     ap.add_argument("--apk", type=Path)
     ap.add_argument("--package", help="пакет для spawn (по умолчанию — из манифеста APK)")
     ap.add_argument("--keys", nargs="*", help="подмножество ключей; по умолч. activation_exact")
-    ap.add_argument("--backend", default="openai", choices=["openai", "manual"])
+    ap.add_argument("--backend", default="openai", choices=["openai", "manual", "mech"],
+                    help="openai=LLM, manual=план из файла, mech=механический без LLM")
     ap.add_argument("--manual-plan", type=Path, help="файл с планом для --backend manual")
+    ap.add_argument("--hidden", type=Path, help="out/<pkg>.hidden.jsonl — карта ключ→путь для привязки снимка")
     ap.add_argument("--wait", type=float, default=5.0, help="окно ожидания сетевого события, сек")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--dry-run", action="store_true", help="prompt+plan+validate без устройства")
@@ -765,7 +827,15 @@ def main():
             print(f"[{r['key']}] проблемы плана: {validate_plan(plan, me) or 'нет'}")
         return
     pkg = args.package or _package_of(args.apk)
-    run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan)
+    paths = {}
+    if args.hidden and args.hidden.exists():
+        for l in args.hidden.read_text(encoding="utf-8").splitlines():
+            if not l.strip():
+                continue
+            h = json.loads(l)
+            if h.get("status") == "hidden" and h.get("path"):
+                paths.setdefault(h["key"], h["path"])
+    run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan, paths)
     for r in recs:
         results.append(run_key(r, stages=(0, 1, 2), run_stage=run_stage))
     txt = report(results)

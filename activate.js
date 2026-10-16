@@ -4,7 +4,7 @@
  * один раз. hook.js грузится рядом и подтверждает факт вызова. */
 
 var proxyByIface = {};   // имя интерфейса -> живой прокси-инстанс (для call_retrofit)
-var cap = { key: null, hit: null };
+var cap = { key: null, path: '', hits: [] };   // path — ожидаемый endpoint ключа
 
 function jclass(name) { return Java.use(name.replace(/\//g, '.')); }
 
@@ -133,8 +133,12 @@ function doTrigger(t, args) {
 }
 
 rpc.exports = {
-    captureOn: function (key) { cap.key = key; cap.hit = null; },
-    snapshot: function () { return cap.hit; },
+    captureOn: function (key, pathHint) { cap.key = key; cap.path = pathHint || ''; cap.hits = []; },
+    snapshot: function () {
+        if (!cap.hits.length) return null;
+        for (var i = 0; i < cap.hits.length; i++) if (cap.hits[i].matched) return cap.hits[i];
+        return cap.hits[0];   // ни один не совпал с ожидаемым путём — отдаём первый (advisory)
+    },
     arm: function (planJson) {
         var plan = JSON.parse(planJson), ex = [];
         Java.perform(function () {
@@ -196,7 +200,8 @@ function installOkHttpCapture(attemptsLeft) {
         var Ok = Java.use('okhttp3.OkHttpClient');
         Ok.newCall.implementation = function (req) {
             try {
-                if (cap.key && cap.hit === null) {
+                if (cap.key && cap.hits.length < 10) {
+                    var url = req.url().toString();
                     var body = null;
                     try {
                         var rb = req.body();
@@ -207,7 +212,8 @@ function installOkHttpCapture(attemptsLeft) {
                             body = buf.readUtf8();
                         }
                     } catch (e) { body = '<unreadable>'; }
-                    cap.hit = { key: cap.key, method: req.method(), url: req.url().toString(), body: body };
+                    cap.hits.push({ key: cap.key, method: req.method(), url: url, body: body,
+                                    matched: cap.path ? (url.indexOf(cap.path) !== -1) : false });
                 }
             } catch (e) {}
             return this.newCall(req);
