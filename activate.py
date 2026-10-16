@@ -207,8 +207,11 @@ def _urllib_transport(url, headers, body):
         return r.read().decode("utf-8")
 
 
-def generate_plan(prompt, backend="openai", *, transport=None, manual_path=None):
-    """Генерирует план через LLM (openai) или читает вручную (manual)."""
+def generate_plan(prompt, backend="openai", *, transport=None, manual_path=None,
+                  max_retries=4, _backoff=None):
+    """Генерирует план через LLM (openai) или читает вручную (manual).
+    На бесплатном tier (OpenRouter) жёсткие rate-limit'ы — ретрай с бэкоффом на
+    любой сбой транспорта (429/5xx/сеть), max_retries попыток сверх первой."""
     if backend == "manual":
         src = Path(manual_path) if manual_path else None
         if not src or not src.exists():
@@ -223,10 +226,21 @@ def generate_plan(prompt, backend="openai", *, transport=None, manual_path=None)
     body = json.dumps({"model": model, "temperature": 0,
                        "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    try:
-        raw = (transport or _urllib_transport)(url, headers, body)
-    except Exception as e:
-        raise RuntimeError(f"LLM transport failed ({model} @ {url}): {e}") from e
+    import time as _t
+    backoff = _backoff or (lambda n: _t.sleep(min(3 * (2 ** n), 30)))
+    raw, last = None, None
+    for attempt in range(max_retries + 1):
+        try:
+            raw = (transport or _urllib_transport)(url, headers, body)
+            last = None
+            break
+        except Exception as e:
+            last = e
+            if attempt < max_retries:
+                backoff(attempt)
+    if last is not None:
+        raise RuntimeError(f"LLM transport failed ({model} @ {url}) после "
+                           f"{max_retries + 1} попыток: {last}") from last
     try:
         content = json.loads(raw)["choices"][0]["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as e:
@@ -722,7 +736,7 @@ def _check_generate_plan():
     def boom(*a):
         raise urllib.error.HTTPError("https://x", 429, "Too Many Requests", {}, None)
     try:
-        generate_plan("PROMPT", backend="openai", transport=boom)
+        generate_plan("PROMPT", backend="openai", transport=boom, max_retries=0)
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         msg = str(e).lower()
