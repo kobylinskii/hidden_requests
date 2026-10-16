@@ -281,18 +281,26 @@ def activate_on_device(dx, pkg, backend, wait_t, manual_path=None):
         if probs:
             return {"stage": stage, "valid": False, "exceptions": probs,
                     "fired": False, "real_params": False, "request": None, "plan": plan}
-        pid = device.spawn([pkg]); session = device.attach(pid)
-        for js in ("hook.js", "activate.js"):
-            s = session.create_script((HERE / js).read_text(encoding="utf-8"))
-            s.load()
-            if js == "activate.js":
-                agent = s
-        device.resume(pid)
-        agent.exports_sync.capture_on(rec["key"])
-        res = agent.exports_sync.arm(json.dumps(plan))
-        time.sleep(wait_t)
-        snap = agent.exports_sync.snapshot()
-        session.detach()
+        pid = device.spawn([pkg])
+        session = None
+        try:
+            session = device.attach(pid)
+            for js in ("hook.js", "activate.js"):
+                s = session.create_script((HERE / js).read_text(encoding="utf-8"))
+                s.load()
+                if js == "activate.js":
+                    agent = s
+            device.resume(pid)
+            agent.exports_sync.capture_on(rec["key"])
+            res = agent.exports_sync.arm(json.dumps(plan))
+            time.sleep(wait_t)
+            snap = agent.exports_sync.snapshot()
+        finally:
+            if session is not None:
+                try: session.detach()
+                except Exception: pass
+            try: device.kill(pid)
+            except Exception: pass
         fired = snap is not None
         real = fired and _params_real(plan, snap)
         return {"stage": stage, "valid": True, "exceptions": res.get("exceptions", []),
