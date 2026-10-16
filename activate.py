@@ -121,6 +121,7 @@ def method_smali(dx, cls, method):
             continue
         for ins in code.get_bc().get_instructions():
             out.append(f"{ins.get_name()} {ins.get_output()}")
+        break
     return "\n".join(out)
 
 
