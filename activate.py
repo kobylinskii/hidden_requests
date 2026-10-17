@@ -508,14 +508,47 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
 
 
 def _params_real(plan, snap):
-    """Уровень (б): хоть один аргумент не синтетический ($choose/прогон) И запрос непуст.
-    Порог (spec §15, открытый вопрос): нет args через $new/примитив-болванку."""
-    if not snap or not snap.get("url"):
+    """Уровень (б1): запрос СОБРАН ПРИЛОЖЕНИЕМ — непустой снимок И ни один
+    аргумент на сработавшем пути не был НАШЕЙ синтетической болванкой.
+    Проходят: none-тир (args пуст — запрос полностью определён методом) и
+    invoke/trigger_entry с пустыми args (живой вызывающий сам собрал DTO из
+    состояния приложения). Не проходят: любой наш внедрённый аргумент —
+    примитив-дефолт, String-болванка (вкл. ""), $new/$default-конструкция.
+    Значения из живого приложения ($choose/$field/$invoke) болванками не
+    считаются (spec §15: граница (а)=запрос сформирован / (б1)=app-built).
+    Снимок обязан быть matched (url содержит ожидаемый endpoint ключа) — иначе
+    это попутный стартовый трафик приложения, а не НАШ форс-вызов (suspend мог
+    не дойти до okhttp.newCall, и snapshot() вернул чужой запрос)."""
+    if not snap or not snap.get("url") or not snap.get("matched"):
         return False
-    synth = any(isinstance(a.get("value"), (int, float, str, bool)) or
-                (isinstance(a.get("value"), dict) and "$new" in a["value"])
-                for a in plan.get("args", []))
-    return not synth or bool(plan.get("trigger", {}).get("kind") in ("invoke", "trigger_entry"))
+    for a in plan.get("args", []):
+        v = a.get("value")
+        if isinstance(v, (int, float, bool, str)):          # примитив/String-болванка
+            return False
+        if isinstance(v, dict) and ("$new" in v or "$default" in v):  # наша конструкция
+            return False
+    return True
+
+
+def _check_params_real():
+    snap = {"url": "/x", "matched": True}
+    # none-тир (args пуст, запрос полностью определён методом) — app-built (б1)
+    assert _params_real({"args": [], "trigger": {"kind": "call_retrofit"}}, snap)
+    # invoke/trigger_entry с пустыми args (живой вызывающий собрал DTO) — б1
+    assert _params_real({"args": [], "trigger": {"kind": "invoke"}}, snap)
+    # наши болванки — НЕ б1
+    assert not _params_real({"args": [{"index": 0, "value": ""}]}, snap)            # String-болванка
+    assert not _params_real({"args": [{"index": 0, "value": 0}]}, snap)             # примитив
+    assert not _params_real({"args": [{"index": 0, "value": {"$new": "p.Dto"}}]}, snap)   # конструкция
+    assert not _params_real({"args": [{"index": 0, "value": {"$default": "p.T"}}]}, snap)  # дефолт по типу
+    # значение из живого приложения — допустимо
+    assert _params_real({"args": [{"index": 0, "value": {"$choose": "p.T"}}]}, snap)
+    # снимок НЕ matched (попутный трафик приложения) — не б1
+    assert not _params_real({"args": []}, {"url": "/x", "matched": False})
+    # пустой снимок — не б1 в любом случае
+    assert not _params_real({"args": []}, None)
+    assert not _params_real({"args": []}, {"url": "", "matched": True})
+    print("  params_real ok")
 
 
 def report(results):
@@ -540,6 +573,24 @@ def report(results):
          "",
          "Оговорка: сравнение с RQ3/Таблицей IV ICSE 2025 — качественное; "
          "метрики несопоставимы напрямую (активити vs сетевые вызовы, другой стенд).",]
+    # Дамп сформированных запросов по каждому ключу (артефакт для ВКР): что
+    # именно ушло и чем наполнено тело — app-built (б1) vs наша болванка (а).
+    dump = []
+    for r in results:
+        snap = None
+        for s in r.get("stages", []):
+            if (s.get("request") or {}).get("url"):
+                snap = s["request"]
+                if s["request"].get("matched"):
+                    break
+        if not snap:
+            continue
+        lvl = "б1" if r["activated_real"] else "а"
+        body = snap.get("body")
+        body = "" if body is None else (" body=" + str(body)[:120])
+        dump.append(f"  [{lvl}] {r['key'].split('->')[-1]}: {snap.get('method','?')} {snap.get('url','')}{body}")
+    if dump:
+        L += ["", "Сформированные запросы (по ключам, [а]=болванка / [б1]=app-built):"] + dump
     return "\n".join(L)
 
 
@@ -867,6 +918,7 @@ def _selfcheck(apk=None):
     _check_generate_plan()
     _check_staging()
     _check_arg_synth()
+    _check_params_real()
     _check_report()
     if apk is not None:
         if load_apk is None:

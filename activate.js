@@ -188,6 +188,21 @@ function mintProxy(clsName) {
     return null;
 }
 
+// Живой инстанс класса из кучи (уровень б1): вызывающие/ViewModel/UseCase —
+// DI-синглтоны, они ЕСТЬ в куче (в отличие от транзиентных DTO). Живой receiver
+// несёт реальное состояние приложения, поэтому его код собирает запрос с
+// реальными значениями, а не с нашими болванками. null — живого нет.
+function liveReceiver(clsName) {
+    var found = null;
+    try {
+        Java.choose(clsName, {
+            onMatch: function (i) { try { found = Java.retain(i); } catch (e) {} return 'stop'; },
+            onComplete: function () {}
+        });
+    } catch (e) {}
+    return found;
+}
+
 function doTrigger(t, args) {
     var C = jclass(t.cls);
     if (t.kind === 'call_retrofit') {
@@ -195,7 +210,11 @@ function doTrigger(t, args) {
         if (!inst) throw new Error('прокси-инстанс ' + t.cls + ' ещё не создан и не удалось создать через retrofit.create (нет живого Retrofit?)');
         return invokeOverload(overloadBySig(C, t.method, t.sig), inst, args);
     }
-    return invokeOverload(overloadBySig(C, t.method, t.sig), C.$new(), args);
+    // invoke / trigger_entry: живой вызывающий из кучи → его код сам собирает
+    // реальный DTO (уровень б1); фолбэк на $new() (пустое состояние), если
+    // живого инстанса нет.
+    var recv = liveReceiver(t.cls) || C.$new();
+    return invokeOverload(overloadBySig(C, t.method, t.sig), recv, args);
 }
 
 rpc.exports = {
