@@ -286,13 +286,27 @@ def _guard_overrides(rec):
         out.append({"cls": cls, "method": meth, "sig": "*", "ret": val})
     return out
 
+def _arg_val(t):
+    """JVM-дескриптор типа параметра -> значение для плана. Объект -> живой
+    инстанс из кучи ($choose, реальные параметры), массив -> null (грубо),
+    примитив -> дефолт. Типы приходят из среза (slice.py arg_types)."""
+    if t.startswith("L"):
+        return {"$choose": t[1:-1].replace("/", ".")}
+    if t.startswith("["):
+        return {"$null": "x"}
+    return {"Z": False, "F": 0.0, "D": 0.0}.get(t, 0)
+
+def _args_from_types(rec):
+    return [{"index": i, "value": _arg_val(t)} for i, t in enumerate(rec.get("arg_types", []))]
+
 def make_plan(rec, stage):
     cls, method, key = rec["cls"], rec["method"], rec["key"]
     p = {"key": key, "stage": stage, "overrides": [], "fields": [], "args": [],
          "raw_js": None, "rationale": ""}
     if stage == 0:
         p["trigger"] = {"kind": "call_retrofit", "cls": cls, "method": method, "sig": "*"}
-        p["rationale"] = "mech stage0: прямой вызов Retrofit-метода (zero-arg + авто-Continuation)"
+        p["args"] = _args_from_types(rec)   # type-aware: $choose объектов + дефолты примитивов
+        p["rationale"] = "mech stage0: прямой вызов Retrofit-метода, args по типам (+авто-Continuation)"
     elif stage == 1:
         cs = rec.get("call_sites") or []
         ccls, cm = _split(cs[0]["caller"]) if cs else (cls, method)
@@ -382,7 +396,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
     упирается в тяжёлую androguard-загрузку).
     import frida/trace здесь, а не на верху модуля — offline-пути должны работать
     без установленного frida."""
-    import frida, time, trace
+    import frida, time, trace, signal
     _me = {}
     def me(cls, kind, name, sig):
         if skip_dx:                              # без DEX-валидации (кривой член упадёт на устройстве)
@@ -415,8 +429,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         if probs:
             return {"stage": stage, "valid": False, "exceptions": probs,
                     "fired": False, "real_params": False, "request": None, "plan": plan}
-        pid = device.spawn([pkg])
-        session = None
+        session = pid = None
         seen = {"hit": False}
 
         def _on_hook_msg(message, data):
@@ -433,7 +446,15 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         # прокси до arm (иначе call_retrofit не найдёт инстанс). Пилот-правка, §15.
         res, snap, exc = {}, None, []
         _SETTLE = 1.0
+        # Таймаут на ключ: на свопящем эмуляторе device.spawn/attach иногда виснет
+        # намертво (во frida нет таймаута) — SIGALRM в главном потоке прерывает
+        # зависший вызов, ключ помечается timeout и прогон идёт дальше (пилот-правка).
+        def _on_timeout(sig, frm):
+            raise TimeoutError("per-key timeout (spawn/attach завис)")
+        _old_h = signal.signal(signal.SIGALRM, _on_timeout)
+        signal.alarm(int(wait_t) + 45)
         try:
+            pid = device.spawn([pkg])
             session = device.attach(pid)
             # ТОЛЬКО activate.js: он сам кэширует прокси, несёт key-exact оракул
             # (эмитит {t:'retrofit',cls,m}) и снимает запрос. hook.js НЕ грузим —
@@ -454,11 +475,14 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         except Exception as e:
             exc.append("session: " + str(e))
         finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, _old_h)
             if session is not None:
                 try: session.detach()
                 except Exception: pass
-            try: device.kill(pid)
-            except Exception: pass
+            if pid is not None:
+                try: device.kill(pid)
+                except Exception: pass
         # fired — ключ-точный оракул из hook.js (Proxy.invoke по cls->method).
         # snap — advisory-артефакт; строгая привязка к key — доработка пилотной фазы.
         fired = seen["hit"]

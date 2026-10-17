@@ -987,6 +987,46 @@ def _is_framework_guard(guard):
     return bool(m) and m.group() in _FRAMEWORK_MEMBER_NAMES
 
 
+_PRIM = set("ZBSCIJFD")
+_CONT = "Lkotlin/coroutines/Continuation;"
+
+def _param_types(desc):
+    """JVM-дескриптор метода '(...)ret' -> список дескрипторов параметров
+    ['Ljava/lang/String;','I','[Z',...]. Пусто, если нет скобок."""
+    m = re.search(r"\(([^)]*)\)", desc or "")
+    if not m:
+        return []
+    s, out, i = m.group(1).replace(" ", ""), [], 0
+    while i < len(s):
+        arr = ""
+        while i < len(s) and s[i] == "[":
+            arr += "["; i += 1
+        c = s[i]
+        if c == "L":
+            e = s.index(";", i)
+            out.append(arr + s[i:e + 1]); i = e + 1
+        else:
+            out.append(arr + c); i += 1
+    return out
+
+def _hidden_desc(dx, cls, method):
+    """Дескриптор скрытого Retrofit-метода cls->method (первая перегрузка)."""
+    ca = dx.classes.get("L" + cls.replace(".", "/") + ";")
+    if ca is None:
+        return None
+    for ma in ca.get_methods():
+        if ma.name == method:
+            return ma.descriptor
+    return None
+
+def _data_cost(sem_types):
+    """Тир стоимости ДАННЫХ для активации (HTTP-аналог Таблицы IV RQ3): по
+    семантическим аргументам (Continuation уже убран). none / primitive / object."""
+    if not sem_types:
+        return "none"
+    return "primitive" if all(t[0] in _PRIM for t in sem_types) else "object"
+
+
 def slice_key(dx, key):
     """Полная запись среза для одного ключа (схема спеки §4): обход вверх
     (Task 4) до фронтира/лимита, на каждом семантическом кадре — стражи
@@ -1003,7 +1043,15 @@ def slice_key(dx, key):
            "activation_exact": False, "args": [],
            "frontier": w["frontier"], "depth": w["depth"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
+           "arg_types": [], "suspend": False, "data_cost": "none",
            "notes": []}
+    # Типы аргументов скрытого метода — собираем ВО ВРЕМЯ среза (dx уже загружен),
+    # чтобы activate.py синтезировал args по типам без отдельной androguard-загрузки.
+    # Continuation у suspend убираем из семантических — рантайм досылает его сам.
+    _pt = _param_types(_hidden_desc(dx, cls, method))
+    rec["suspend"] = bool(_pt) and _pt[-1] == _CONT
+    rec["arg_types"] = [t for t in _pt if t != _CONT]
+    rec["data_cost"] = _data_cost(rec["arg_types"])
     if not w["reached"]:
         # BFScan печатает JADX-алиасы имён (обфускация): такого класса/метода в DEX
         # нет вовсе — это артефакт статики, а не категория No caller
@@ -1181,6 +1229,15 @@ def report(records, meta=None):
     w(f"Нижняя оценка (обход не дошёл до UI-входа, истинная стоимость не меньше): {len(lower)} ключей")
     undet = sum(1 for r in records if r["reached"] and r.get("activation_cost") is None)
     w(f"Стоимость не определена (обход завершился только на плумбинге, нет семантического входа): {undet} ключей")
+    # Стоимость ДАННЫХ (HTTP-аналог тиров «+Data support» RQ3): по типам аргументов
+    # скрытого метода. none=нет аргументов (активируется прямым вызовом), primitive=
+    # только примитивы (дефолты), object=есть объектные арги (нужен живой инстанс/синтез).
+    dc = Counter(r.get("data_cost", "none") for r in records if r["reached"])
+    susp = sum(1 for r in records if r["reached"] and r.get("suspend"))
+    w(f"Стоимость данных (типы аргументов скрытого метода): "
+      f"none(без аргументов): {dc.get('none', 0)} | "
+      f"primitive(только примитивы): {dc.get('primitive', 0)} | "
+      f"object(есть объектные): {dc.get('object', 0)} | из них suspend: {susp}")
     src = Counter(g["operand"]["detail"] for r in records for g in r["guards"]
                   if not g["notes"] and g["operand"]["source_kind"] in ("invoke", "field", "instanceof")
                   and g["operand"]["detail"])
