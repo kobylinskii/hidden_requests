@@ -559,9 +559,25 @@ OpenRouter (haiku: быстро/надёжно) либо не-rate-limited ис�
 ДАННЫЕ аргументов** — это прямой HTTP-аналог тира «+Data support» RQ3 ICSE (~24% активити требовали
 генерации данных). Вывод для ВКР: **11/48 активируются тривиально/без данных** (ст.0/1, zero-arg),
 **~37/48 требуют реальных аргументов** — их даёт не угадывание плана (ни механика, ни LLM вслепую), а
-harvest/replay реальных значений из трейса (провенанс №3, спека §5) либо type-aware-синтез с `$choose`
-живых инстансов (нужен dx с типами). Инфраструктура (frida 17, suspend-Continuation, оракул,
-attribution, retry, бэкенды mech/manual/openai/plans) — рабочая.
+harvest/replay реальных значений из трейса (провенанс №3, спека §5) либо type-aware-синтез. Инфраструктура
+(frida 17, suspend-Continuation, оракул, attribution, retry, бэкенды mech/manual/openai/plans) — рабочая.
+
+**Классификация по стоимости ДАННЫХ — собрана ВО ВРЕМЯ среза** (slice.py пишет `arg_types`/`suspend`/
+`data_cost` из дескриптора метода; HTTP-аналог тиров «+Data support» RQ3). Из 48 `activation_exact`:
+**none (0 аргументов) 7, primitive 1, object (нужен request-body-объект) 40**; по всем 171 reached —
+none 13 / primitive 8 / **object 150**; suspend 157/171. Доминанта остатка — объектные request-body-DTO
+(`DisallowDeviceRequestBodyDto`, `AnalyticEventRequest`, …).
+
+**Type-aware синтез аргументов реализован** (make_plan строит args по `arg_types`: объект→`$choose` живого
+инстанса, примитив→дефолт; прогон на 37) → **0/37, и причина окончательна:** `$choose: живых инстансов
+<Dto> нет` — объектные request-body **транзиентны**, их нет в куче (скрытый вызов их не создаёт). Значит
+**40/48 «object» активируются не выбором из кучи, а КОНСТРУИРОВАНИЕМ DTO** (`$new`/builder с рекурсивным
+синтезом полей) либо **harvest реального DTO из прогнанного трейса** (провенанс №3). Добавлен таймаут на
+ключ (SIGALRM вокруг spawn/attach) — зависший на свопе ключ пропускается, прогон не виснет (в прогоне
+также всплыл инфра-шум «need Gadget»: эмулятор ушёл offline).
+
+**ИТОГ пилота активации: 11/48** (тиры none/primitive + тривиальные); точная причина остатка —
+**конструирование объектных аргументов** (НЕ стражи и НЕ доступ к LLM) = это и есть следующий шаг.
 
 Дизайн — `docs/superpowers/specs/2026-10-16-frida-forced-activation-design.md`,
 план реализации — `docs/superpowers/plans/2026-10-16-frida-forced-activation.md`.
