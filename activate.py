@@ -374,7 +374,7 @@ def _agent(name):
     return b if b.exists() else HERE / name
 
 
-def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False):
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None):
     """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
     только когда dx реально нужен (валидация overrides/fields, smali для openai-
@@ -393,7 +393,12 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
     device = trace.pick_device(None)
 
     def run_stage(rec, stage):
-        if backend == "mech":
+        if backend == "plans":
+            plan = (plans or {}).get(rec["key"])  # готовый план на ключ (напр. от субагента)
+            if not isinstance(plan, dict) or plan.get("stage") != stage:
+                return {"stage": stage, "valid": False, "exceptions": ["нет плана для этой ступени"],
+                        "fired": False, "real_params": False, "request": None, "plan": plan}
+        elif backend == "mech":
             plan = make_plan(rec, stage)        # детерминированно из среза, без dx/LLM
         else:
             # manual и skip_dx игнорируют dx/smali (не грузим тяжёлый androguard);
@@ -820,8 +825,10 @@ def main():
     ap.add_argument("--skip-dx", action="store_true",
                     help="не грузить androguard dx: пустой smali в промпте + пропуск DEX-валидации "
                          "(кривой член падает на устройстве). Для openai на тяжёлом/свопящем APK.")
-    ap.add_argument("--backend", default="openai", choices=["openai", "manual", "mech"],
-                    help="openai=LLM, manual=план из файла, mech=механический без LLM")
+    ap.add_argument("--backend", default="openai", choices=["openai", "manual", "mech", "plans"],
+                    help="openai=LLM, manual=один план из файла, mech=механический без LLM, "
+                         "plans=готовые планы на ключ из --plans-file (напр. от субагента)")
+    ap.add_argument("--plans-file", type=Path, help="JSON {ключ: план} для --backend plans")
     ap.add_argument("--manual-plan", type=Path, help="файл с планом для --backend manual")
     ap.add_argument("--hidden", type=Path, help="out/<pkg>.hidden.jsonl — карта ключ→путь для привязки снимка")
     ap.add_argument("--wait", type=float, default=5.0, help="окно ожидания сетевого события, сек")
@@ -866,7 +873,11 @@ def main():
             h = json.loads(l)
             if h.get("status") == "hidden" and h.get("path"):
                 paths.setdefault(h["key"], h["path"])
-    run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan, paths, args.skip_dx)
+    plans = {}
+    if args.plans_file and args.plans_file.exists():
+        plans = json.loads(args.plans_file.read_text(encoding="utf-8"))
+    run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan,
+                                   paths, args.skip_dx, plans)
     for r in recs:
         results.append(run_key(r, stages=(0, 1, 2), run_stage=run_stage))
     txt = report(results)
