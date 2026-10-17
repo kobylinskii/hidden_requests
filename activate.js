@@ -164,11 +164,35 @@ function invokeOverload(ov, receiver, args) {
     return ov.call.apply(ov, [receiver].concat(args));
 }
 
+// Лениво-инициализируемый Retrofit-сервис: на холодном старте его прокси ещё
+// нет (приложение создаёт сервис при открытии экрана фичи). Но сам Retrofit —
+// долгоживущий синглтон, он ЕСТЬ в куче ($choose работает, в отличие от
+// транзиентных DTO). Создаём прокси тем же публичным API, что и приложение —
+// retrofit.create(InterfaceClass). create() внутри зовёт Proxy.newProxyInstance,
+// наш хук регистрирует прокси в proxyByIface и вешает оракул на его handler.
+function mintProxy(clsName) {
+    var iface;
+    try { iface = jclass(clsName).class; } catch (e) { return null; }
+    var rets = [];
+    Java.choose('retrofit2.Retrofit', {
+        onMatch: function (r) { try { rets.push(Java.retain(r)); } catch (e) {} },
+        onComplete: function () {}
+    });
+    for (var i = 0; i < rets.length; i++) {
+        // Любой Retrofit собирает прокси для интерфейса (create не валидирует
+        // baseUrl); при нескольких хостах endpoint снимка — advisory.
+        try { rets[i].create(iface); } catch (e) { continue; }
+        var got = proxyByIface[clsName] || proxyByIface[clsName.replace(/\./g, '/')];
+        if (got) return got;
+    }
+    return null;
+}
+
 function doTrigger(t, args) {
     var C = jclass(t.cls);
     if (t.kind === 'call_retrofit') {
-        var inst = proxyByIface[t.cls] || proxyByIface[t.cls.replace(/\./g, '/')];
-        if (!inst) throw new Error('прокси-инстанс ' + t.cls + ' ещё не создан');
+        var inst = proxyByIface[t.cls] || proxyByIface[t.cls.replace(/\./g, '/')] || mintProxy(t.cls);
+        if (!inst) throw new Error('прокси-инстанс ' + t.cls + ' ещё не создан и не удалось создать через retrofit.create (нет живого Retrofit?)');
         return invokeOverload(overloadBySig(C, t.method, t.sig), inst, args);
     }
     return invokeOverload(overloadBySig(C, t.method, t.sig), C.$new(), args);
