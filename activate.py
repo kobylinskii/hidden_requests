@@ -246,6 +246,8 @@ def generate_plan(prompt, backend="openai", *, transport=None, manual_path=None,
         content = json.loads(raw)["choices"][0]["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as e:
         raise RuntimeError(f"LLM response unparsable: {e}; raw={raw[:200]!r}") from e
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError(f"LLM вернул пустой content ({content!r}; raw={raw[:200]!r})")
     return parse_plan(content)
 
 
