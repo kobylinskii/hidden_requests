@@ -286,18 +286,31 @@ def _guard_overrides(rec):
         out.append({"cls": cls, "method": meth, "sig": "*", "ret": val})
     return out
 
-def _arg_val(t):
-    """JVM-дескриптор типа параметра -> значение для плана. Объект -> живой
-    инстанс из кучи ($choose, реальные параметры), массив -> null (грубо),
-    примитив -> дефолт. Типы приходят из среза (slice.py arg_types)."""
-    if t.startswith("L"):
-        return {"$choose": t[1:-1].replace("/", ".")}
+def _arg_val(t, recipes, depth=2):
+    """JVM-дескриптор типа параметра -> значение для плана. String -> "",
+    массив -> null (грубо), примитив -> дефолт. Объект: если в recipes есть
+    рецепт постройки (slice.py arg_recipes) и глубина не исчерпана — строим
+    $new по конструктору, рекурсивно синтезируя его аргументы; иначе $default
+    (activate.js в рантайме даст enum->values()[0] / прочий объект->null).
+    Объектные DTO транзиентны (в куче их нет), поэтому $new, а не $choose."""
+    if t == "Ljava/lang/String;":
+        return ""
     if t.startswith("["):
         return {"$null": "x"}
+    if t.startswith("L"):
+        fq = t[1:-1].replace("/", ".")
+        r = recipes.get(t)
+        if r and depth > 0:
+            pts = r["ctor"]
+            return {"$new": fq, "sig": "(" + "".join(pts) + ")V",
+                    "args": [_arg_val(p, recipes, depth - 1) for p in pts]}
+        return {"$default": fq}
     return {"Z": False, "F": 0.0, "D": 0.0}.get(t, 0)
 
 def _args_from_types(rec):
-    return [{"index": i, "value": _arg_val(t)} for i, t in enumerate(rec.get("arg_types", []))]
+    recipes = rec.get("arg_recipes", {})
+    return [{"index": i, "value": _arg_val(t, recipes)}
+            for i, t in enumerate(rec.get("arg_types", []))]
 
 def make_plan(rec, stage):
     cls, method, key = rec["cls"], rec["method"], rec["key"]
@@ -305,7 +318,7 @@ def make_plan(rec, stage):
          "raw_js": None, "rationale": ""}
     if stage == 0:
         p["trigger"] = {"kind": "call_retrofit", "cls": cls, "method": method, "sig": "*"}
-        p["args"] = _args_from_types(rec)   # type-aware: $choose объектов + дефолты примитивов
+        p["args"] = _args_from_types(rec)   # type-aware: $new DTO по рецепту + дефолты примитивов
         p["rationale"] = "mech stage0: прямой вызов Retrofit-метода, args по типам (+авто-Continuation)"
     elif stage == 1:
         cs = rec.get("call_sites") or []
@@ -808,6 +821,30 @@ def _check_staging():
     print("  staging ok")
 
 
+def _check_arg_synth():
+    # object-арг с рецептом -> $new по конструктору: примитив->дефолт,
+    # String->"", вложенный объект с рецептом -> вложенный $new, объект без
+    # рецепта/enum -> $default.
+    recipes = {"Lp/Dto;": {"ctor": ["Ljava/lang/String;", "I", "Lp/Inner;", "Lp/Mode;"]},
+               "Lp/Inner;": {"ctor": ["Z"]}}
+    rec = {"arg_types": ["Lp/Dto;", "J", "Ljava/lang/String;", "[I"],
+           "arg_recipes": recipes}
+    args = [a["value"] for a in _args_from_types(rec)]
+    dto = args[0]
+    assert dto["$new"] == "p.Dto" and dto["sig"] == "(Ljava/lang/String;ILp/Inner;Lp/Mode;)V"
+    assert dto["args"][0] == "" and dto["args"][1] == 0           # String->"", int->0
+    assert dto["args"][2]["$new"] == "p.Inner"                   # вложенный DTO с рецептом
+    assert dto["args"][2]["args"] == [False]                     # его boolean->false
+    assert dto["args"][3] == {"$default": "p.Mode"}              # enum без рецепта -> $default
+    assert args[1] == 0 and args[2] == "" and args[3] == {"$null": "x"}  # long/String/массив
+    # исчерпание глубины: объект на 3-м уровне -> $default, не бесконечная рекурсия
+    deep = {"Lp/A;": {"ctor": ["Lp/B;"]}, "Lp/B;": {"ctor": ["Lp/C;"]},
+            "Lp/C;": {"ctor": ["Lp/D;"]}, "Lp/D;": {"ctor": ["I"]}}
+    v = _arg_val("Lp/A;", deep)   # A(depth2)->B(1)->C(0): C уже $default, не раскрыт
+    assert v["args"][0]["$new"] == "p.B" and v["args"][0]["args"][0] == {"$default": "p.C"}, v
+    print("  arg_synth ok")
+
+
 def _check_report():
     results = [
         {"key": "a", "reached": True, "activated_real": True, "min_stage": 0},
@@ -829,6 +866,7 @@ def _selfcheck(apk=None):
     _check_parse_plan()
     _check_generate_plan()
     _check_staging()
+    _check_arg_synth()
     _check_report()
     if apk is not None:
         if load_apk is None:

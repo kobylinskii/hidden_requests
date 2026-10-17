@@ -23,11 +23,59 @@ function coerce(v) {
         if (found === null) throw new Error('$choose: живых инстансов ' + C + ' нет');
         return found;
     }
+    if ('$default' in v) return synthDefault(v['$default']);
     if ('$new' in v) {
         var args = (v.args || []).map(coerce);
-        return jclass(v['$new']).$new.apply(null, args);
+        var C = jclass(v['$new']);
+        var ctor = v.sig ? pickOverload(C.$new, v.sig) : C.$new;
+        // receiver конструктора — сам класс C (не null): иначе frida-java-bridge
+        // теряет class-handle ($borrowClassHandle of null).
+        return ctor.apply(C, args);
     }
     return v;
+}
+
+// Значение по умолчанию для типа, которого мы не строим рецептом (вложенный
+// объект за пределами глубины, enum, класс без конструктора): примитив->дефолт,
+// String->"", enum->первая константа (values()[0]), прочий объект->null (тело
+// запроса всё равно формируется — нас интересует факт вызова, spec §14.4).
+var _PRIM_DEFAULT = { boolean: false, byte: 0, short: 0, char: 0, int: 0,
+                      long: 0, float: 0.0, double: 0.0 };
+var _BOXED = { 'java.lang.Integer': 'int', 'java.lang.Long': 'long',
+               'java.lang.Short': 'short', 'java.lang.Byte': 'byte',
+               'java.lang.Character': 'char', 'java.lang.Boolean': 'boolean',
+               'java.lang.Float': 'float', 'java.lang.Double': 'double' };
+var _EMPTY = { 'java.util.List': 'emptyList', 'java.util.Collection': 'emptyList',
+               'java.lang.Iterable': 'emptyList', 'java.util.Map': 'emptyMap',
+               'java.util.Set': 'emptySet' };
+function synthDefault(name) {
+    if (name in _PRIM_DEFAULT) return _PRIM_DEFAULT[name];
+    if (name === 'java.lang.String' || name === 'java.lang.CharSequence') return '';
+    try {
+        if (name in _BOXED) return jclass(name).valueOf(_PRIM_DEFAULT[_BOXED[name]]);
+        if (name in _EMPTY) return jclass('java.util.Collections')[_EMPTY[name]]();
+        var C = jclass(name);
+        if (typeof C.values === 'function') {   // enum -> первая константа
+            var vs = C.values();
+            if (vs && vs.length) return vs[0];
+        }
+        // Kotlin-параметры часто non-null (checkNotNullParameter кидает NPE на
+        // null): даём no-arg инстанс (Object, ArrayList, HashMap, …), если есть
+        // такой конструктор; иначе падаем в null ниже.
+        try { return C.$new(); } catch (e) {}
+    } catch (e) {}
+    return null;
+}
+
+// Выбор перегрузки (метода или конструктора C.$new) по JVM-сигнатуре параметров.
+function pickOverload(m, sig) {
+    var want = sigArgClassNames(sig);
+    var ov = m.overloads;
+    for (var i = 0; i < ov.length; i++) {
+        var a = ov[i].argumentTypes.map(function (t) { return t.className; });
+        if (want !== null && a.length === want.length && a.join(',') === want.join(',')) return ov[i];
+    }
+    return m;
 }
 
 // Массивы отдаём в JNI/Class.getName()-форме ([I, [Ljava.lang.String;, [[I —
@@ -61,13 +109,7 @@ function sigArgClassNames(sig) {
 }
 
 function overloadBySig(clazz, method, sig) {
-    var ov = clazz[method].overloads;
-    var want = sigArgClassNames(sig);
-    for (var i = 0; i < ov.length; i++) {
-        var a = ov[i].argumentTypes.map(function (t) { return t.className; });
-        if (want !== null && a.length === want.length && a.join(',') === want.join(',')) return ov[i];
-    }
-    return clazz[method];  // единственная перегрузка
+    return pickOverload(clazz[method], sig);  // единственная перегрузка -> сам method
 }
 
 function applyOverride(o) {

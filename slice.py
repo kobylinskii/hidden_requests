@@ -1027,6 +1027,58 @@ def _data_cost(sem_types):
     return "primitive" if all(t[0] in _PRIM for t in sem_types) else "object"
 
 
+_MARKER = "DefaultConstructorMarker"
+
+def _is_enum(ca):
+    """Класс — enum (конструировать нельзя, у activate.js $default возьмёт
+    values()[0])."""
+    sup = getattr(ca, "extends", None)
+    if sup and "Enum;" in str(sup):
+        return True
+    return any(m.name == "values" for m in ca.get_methods())
+
+def _ctor_params(ca):
+    """Параметры «строительного» конструктора: среди <init> берём с наименьшим
+    числом параметров, исключая синтетический Kotlin-дефолтный (…, int,
+    DefaultConstructorMarker). None -> подходящего конструктора нет."""
+    best = None
+    for ma in ca.get_methods():
+        if ma.name != "<init>":
+            continue
+        pts = _param_types(ma.descriptor)
+        if any(_MARKER in t for t in pts):
+            continue
+        if best is None or len(pts) < len(best):
+            best = pts
+    return best
+
+def _arg_recipes(dx, arg_types, depth=2):
+    """Рецепты постройки объектных аргументов DTO: {jvm-тип: {"ctor": [типы
+    параметров]}}. Рекурсия на объектных параметрах конструктора до depth
+    уровней. String / enum / framework-классы / классы без конструктора НЕ
+    пишутся — на них make_plan даст $default (пустая строка / values()[0] /
+    null). Источник — androguard dx (уже загружен в срезе)."""
+    recipes, seen = {}, set()
+    def visit(t, d):
+        if d < 0 or not t.startswith("L") or t in seen:
+            return
+        seen.add(t)
+        if t == "Ljava/lang/String;" or _fqcn(t).startswith(_FRAMEWORK_OWNER_PREFIXES):
+            return
+        ca = dx.classes.get(t)
+        if ca is None or _is_enum(ca):
+            return
+        pts = _ctor_params(ca)
+        if pts is None:
+            return
+        recipes[t] = {"ctor": pts}
+        for p in pts:
+            visit(p, d - 1)
+    for t in arg_types:
+        visit(t, depth)
+    return recipes
+
+
 def slice_key(dx, key):
     """Полная запись среза для одного ключа (схема спеки §4): обход вверх
     (Task 4) до фронтира/лимита, на каждом семантическом кадре — стражи
@@ -1044,7 +1096,7 @@ def slice_key(dx, key):
            "frontier": w["frontier"], "depth": w["depth"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "arg_types": [], "suspend": False, "data_cost": "none",
-           "notes": []}
+           "arg_recipes": {}, "notes": []}
     # Типы аргументов скрытого метода — собираем ВО ВРЕМЯ среза (dx уже загружен),
     # чтобы activate.py синтезировал args по типам без отдельной androguard-загрузки.
     # Continuation у suspend убираем из семантических — рантайм досылает его сам.
@@ -1052,6 +1104,9 @@ def slice_key(dx, key):
     rec["suspend"] = bool(_pt) and _pt[-1] == _CONT
     rec["arg_types"] = [t for t in _pt if t != _CONT]
     rec["data_cost"] = _data_cost(rec["arg_types"])
+    # рецепты постройки объектных DTO-аргументов (тир object Таблицы IV): они
+    # транзиентны, в куче их нет ($choose пусто) — activate.py строит их $new.
+    rec["arg_recipes"] = _arg_recipes(dx, rec["arg_types"])
     if not w["reached"]:
         # BFScan печатает JADX-алиасы имён (обфускация): такого класса/метода в DEX
         # нет вовсе — это артефакт статики, а не категория No caller
@@ -1160,6 +1215,12 @@ def _check_slice_key(dx):
     # call-site — args должен быть непустым и нести схему {index,source_kind,detail}.
     assert rec["args"], rec
     assert set(("index", "source_kind", "detail")) <= set(rec["args"][0])
+    # тир object: disallowDeviceDownload принимает request-body DTO → для него
+    # собран рецепт постройки (ctor с типами параметров), не пустой.
+    assert rec["data_cost"] == "object", rec["arg_types"]
+    assert rec["arg_recipes"], rec["arg_types"]
+    assert all("ctor" in v and isinstance(v["ctor"], list)
+               for v in rec["arg_recipes"].values()), rec["arg_recipes"]
     print("  slice_key ok")
 
 
