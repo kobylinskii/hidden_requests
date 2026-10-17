@@ -224,6 +224,7 @@ def generate_plan(prompt, backend="openai", *, transport=None, manual_path=None,
     if not key:
         raise SystemExit("нет LLM_API_KEY в окружении (или используйте --backend manual)")
     body = json.dumps({"model": model, "temperature": 0,
+                       "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "2000")),
                        "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     import time as _t
