@@ -39,7 +39,23 @@ HIDDEN="$OUT/${PKG}.hidden.jsonl"
 SLICE="$OUT/${PKG}.slice.jsonl"
 ACT="$OUT/${PKG}.activation.jsonl"
 
-if [ -n "${HIDDEN_IN:-}" ]; then
+if [ -n "${SLICE_IN:-}" ]; then
+    # ── Старт с ГОТОВОГО СРЕЗА: пропускаем BFScan+трафик+diff+slice целиком.
+    # Срез (androguard) — самый память-ёмкий шаг; переиспользование готового
+    # slice.jsonl исключает OOM и экономит ~2 мин. Для привязки matched рядом
+    # нужен $HIDDEN (из out/) — если есть, используется; иначе снимок advisory.
+    [ -f "$SLICE_IN" ] || { echo "нет файла SLICE_IN: $SLICE_IN" >&2; exit 1; }
+    say "2–5/6  Старт с готового среза (BFScan/трафик/diff/slice пропущены)"
+    [ "$(readlink -f "$SLICE_IN")" = "$(readlink -f "$SLICE")" ] || cp -p "$SLICE_IN" "$SLICE"
+    $PY - "$SLICE" >&2 <<'PY'
+import json, sys
+tot = reached = 0
+for l in open(sys.argv[1], encoding="utf-8"):
+    r = json.loads(l); tot += 1; reached += bool(r.get("reached"))
+print(f"  взят готовый срез: {tot} ключей | достижимы: {reached} ({sys.argv[1]})")
+PY
+    [ -f "$HIDDEN" ] || echo "  (нет $HIDDEN — снимки будут advisory, без строгой привязки matched)" >&2
+elif [ -n "${HIDDEN_IN:-}" ]; then
     # ── Старт с готового списка скрытых запросов: пропускаем BFScan+трафик+diff.
     # Полезно для повторной активации без нового сбора трафика.
     [ -f "$HIDDEN_IN" ] || { echo "нет файла HIDDEN_IN: $HIDDEN_IN" >&2; exit 1; }
@@ -87,7 +103,8 @@ fi
 
 # ── 5. Срез скрытых запросов ────────────────────────────────────────────────
 # Срез объёмный (call-sites/стражи/провенанс по каждому ключу) — в файл;
-# в терминал только сводка.
+# в терминал только сводка. В режиме SLICE_IN шаг пропущен (срез уже готов).
+if [ -z "${SLICE_IN:-}" ]; then
 say "5/6  Статический срез скрытых запросов (slice)"
 # stdout (огромный отчёт среза) — в /dev/null; stderr (прогресс) — в терминал.
 $PY "$HERE/slice.py" --hidden "$HIDDEN" --apk "$APK" --out "$SLICE" >/dev/null
@@ -100,6 +117,7 @@ for l in open(sys.argv[1], encoding="utf-8"):
 print(f"  срез построен: {tot} ключей | достижимы в коде: {reached} | "
       f"напрямую активируемы (activation_exact): {exact}")
 PY
+fi
 
 # ── 6. Принудительная активация ──────────────────────────────────────────────
 # --recurse-args: полное тело с продюсерами/заглушками; --skip-dx: без повторной
