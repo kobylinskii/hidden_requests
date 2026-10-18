@@ -647,6 +647,20 @@ DTO построен живым компонентом без user-context). В�
 RQ3 ICSE. Это и есть задача фазы **(б2): harvest/replay реальных значений из driven/залогиненной сессии**
 + захват на уровне Retrofit. Worklist из 37 ключей (с под-блокерами) — в прогоне `…activation.dto.jsonl`.
 
+**Фаза (б2a) — захват на уровне сборки Retrofit-запроса (2026-10-18).** Пробел захвата снят: добавлен
+хук `okhttp3.Request$Builder.build()` (`activate.js captureRequest(..,'build')`) — Retrofit строит
+`Request` синхронно во время форс-вызова, ДАЖЕ если suspend-корутина не дойдёт до диспетча
+(`okhttp.newCall`). Чистый прогон (залогиненный стенд): **matched-снимков 26 → 42/48** (источник у всех —
+`build`, что доказывает: suspend-вызовы реально СТРОЯТ запрос, просто не диспетчеризуют его нашим trivial
+Continuation). Теперь видно тело почти каждого форс-вызова — сильный артефакт ВКР и точная карта пробела
+данных: `refreshToken {"refreshToken":""}`, `checkAdultCode {"code":""}`, `restoreYandexSubscription
+{"idempotenceKey":"","productId":""}`, `oauth2auth {"access_token":"","refresh_token":"",…}`,
+`cancelSubscription {"productCode":""}`, платёжные DTO и т.д.; часть полей уже «реалистичны» из enum-дефолта
+(`analyticsEvent {"eventType":"SUBSCRIPTION",…}`). Обфускация R8 местами стирает имена полей
+(`createPayment {"a":{"a":"",…}}`) — ограничение для harvest по именам. (б1) не изменился (10/48): захват
+даёт видимость, не реальные значения. Остаётся **(б2b): наполнить видимые пустые поля реальными значениями
+из залогиненной сессии** (harvest из своего трафика приложения / heap-синглтонов сессии).
+
 Дизайн — `docs/superpowers/specs/2026-10-16-frida-forced-activation-design.md`,
 план реализации — `docs/superpowers/plans/2026-10-16-frida-forced-activation.md`.
 

@@ -588,7 +588,9 @@ def report(results):
         lvl = "б1" if r["activated_real"] else "а"
         body = snap.get("body")
         body = "" if body is None else (" body=" + str(body)[:120])
-        dump.append(f"  [{lvl}] {r['key'].split('->')[-1]}: {snap.get('method','?')} {snap.get('url','')}{body}")
+        src = snap.get("source")
+        src = f" [{src}]" if src else ""
+        dump.append(f"  [{lvl}]{src} {r['key'].split('->')[-1]}: {snap.get('method','?')} {snap.get('url','')}{body}")
     if dump:
         L += ["", "Сформированные запросы (по ключам, [а]=болванка / [б1]=app-built):"] + dump
     return "\n".join(L)

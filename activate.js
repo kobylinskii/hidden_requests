@@ -280,32 +280,46 @@ Java.perform(function () {
     installOkHttpCapture(60);
 });
 
+// Снять okhttp3.Request в cap.hits (url+метод+тело, флаг matched по cap.path).
+// source — откуда снято ('build' — сборка Retrofit-запроса, 'dispatch' — okhttp.newCall),
+// чтобы в отчёте было видно, дошёл ли вызов до сети.
+function captureRequest(req, source) {
+    try {
+        if (!cap.key || cap.hits.length >= 10) return;
+        var url = req.url().toString();
+        var body = null;
+        try {
+            var rb = req.body();
+            if (rb !== null) {
+                var Buffer = Java.use('okio.Buffer');
+                var buf = Buffer.$new();
+                rb.writeTo(buf);
+                body = buf.readUtf8();
+            }
+        } catch (e) { body = '<unreadable>'; }
+        cap.hits.push({ key: cap.key, method: req.method(), url: url, body: body, source: source,
+                        matched: cap.path ? (url.indexOf(cap.path) !== -1) : false });
+    } catch (e) {}
+}
+
 function installOkHttpCapture(attemptsLeft) {
+    var ok = false;
+    // Диспетч: okhttp3.OkHttpClient.newCall — запрос реально ушёл в сеть.
     try {
         var Ok = Java.use('okhttp3.OkHttpClient');
-        Ok.newCall.implementation = function (req) {
-            try {
-                if (cap.key && cap.hits.length < 10) {
-                    var url = req.url().toString();
-                    var body = null;
-                    try {
-                        var rb = req.body();
-                        if (rb !== null) {
-                            var Buffer = Java.use('okio.Buffer');
-                            var buf = Buffer.$new();
-                            rb.writeTo(buf);
-                            body = buf.readUtf8();
-                        }
-                    } catch (e) { body = '<unreadable>'; }
-                    cap.hits.push({ key: cap.key, method: req.method(), url: url, body: body,
-                                    matched: cap.path ? (url.indexOf(cap.path) !== -1) : false });
-                }
-            } catch (e) {}
-            return this.newCall(req);
-        };
-        return;
-    } catch (e) {
-        if (attemptsLeft <= 0) return;
-        setTimeout(function () { installOkHttpCapture(attemptsLeft - 1); }, 1000);
-    }
+        Ok.newCall.implementation = function (req) { captureRequest(req, 'dispatch'); return this.newCall(req); };
+        ok = true;
+    } catch (e) {}
+    // Сборка: okhttp3.Request$Builder.build() — Retrofit строит Request ЗДЕСЬ,
+    // синхронно во время вызова, даже если suspend-корутина не дойдёт до
+    // диспетча (наш trivial Continuation её не прокачивает). Ловим тело форс-
+    // запроса, который иначе не виден (пробел захвата фазы б1).
+    try {
+        var RB = Java.use('okhttp3.Request$Builder');
+        RB.build.implementation = function () { var r = this.build(); captureRequest(r, 'build'); return r; };
+        ok = true;
+    } catch (e) {}
+    if (ok) return;
+    if (attemptsLeft <= 0) return;
+    setTimeout(function () { installOkHttpCapture(attemptsLeft - 1); }, 1000);
 }
