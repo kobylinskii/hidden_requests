@@ -93,6 +93,9 @@ def main():
     # поднимается с чистыми множествами и заново шлёт те же события.
     seen = {"retrofit": set(), "http": set()}
     limit_hit = {"yes": False}
+    # Индикатор насыщения: время последнего НОВОГО уникального вызова — чтобы
+    # видеть в терминале, когда новые запросы перестали появляться.
+    progress = {"last_new": time.time()}
 
     def on_message(message, data):
         if message["type"] == "error":
@@ -118,9 +121,14 @@ def main():
             key = f"{payload['cls']}->{payload['m']}"
             if key not in seen["retrofit"]:
                 seen["retrofit"].add(key)
-                print(f"  + {key}", file=sys.stderr)
+                progress["last_new"] = time.time()
+                print(f"  + [retrofit] {key}  (всего {len(seen['retrofit'])})", file=sys.stderr)
         elif kind == "http":
-            seen["http"].add(payload.get("url", ""))
+            url = payload.get("url", "")
+            if url and url not in seen["http"]:
+                seen["http"].add(url)
+                progress["last_new"] = time.time()
+                print(f"  + [http] {url[:90]}  (всего {len(seen['http'])})", file=sys.stderr)
 
     def on_detached(reason, crash):
         # Колбэк приходит из потока frida — отсюда нельзя дёргать spawn/attach,
@@ -146,8 +154,19 @@ def main():
 
     print(f"\nпишу в {out}\nисследуйте приложение; Ctrl-C — закончить\n", file=sys.stderr)
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("now", True))
+    HEARTBEAT = 15      # как часто печатать сводку, сек
+    SATURATED = 60      # «без новых» дольше этого — считаем насыщением
+    last_beat = time.time()
     try:
         while not stop["now"]:
+            now = time.time()
+            if now - last_beat >= HEARTBEAT:
+                last_beat = now
+                idle = int(now - progress["last_new"])
+                hint = ("НАСЫЩЕНИЕ — можно Ctrl-C" if idle >= SATURATED
+                        else "кликайте дальше")
+                print(f"[сбор] retrofit: {len(seen['retrofit'])} | http: {len(seen['http'])} URL "
+                      f"| {idle}с без новых — {hint}", file=sys.stderr)
             if state["restart"]:
                 state["restart"] = False
                 if state["restarts"] >= args.max_restarts:
