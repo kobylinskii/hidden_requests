@@ -71,13 +71,20 @@ def main():
                     help="дописать в существующий файл (несколько сессий)")
     ap.add_argument("--max-restarts", type=int, default=10,
                     help="сколько раз поднимать упавшее приложение (0 — не поднимать)")
-    ap.add_argument("--script", type=Path, default=HERE / "hook.js")
+    ap.add_argument("--script", type=Path, default=None,
+                    help="агент; по умолч. build/hook.js (frida 17, собран с "
+                         "frida-java-bridge), иначе hook.js (frida 16/arm)")
     args = ap.parse_args()
 
     out = args.out or HERE / "out" / f"{args.package}.dynamic.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
     fh = out.open("a" if args.append else "w", encoding="utf-8")
-    script_src = args.script.read_text(encoding="utf-8")
+    # frida 17 убрал глобал Java → грузим собранный build/hook.js (bundle с
+    # frida-java-bridge); исходный hook.js падает "ReferenceError: Java is not defined".
+    script_path = args.script or (HERE / "build" / "hook.js"
+                                  if (HERE / "build" / "hook.js").exists() else HERE / "hook.js")
+    script_src = script_path.read_text(encoding="utf-8")
+    print(f"агент: {script_path.relative_to(HERE)}", file=sys.stderr)
 
     device = pick_device(args.device)
     print(f"устройство: {device.id} ({device.name})", file=sys.stderr)
