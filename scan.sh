@@ -53,20 +53,46 @@ $PY "$HERE/trace.py" --package "$PKG" --out "$DYN" ${TRACE_APPEND:+--append} >&2
 [ -s "$DYN" ] || { echo "трафик не собран ($DYN пуст) — прерываю" >&2; exit 1; }
 
 # ── 4. Скрытые запросы: статика ∖ динамика ──────────────────────────────────
+# Полный отчёт — в файл, в терминал — только сводка (не засорять выводом).
 say "4/6  Выделение скрытых запросов (diff)"
-$PY "$HERE/diff.py" --static "$STATIC" --dynamic "$DYN" --out "$HIDDEN" >&2
+$PY "$HERE/diff.py" --static "$STATIC" --dynamic "$DYN" --out "$HIDDEN" \
+    > "$OUT/${PKG}.hidden.report.txt" 2>/dev/null
+$PY - "$STATIC" "$HIDDEN" >&2 <<'PY'
+import json, re, sys
+stat = len(re.findall(r'^\*\*Method\*\*', open(sys.argv[1], encoding="utf-8").read(), re.M))
+h = n = nr = 0
+for l in open(sys.argv[2], encoding="utf-8"):
+    st = json.loads(l).get("status")
+    h += st == "hidden"; n += st == "not_in_static"; nr += st == "non_retrofit"
+print(f"  скрытых запросов: {h}  (из {stat} статических записей) | "
+      f"вызвано-но-нет-в-статике: {n} | вне retrofit: {nr}")
+PY
 
 # ── 5. Срез скрытых запросов ────────────────────────────────────────────────
+# Срез объёмный (call-sites/стражи/провенанс по каждому ключу) — в файл;
+# в терминал только сводка.
 say "5/6  Статический срез скрытых запросов (slice)"
-$PY "$HERE/slice.py" --hidden "$HIDDEN" --apk "$APK" --out "$SLICE" >&2
+$PY "$HERE/slice.py" --hidden "$HIDDEN" --apk "$APK" --out "$SLICE" >/dev/null 2>&1
+$PY - "$SLICE" >&2 <<'PY'
+import json, sys
+tot = reached = exact = 0
+for l in open(sys.argv[1], encoding="utf-8"):
+    r = json.loads(l); tot += 1
+    reached += bool(r.get("reached")); exact += bool(r.get("activation_exact"))
+print(f"  срез построен: {tot} ключей | достижимы в коде: {reached} | "
+      f"напрямую активируемы (activation_exact): {exact}")
+PY
 
 # ── 6. Принудительная активация ──────────────────────────────────────────────
-say "6/6  Принудительный вызов скрытых запросов (activate)"
 # --recurse-args: полное тело с продюсерами/заглушками; --skip-dx: без повторной
-# тяжёлой загрузки APK (срез уже несёт типы/рецепты/провенанс).
+# тяжёлой загрузки APK (срез уже несёт типы/рецепты/провенанс). Прогресс по
+# ключам печатает сам activate.py; итоговый отчёт — ниже.
+say "6/6  Принудительный вызов скрытых запросов (activate)"
+# stdout (итоговый отчёт) — в /dev/null (покажем из файла ниже), stderr
+# (прогресс по ключам) — в терминал.
 $PY "$HERE/activate.py" --slice "$SLICE" --apk "$APK" --package "$PKG" \
     --backend mech --recurse-args --skip-dx --hidden "$HIDDEN" \
-    --out "$ACT" ${ACT_ATTACH:+--attach} >&2
+    --out "$ACT" ${ACT_ATTACH:+--attach} >/dev/null
 
 say "ГОТОВО — отчёты в $OUT"
 echo "  скрытые запросы:        $HIDDEN  (+ .report.txt)" >&2

@@ -1310,8 +1310,17 @@ def main():
         plans = json.loads(args.plans_file.read_text(encoding="utf-8"))
     run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan,
                                    paths, args.skip_dx, plans, args.recurse_args, args.attach)
-    for r in recs:
-        results.append(run_key(r, stages=(0, 1, 2), run_stage=run_stage))
+    total = len(recs)
+    print(f"[активация] ключей к вызову: {total}", file=sys.stderr)
+    _mark = {"б1": "реальные app-данные", "в": "наполнено заглушками", "а": "достижим (тело пусто/болванка)"}
+    for i, r in enumerate(recs, 1):
+        res = run_key(r, stages=(0, 1, 2), run_stage=run_stage)
+        results.append(res)
+        fired = any(s.get("fired") for s in res.get("stages", []))
+        lvl = _honest_level(res)[0]
+        print(f"  [{i}/{total}] {r['key'].split('->')[-1]}: "
+              f"{'вызван' if fired else 'НЕ вызван'}"
+              f"{' / ' + _mark.get(lvl, '') if fired else ''}", file=sys.stderr)
     txt = report(results)
     print(txt)
     if args.out:
