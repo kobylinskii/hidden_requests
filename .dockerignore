@@ -1,0 +1,15 @@
+# тяжёлое/ненужное в образе; оставляем код, build/ (агенты) и BFScan/target (jar)
+apk/
+out/
+*.apk
+.venv/
+.frida17/
+docs/
+__pycache__/
+**/__pycache__/
+*.pyc
+**/.git/
+BFScan/src/
+BFScan/assets/
+*.md
+!DOCKER.md
