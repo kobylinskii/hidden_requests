@@ -363,14 +363,79 @@ def _args_from_types(rec):
     return [{"index": i, "value": _prov_val(prov.get(i), recipes, t)}
             for i, t in enumerate(rec.get("arg_types", []))]
 
-def make_plan(rec, stage):
+
+def _stub_val(ftype):
+    """Заглушка на user-input лист (param/unknown): маркер $stub с типом —
+    coerce даст НЕПУСТОЕ значение нужного типа (синтетика, НЕ app-данные; тир
+    (в) synthesized). LLM-наполнитель — отдельным флагом поверх (follow-up)."""
+    return {"$stub": _fq(ftype) if ftype.startswith("L") else ftype}
+
+def _src_val(src, recipes, ftype):
+    """Рекурсивное дерево источника (slice.arg_sources) -> значение плана.
+    const->литерал; field->$field; invoke->$invoke с РЕКУРСИВНО собранными
+    аргументами продюсера; new->$new с рекурсивными ctor-полями; param/unknown/
+    capped/instanceof -> $stub (user-input). Так «дёргаем продюсеров рекурсивно,
+    пока не упрёмся в пользовательский ввод», где ставим заглушку."""
+    if not isinstance(src, dict):
+        return _arg_val(ftype, recipes)
+    k = src.get("k")
+    if k == "const":
+        v = src.get("value")
+        return v if isinstance(v, (str, int, float, bool)) else _stub_val(ftype)
+    if k == "field" and src.get("detail") and "->" in src["detail"]:
+        owner, rest = src["detail"].split("->", 1)
+        return {"$field": _fq(owner), "name": rest.split()[0], "else": _stub_val(ftype)}
+    if k == "invoke" and src.get("detail") and "->" in src["detail"]:
+        owner, rest = src["detail"].split("->", 1)
+        m = re.match(r"([^(]+)(\([^)]*\)\S*)", rest)
+        if m:
+            meth, sig = m.group(1), m.group(2)
+            pts = _sig_param_types(sig)
+            sa = src.get("args") or []
+            args = [_src_val(sa[i], recipes, pts[i]) if i < len(sa) else _stub_val(pts[i])
+                    for i in range(len(pts))]
+            return {"$invoke": _fq(owner), "method": meth, "sig": sig, "args": args,
+                    "else": _stub_val(ftype)}
+    if k == "new" and src.get("type"):
+        t = src["type"]; r = recipes.get(t)
+        if r:
+            pts = r["ctor"]; ca = src.get("ctor_args") or []
+            args = [_src_val(ca[i], recipes, pts[i]) if i < len(ca) else _stub_val(pts[i])
+                    for i in range(len(pts))]
+            return {"$new": _fq(t), "sig": "(" + "".join(pts) + ")V", "args": args}
+    return _stub_val(ftype)  # param / unknown / capped / instanceof / нерезолвнутое
+
+def _args_from_sources(rec):
+    """Рекурсивный вариант (флаг --recurse-args): аргументы из arg_sources."""
+    recipes = rec.get("arg_recipes", {})
+    src = {a["index"]: a.get("source") for a in (rec.get("arg_sources") or [])}
+    return [{"index": i, "value": _src_val(src.get(i), recipes, t)}
+            for i, t in enumerate(rec.get("arg_types", []))]
+
+def _plan_has_stub(v):
+    """Есть ли $stub как ПЕРВИЧНОЕ значение плана (рекурсивно) — признак тира
+    (в) synthesized (user-input заглушен). Ветка `else` (фолбэк $field/$invoke)
+    игнорируется: упал ли продюсер в заглушку — факт рантайма, ловится оффлайн
+    по телу (маркер 'stub'), а не по плану (иначе каждый $field с else-stub
+    ложно метился бы synthesized)."""
+    if isinstance(v, dict):
+        if "$stub" in v:
+            return True
+        return any(_plan_has_stub(val) for key, val in v.items() if key != "else")
+    if isinstance(v, list):
+        return any(_plan_has_stub(x) for x in v)
+    return False
+
+def make_plan(rec, stage, recurse_args=False):
     cls, method, key = rec["cls"], rec["method"], rec["key"]
     p = {"key": key, "stage": stage, "overrides": [], "fields": [], "args": [],
          "raw_js": None, "rationale": ""}
     if stage == 0:
         p["trigger"] = {"kind": "call_retrofit", "cls": cls, "method": method, "sig": "*"}
-        p["args"] = _args_from_types(rec)   # type-aware: $new DTO по рецепту + дефолты примитивов
-        p["rationale"] = "mech stage0: прямой вызов Retrofit-метода, args по типам (+авто-Continuation)"
+        p["args"] = _args_from_sources(rec) if recurse_args else _args_from_types(rec)
+        p["rationale"] = ("mech stage0: прямой вызов Retrofit-метода, args "
+                          + ("рекурсивно из arg_sources +$stub на user-input" if recurse_args
+                             else "по типам/провенансу (+авто-Continuation)"))
     elif stage == 1:
         cs = rec.get("call_sites") or []
         ccls, cm = _split(cs[0]["caller"]) if cs else (cls, method)
@@ -452,7 +517,7 @@ def _agent(name):
     return b if b.exists() else HERE / name
 
 
-def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None):
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False):
     """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
     только когда dx реально нужен (валидация overrides/fields, smali для openai-
@@ -477,7 +542,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 return {"stage": stage, "valid": False, "exceptions": ["нет плана для этой ступени"],
                         "fired": False, "real_params": False, "request": None, "plan": plan}
         elif backend == "mech":
-            plan = make_plan(rec, stage)        # детерминированно из среза, без dx/LLM
+            plan = make_plan(rec, stage, recurse_args)  # детерминированно из среза, без dx/LLM
         else:
             # manual и skip_dx игнорируют dx/smali (не грузим тяжёлый androguard);
             # у openai smali синка обычно пуст (интерфейс) — главный сигнал в срезе.
@@ -604,6 +669,9 @@ def _params_real(plan, snap, rec=None):
     (а). data_cost берём из среза (rec); без rec — выводим из плана (none =
     нет args)."""
     if not snap or not snap.get("url") or not snap.get("matched"):
+        return False
+    # $stub в плане = user-input заглушен нами → тир (в) synthesized, НЕ app-built
+    if any(_plan_has_stub(a.get("value")) for a in plan.get("args", [])):
         return False
     data_cost = (rec or {}).get("data_cost")
     if data_cost is None:
@@ -1015,6 +1083,20 @@ def _check_arg_synth():
                                    "detail": "Lp/S;->t Ljava/lang/String;"}]}]}
     a2 = _args_from_types(rn)[0]["value"]
     assert a2["$new"] == "p.Dto" and a2["args"][0]["$field"] == "p.S", a2
+    # рекурсивный arg_sources: new -> invoke(продюсер) -> param-лист = $stub
+    rs = {"arg_types": ["Lp/Dto;"], "arg_recipes": {"Lp/Dto;": {"ctor": ["Lp/X;"]}},
+          "arg_sources": [{"index": 0, "source": {"k": "new", "type": "Lp/Dto;",
+              "ctor_args": [{"k": "invoke", "detail": "Lp/F;->mk(Ljava/lang/String;)Lp/X;",
+                             "args": [{"k": "param", "index": 1}]}]}}]}
+    a3 = _args_from_sources(rs)[0]["value"]
+    assert a3["$new"] == "p.Dto", a3
+    assert a3["args"][0]["$invoke"] == "p.F" and a3["args"][0]["method"] == "mk", a3
+    assert a3["args"][0]["args"][0] == {"$stub": "java.lang.String"}, a3   # user-input лист
+    assert _plan_has_stub(a3) and not _plan_has_stub({"$field": "p.S", "name": "C"})
+    # field-лист без $stub — app-built, не synthesized
+    rf2 = {"arg_types": ["Ljava/lang/String;"], "arg_recipes": {},
+           "arg_sources": [{"index": 0, "source": {"k": "field", "detail": "Lp/S;->t Ljava/lang/String;"}}]}
+    assert not _plan_has_stub(_args_from_sources(rf2)[0]["value"])
     print("  arg_synth ok")
 
 
@@ -1069,6 +1151,8 @@ def main():
     ap.add_argument("--hidden", type=Path, help="out/<pkg>.hidden.jsonl — карта ключ→путь для привязки снимка")
     ap.add_argument("--wait", type=float, default=5.0, help="окно ожидания сетевого события, сек")
     ap.add_argument("--out", type=Path)
+    ap.add_argument("--recurse-args", action="store_true",
+                    help="stage0: аргументы рекурсивно из arg_sources, $stub на user-input листьях (тир synthesized)")
     ap.add_argument("--dry-run", action="store_true", help="prompt+plan+validate без устройства")
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args()
@@ -1113,7 +1197,7 @@ def main():
     if args.plans_file and args.plans_file.exists():
         plans = json.loads(args.plans_file.read_text(encoding="utf-8"))
     run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan,
-                                   paths, args.skip_dx, plans)
+                                   paths, args.skip_dx, plans, args.recurse_args)
     for r in recs:
         results.append(run_key(r, stages=(0, 1, 2), run_stage=run_stage))
     txt = report(results)

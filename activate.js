@@ -77,6 +77,18 @@ function coerce(v) {
         if (ok && r !== null) return r;
         return ('else' in v) ? coerce(v['else']) : null;
     }
+    // $stub — заглушка user-input листа (тир synthesized): НЕПУСТОЕ значение
+    // нужного типа, чтобы поле попало в тело (но это синтетика, не app-данные).
+    if ('$stub' in v) {
+        var t = v['$stub'];
+        if (t in _JVM_PRIM) t = _JVM_PRIM[t];   // JVM-дескриптор Z/I/J… -> frida-имя
+        if (t === 'java.lang.String' || t === 'java.lang.CharSequence') return 'stub';
+        if (t in _PRIM_DEFAULT) return (t === 'boolean') ? true : 1;   // непустое значение типа
+        try {
+            if (t in _BOXED) return jclass(t).valueOf(t === 'java.lang.Boolean' ? true : 1);
+        } catch (e) {}
+        return synthDefault(t);   // enum/коллекция/объект — как дефолт (непустой, если можем)
+    }
     if ('$default' in v) return synthDefault(v['$default']);
     if ('$new' in v) {
         var args = (v.args || []).map(coerce);
@@ -95,6 +107,10 @@ function coerce(v) {
 // запроса всё равно формируется — нас интересует факт вызова, spec §14.4).
 var _PRIM_DEFAULT = { boolean: false, byte: 0, short: 0, char: 0, int: 0,
                       long: 0, float: 0.0, double: 0.0 };
+// JVM-дескриптор примитива -> frida-имя (slice кладёт в тип параметра дескриптор
+// Z/I/J…, а _PRIM_DEFAULT/_BOXED оперируют полными именами).
+var _JVM_PRIM = { Z: 'boolean', B: 'byte', S: 'short', C: 'char', I: 'int',
+                  J: 'long', F: 'float', D: 'double' };
 var _BOXED = { 'java.lang.Integer': 'int', 'java.lang.Long': 'long',
                'java.lang.Short': 'short', 'java.lang.Byte': 'byte',
                'java.lang.Character': 'char', 'java.lang.Boolean': 'boolean',

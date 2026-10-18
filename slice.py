@@ -302,6 +302,23 @@ def _check_ctor_args():
     ca = _ctor_args_of(fr, "B", 4, "v0", "Lp/Dto;")
     assert ca == [{"index": 0, "source_kind": "const", "detail": "promo"},
                   {"index": 1, "source_kind": "field", "detail": "Lp/Store;->token Ljava/lang/String;"}], ca
+    # РЕКУРСИЯ: поле DTO = результат вызова продюсера, чей аргумент — const →
+    # дерево new → invoke(args=[const]); поле 1 — param (user-input лист)
+    insns2 = [
+        Insn("new-instance", "v0", ("Lp/Dto;",)),
+        Insn("const", "v3", ("seed",)),
+        Insn("invoke-static", None, ("Lp/F;->mk(Ljava/lang/String;)Lp/X;", "v3")),
+        Insn("move-result", "v1", ("Lp/F;->mk(Ljava/lang/String;)Lp/X;",)),  # поле0 = mk(seed)
+        Insn("invoke-direct", None, ("Lp/Dto;-><init>(Lp/X;Ljava/lang/String;)V", "v0", "v1", "p5")),
+        Insn("invoke-interface", None, ("Lp/Api;->send(Lp/Dto;)V", "v9", "v0")),
+    ]
+    g2 = nx.DiGraph(); g2.add_node("B", insns=insns2)
+    fr2 = {"cfg": g2, "params": {"p5": 1}}
+    t = _resolve_source(fr2, "B", 5, "v0")
+    assert t["k"] == "new" and t["type"] == "Lp/Dto;", t
+    assert t["ctor_args"][0] == {"k": "invoke", "detail": "Lp/F;->mk(Ljava/lang/String;)Lp/X;",
+                                 "args": [{"k": "const", "value": "seed"}]}, t["ctor_args"][0]
+    assert t["ctor_args"][1] == {"k": "param", "index": 1}, t["ctor_args"][1]  # user-input лист
     print("  ctor_args ok")
 
 
@@ -946,6 +963,116 @@ def args_of_call(fr, offset, cls, method):
     return out
 
 
+def _def_insn(cfg, block, use_pos, reg):
+    """Инструкция-определение reg (обратный def-use один хоп, как
+    classify_operand, но возвращает (block, idx, Insn)). None — не нашли
+    локального def (параметр / >=2 предшественника)."""
+    b, start, seen = block, use_pos - 1, set()
+    while True:
+        insns = cfg.nodes[b]["insns"]
+        for i in range(min(start, len(insns) - 1), -1, -1):
+            if insns[i].out == reg:
+                return (b, i, insns[i])
+        if b in seen:
+            return None
+        seen.add(b)
+        preds = list(cfg.predecessors(b))
+        if len(preds) == 1:
+            b = preds[0]; start = len(cfg.nodes[b]["insns"]) - 1; continue
+        return None
+
+
+def _resolve_source(fr, block, use_pos, reg, depth=3, seen=None):
+    """РЕКУРСИВНОЕ дерево происхождения значения в reg (статический продюсер до
+    листьев). Раскрывает new-instance (→ctor-аргументы), move-result (→вызов-
+    продюсер и ЕГО аргументы), iget/const. Листья: const / field (чтение живого)
+    / invoke (вызов живого продюсера) / param (ПОЛЬЗОВАТЕЛЬСКИЙ ВВОД или вход
+    метода — здесь ставится заглушка) / unknown / capped (предел глубины). Обход
+    интрапроцедурный (тело вызывающего) — продюсер в чужом методе становится
+    листом invoke, его аргументы синтезируются/стопаются на уровне make_plan."""
+    seen = seen or set()
+    loc = _def_insn(fr["cfg"], block, use_pos, reg)
+    if loc is None:
+        return {"k": "param", "index": fr["params"][reg]} if reg in fr["params"] else {"k": "unknown"}
+    b, idx, ins = loc
+    key = (b, idx, reg)
+    if depth <= 0 or key in seen:
+        return {"k": "capped"}
+    seen = seen | {key}
+    op = ins.op
+    if op.startswith("const"):
+        return {"k": "const", "value": ins.args[0] if ins.args else None}
+    if op.startswith(("iget", "sget")):
+        return {"k": "field", "detail": ins.args[0] if ins.args else None}
+    if op.startswith("new-instance"):
+        # <init> идёт ПОСЛЕ new-instance, до точки использования — сканируем от
+        # use_pos назад (как _ctor_args_of), не от позиции самого new-instance.
+        return {"k": "new", "type": ins.args[0] if ins.args else None,
+                "ctor_args": _ctor_sources(fr, block, use_pos, reg, ins.args[0], depth - 1, seen)}
+    if op.startswith("move-result"):
+        if idx - 1 >= 0:
+            inv = fr["cfg"].nodes[b]["insns"][idx - 1]
+            if inv.op.startswith("invoke"):
+                return _invoke_source(fr, b, idx - 1, inv, depth - 1, seen)
+        return {"k": "invoke", "detail": ins.args[0] if ins.args else None, "args": []}
+    if op == "instance-of":
+        return {"k": "instanceof", "detail": ins.args[0] if ins.args else None}
+    return {"k": "unknown"}
+
+
+def _invoke_source(fr, b, pos, inv, depth, seen):
+    """Вызов-продюсер (move-result-инструкция): сигнатура + РЕКУРСИВНО источники
+    его фактических аргументов (receiver и continuation отброшены)."""
+    sig = inv.args[0]
+    regs = list(inv.args[1:])
+    if regs and not inv.op.startswith("invoke-static"):
+        regs = regs[1:]  # receiver — не аргумент
+    if regs and sig and "Lkotlin/coroutines/Continuation;)" in sig:
+        regs = regs[:-1]
+    return {"k": "invoke", "detail": sig,
+            "args": [_resolve_source(fr, b, pos, r, depth, seen) for r in regs]}
+
+
+def _ctor_sources(fr, block, use_pos, dto_reg, dto_type, depth, seen):
+    """Как _ctor_args_of, но каждый ctor-аргумент — РЕКУРСИВНОЕ дерево источника."""
+    b, start, seen2 = block, use_pos, set()
+    while True:
+        insns = fr["cfg"].nodes[b]["insns"]
+        for i in range(min(start, len(insns) - 1), -1, -1):
+            ins = insns[i]
+            if (ins.op.startswith("invoke") and ins.args and ins.args[0]
+                    and "-><init>(" in ins.args[0] and dto_type and dto_type in ins.args[0]
+                    and len(ins.args) > 1 and ins.args[1] == dto_reg):
+                return [_resolve_source(fr, b, i, r, depth, seen) for r in ins.args[2:]]
+        if b in seen2:
+            return []
+        seen2.add(b)
+        preds = list(fr["cfg"].predecessors(b))
+        if len(preds) != 1:
+            return []
+        b = preds[0]; start = len(fr["cfg"].nodes[b]["insns"]) - 1
+
+
+def arg_sources_of_call(fr, offset, cls, method, depth=3):
+    """Рекурсивные деревья происхождения фактических аргументов скрытого вызова
+    (расширение args_of_call до листьев — продюсеры продюсеров до user-input)."""
+    block = fr["block_at"](offset)
+    if block is None:
+        return []
+    insns = fr["cfg"].nodes[block]["insns"]
+    found = _find_invoke(insns, cls, method)
+    if found is None:
+        return []
+    use_pos, ins = found
+    regs = list(ins.args[1:])
+    if regs and not ins.op.startswith("invoke-static"):
+        regs = regs[1:]
+    if regs and "Lkotlin/coroutines/Continuation;)" in ins.args[0]:
+        regs = regs[:-1]
+    return [{"index": i, "source": _resolve_source(fr, block, use_pos, r, depth)}
+            for i, r in enumerate(regs)]
+
+
 def _ctor_args_of(fr, block, use_pos, dto_reg, dto_type):
     """Провенанс фактических ctor-аргументов инлайн-DTO (статический продюсер
     полей тела запроса). Ищет invoke-direct <dto_type>-><init> на регистре
@@ -1238,6 +1365,7 @@ def slice_key(dx, key):
     fr0 = frame_of(first["caller_ma"])
     if fr0 is not None:
         rec["args"] = args_of_call(fr0, first["offset"], cls, method)
+        rec["arg_sources"] = arg_sources_of_call(fr0, first["offset"], cls, method)
     if w["depth_capped"]:
         rec["notes"].append("depth_cap")
     if w["dead_ends"]:
