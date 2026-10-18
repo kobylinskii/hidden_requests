@@ -5,8 +5,42 @@
 
 var proxyByIface = {};   // имя интерфейса -> живой прокси-инстанс (для call_retrofit)
 var cap = { key: null, path: '', hits: [] };   // path — ожидаемый endpoint ключа
+// Пул реальных значений (б2b), собранный ПАССИВНО из СОБСТВЕННОГО трафика
+// приложения (залогинено → на старте рефрешит токен, грузит профиль/устройства
+// с реальными значениями). Ключ — имя JSON-поля, значение — последнее непустое.
+// App-agnostic: только имена полей, без знания классов приложения.
+var harvest = {};
 
 function jclass(name) { return Java.use(name.replace(/\//g, '.')); }
+
+// Рекурсивно собрать непустые примитивные листья JSON в harvest по имени поля.
+function recordHarvest(obj) {
+    if (obj === null || typeof obj !== 'object') return;
+    for (var k in obj) {
+        var v = obj[k];
+        if (v !== null && typeof v === 'object') { recordHarvest(v); }
+        else if ((typeof v === 'string' && v !== '') ||
+                 (typeof v === 'number' && v !== 0) || typeof v === 'boolean') {
+            harvest[k] = v;   // последнее непустое — обычно самое свежее (напр. свежий токен)
+        }
+    }
+}
+
+// Наполнить пустые поля JSON-тела реальными значениями из harvest по имени поля.
+// Возвращает {changed:bool, filled:[имена], obj} — app-agnostic подстановка.
+function fillFromHarvest(obj, filled) {
+    var changed = false;
+    if (obj === null || typeof obj !== 'object') return changed;
+    for (var k in obj) {
+        var v = obj[k];
+        if (v !== null && typeof v === 'object') {
+            if (fillFromHarvest(v, filled)) changed = true;
+        } else if (v === '' && typeof harvest[k] === 'string' && harvest[k] !== '') {
+            obj[k] = harvest[k]; filled.push(k); changed = true;
+        }
+    }
+    return changed;
+}
 
 // JSON-значение -> Java-значение. $choose берёт ЖИВОЙ инстанс (реальные параметры).
 function coerce(v) {
@@ -283,40 +317,85 @@ Java.perform(function () {
 // Снять okhttp3.Request в cap.hits (url+метод+тело, флаг matched по cap.path).
 // source — откуда снято ('build' — сборка Retrofit-запроса, 'dispatch' — okhttp.newCall),
 // чтобы в отчёте было видно, дошёл ли вызов до сети.
-function captureRequest(req, source) {
+function bodyOf(req) {
     try {
+        var rb = req.body();
+        if (rb === null) return null;
+        var Buffer = Java.use('okio.Buffer');
+        var buf = Buffer.$new();
+        rb.writeTo(buf);
+        return buf.readUtf8();
+    } catch (e) { return '<unreadable>'; }
+}
+
+function captureRequest(req, source, body, filled) {
+    try {
+        if (body === undefined) body = bodyOf(req);
+        // harvest из ЛЮБОГО запроса (в т.ч. собственного трафика приложения)
+        if (body && body.charAt(0) === '{') { try { recordHarvest(JSON.parse(body)); } catch (e) {} }
         if (!cap.key || cap.hits.length >= 10) return;
         var url = req.url().toString();
-        var body = null;
-        try {
-            var rb = req.body();
-            if (rb !== null) {
-                var Buffer = Java.use('okio.Buffer');
-                var buf = Buffer.$new();
-                rb.writeTo(buf);
-                body = buf.readUtf8();
-            }
-        } catch (e) { body = '<unreadable>'; }
         cap.hits.push({ key: cap.key, method: req.method(), url: url, body: body, source: source,
-                        matched: cap.path ? (url.indexOf(cap.path) !== -1) : false });
+                        filled: filled || [], matched: cap.path ? (url.indexOf(cap.path) !== -1) : false });
     } catch (e) {}
 }
+
+// Если req — НАШ форс-вызов (url совпал с ожидаемым endpoint ключа) и у него
+// пустые поля, которые есть в harvest — построить новый Request с наполненным
+// телом (б2b). App-agnostic: патч на уровне JSON, пересборка okhttp RequestBody.
+function patchForced(req) {
+    if (!cap.key || !cap.path) return { req: req };
+    var url;
+    try { url = req.url().toString(); } catch (e) { return { req: req }; }
+    if (url.indexOf(cap.path) === -1) return { req: req };
+    var body = bodyOf(req);
+    if (!body || body.charAt(0) !== '{') return { req: req, body: body };
+    var obj; try { obj = JSON.parse(body); } catch (e) { return { req: req, body: body }; }
+    var filled = [];
+    if (!fillFromHarvest(obj, filled)) return { req: req, body: body };
+    try {
+        var json = JSON.stringify(obj);
+        var ct = req.body().contentType();   // сохранить media type
+        var RequestBody = Java.use('okhttp3.RequestBody');
+        var bytes = Java.use('java.lang.String').$new(json).getBytes('UTF-8');
+        var nb;
+        // okhttp менял сигнатуру RequestBody.create между версиями — пробуем обе.
+        try { nb = RequestBody.create(ct, bytes); }
+        catch (e) { nb = RequestBody.create(bytes, ct); }
+        _inPatch = true;   // re-entrancy guard: .build() ниже — тот же хук
+        var nr = req.newBuilder().method(req.method(), nb).build();
+        _inPatch = false;
+        return { req: nr, body: json, filled: filled };
+    } catch (e) { _inPatch = false; return { req: req, body: body }; }
+}
+var _inPatch = false;
 
 function installOkHttpCapture(attemptsLeft) {
     var ok = false;
     // Диспетч: okhttp3.OkHttpClient.newCall — запрос реально ушёл в сеть.
     try {
         var Ok = Java.use('okhttp3.OkHttpClient');
-        Ok.newCall.implementation = function (req) { captureRequest(req, 'dispatch'); return this.newCall(req); };
+        Ok.newCall.implementation = function (req) {
+            var p = patchForced(req);
+            captureRequest(p.req, 'dispatch', p.body, p.filled);
+            return this.newCall(p.req);
+        };
         ok = true;
     } catch (e) {}
     // Сборка: okhttp3.Request$Builder.build() — Retrofit строит Request ЗДЕСЬ,
     // синхронно во время вызова, даже если suspend-корутина не дойдёт до
     // диспетча (наш trivial Continuation её не прокачивает). Ловим тело форс-
-    // запроса, который иначе не виден (пробел захвата фазы б1).
+    // запроса, который иначе не виден (пробел захвата фазы б1), и наполняем его
+    // реальными значениями из harvest (б2b).
     try {
         var RB = Java.use('okhttp3.Request$Builder');
-        RB.build.implementation = function () { var r = this.build(); captureRequest(r, 'build'); return r; };
+        RB.build.implementation = function () {
+            var r = this.build();
+            if (_inPatch) return r;   // наша же пересборка внутри patchForced
+            var p = patchForced(r);
+            captureRequest(p.req, 'build', p.body, p.filled);
+            return p.req;
+        };
         ok = true;
     } catch (e) {}
     if (ok) return;

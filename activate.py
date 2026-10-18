@@ -458,14 +458,18 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         # даже если приложение умерло до snapshot. _SETTLE даёт Retrofit построить
         # прокси до arm (иначе call_retrofit не найдёт инстанс). Пилот-правка, §15.
         res, snap, exc = {}, None, []
-        _SETTLE = 1.0
+        # _SETTLE даёт Retrofit построить прокси ДО arm, и служит ОКНОМ HARVEST
+        # (б2b): залогиненное приложение на старте рефрешит токен, грузит профиль/
+        # устройства — реальные значения попадают в harvest-пул агента ещё до
+        # форс-вызова, и patchForced наполняет ими пустые поля. §4.8.
+        _SETTLE = 4.0
         # Таймаут на ключ: на свопящем эмуляторе device.spawn/attach иногда виснет
         # намертво (во frida нет таймаута) — SIGALRM в главном потоке прерывает
         # зависший вызов, ключ помечается timeout и прогон идёт дальше (пилот-правка).
         def _on_timeout(sig, frm):
             raise TimeoutError("per-key timeout (spawn/attach завис)")
         _old_h = signal.signal(signal.SIGALRM, _on_timeout)
-        signal.alarm(int(wait_t) + 45)
+        signal.alarm(int(wait_t) + 45 + int(_SETTLE))
         try:
             pid = device.spawn([pkg])
             session = device.attach(pid)
@@ -551,6 +555,19 @@ def _check_params_real():
     print("  params_real ok")
 
 
+def _best_snap(r):
+    """Представительный снимок ключа: matched приоритетно, иначе первый с url."""
+    snap = None
+    for s in r.get("stages", []):
+        rq = s.get("request") or {}
+        if rq.get("url"):
+            if rq.get("matched"):
+                return rq
+            if snap is None:
+                snap = rq
+    return snap
+
+
 def report(results):
     """HTTP-аналог Таблицы IV ICSE 2025: распределение ключей по минимальной
     ступени уровня (б) {0,1,2,none} + уровень (а) отдельно + оговорка о
@@ -561,11 +578,15 @@ def report(results):
     from collections import Counter
     dist = Counter(r["min_stage"] for r in results if r["activated_real"])
     none = n - real
+    # (б2): форс-запрос получил реальные значения из harvest (matched-снимок с
+    # непустым filled). Отдельная метрика «наполненности» (может пересекаться с б1).
+    b2 = [r for r in results if (_best_snap(r) or {}).get("matched") and (_best_snap(r) or {}).get("filled")]
     L = [f"Всего ключей: {n}",
          f"(а) достижим (запрос ушёл, параметры любые): {reached}/{n}",
-         f"(б) активирован с реальными параметрами:     {real}/{n}",
+         f"(б1) собран приложением (matched, без наших болванок): {real}/{n}",
+         f"(б2) наполнен реальными значениями из harvest:         {len(b2)}/{n}",
          "",
-         "HTTP-аналог Таблицы IV — минимальная ступень уровня (б):",
+         "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
          f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
          f"  ступень 1 (вызывающий + стражи):   {dist.get(1,0)}",
          f"  ступень 2 (UI-фронтир):            {dist.get(2,0)}",
@@ -574,25 +595,23 @@ def report(results):
          "Оговорка: сравнение с RQ3/Таблицей IV ICSE 2025 — качественное; "
          "метрики несопоставимы напрямую (активити vs сетевые вызовы, другой стенд).",]
     # Дамп сформированных запросов по каждому ключу (артефакт для ВКР): что
-    # именно ушло и чем наполнено тело — app-built (б1) vs наша болванка (а).
+    # именно ушло и чем наполнено тело — app-built (б1) / наполнено harvest (б2) /
+    # наша болванка (а).
     dump = []
     for r in results:
-        snap = None
-        for s in r.get("stages", []):
-            if (s.get("request") or {}).get("url"):
-                snap = s["request"]
-                if s["request"].get("matched"):
-                    break
+        snap = _best_snap(r)
         if not snap:
             continue
-        lvl = "б1" if r["activated_real"] else "а"
+        filled = snap.get("filled") or []
+        lvl = "б2" if (snap.get("matched") and filled) else ("б1" if r["activated_real"] else "а")
         body = snap.get("body")
         body = "" if body is None else (" body=" + str(body)[:120])
         src = snap.get("source")
         src = f" [{src}]" if src else ""
-        dump.append(f"  [{lvl}]{src} {r['key'].split('->')[-1]}: {snap.get('method','?')} {snap.get('url','')}{body}")
+        fl = f" filled={filled}" if filled else ""
+        dump.append(f"  [{lvl}]{src} {r['key'].split('->')[-1]}: {snap.get('method','?')} {snap.get('url','')}{body}{fl}")
     if dump:
-        L += ["", "Сформированные запросы (по ключам, [а]=болванка / [б1]=app-built):"] + dump
+        L += ["", "Сформированные запросы (по ключам, [а]=болванка / [б1]=app-built / [б2]=наполнен harvest):"] + dump
     return "\n".join(L)
 
 
