@@ -340,7 +340,10 @@ def _prov_val(prov, recipes, ftype):
     k, d = prov.get("source_kind"), prov.get("detail")
     if k == "field" and d and "->" in d:
         owner, rest = d.split("->", 1)
-        return {"$field": _fq(owner), "name": rest.split()[0], "else": dflt}
+        fv = {"$field": _fq(owner), "name": rest.split()[0], "else": dflt}
+        if ftype.startswith("L"):      # #2: нужный тип значения поля
+            fv["expect"] = _fq(ftype)
+        return fv
     if k == "invoke" and d and "->" in d:
         owner, rest = d.split("->", 1)
         m = re.match(r"([^(]+)(\([^)]*\)\S*)", rest)
@@ -384,7 +387,10 @@ def _src_val(src, recipes, ftype):
         return v if isinstance(v, (str, int, float, bool)) else _stub_val(ftype)
     if k == "field" and src.get("detail") and "->" in src["detail"]:
         owner, rest = src["detail"].split("->", 1)
-        return {"$field": _fq(owner), "name": rest.split()[0], "else": _stub_val(ftype)}
+        fv = {"$field": _fq(owner), "name": rest.split()[0], "else": _stub_val(ftype)}
+        if ftype.startswith("L"):      # #2: нужный тип значения поля
+            fv["expect"] = _fq(ftype)
+        return fv
     if k == "invoke" and src.get("detail") and "->" in src["detail"]:
         owner, rest = src["detail"].split("->", 1)
         m = re.match(r"([^(]+)(\([^)]*\)\S*)", rest)
@@ -517,6 +523,32 @@ def _agent(name):
     return b if b.exists() else HERE / name
 
 
+def _pidof(device, pkg):
+    import subprocess
+    r = subprocess.run(["adb", "-s", device.id, "shell", "pidof", pkg],
+                       capture_output=True, text=True)
+    p = (r.stdout or "").split()
+    return int(p[0]) if p else None
+
+def _ensure_warm(device, pkg, tries=3):
+    """#1 re-warm (attach-режим): вернуть pid тёплого процесса; если упал —
+    перезапустить через LAUNCHER (логин на диске переживает рестарт) и подождать
+    инициализацию. None — поднять не удалось."""
+    import subprocess, time as _t
+    pid = _pidof(device, pkg)
+    if pid is not None:
+        return pid
+    for _ in range(tries):
+        subprocess.run(["adb", "-s", device.id, "shell", "monkey", "-p", pkg,
+                        "-c", "android.intent.category.LAUNCHER", "1"],
+                       capture_output=True, text=True)
+        _t.sleep(12)
+        pid = _pidof(device, pkg)
+        if pid is not None:
+            _t.sleep(4)   # дать инициализироваться (DI/сессия)
+            return pid
+    return None
+
 def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False):
     """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
@@ -594,16 +626,11 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             # Proxy.newProxyInstance-хук, но mintProxy создаёт свой прокси (хук ловит
             # его) — stage-0 call_retrofit работает.
             if attach:
-                # pid через adb pidof (frida get_process не находит по имени пакета
-                # на этом frida-server); attach по числовому pid.
-                import subprocess
-                _r = subprocess.run(["adb", "-s", device.id, "shell", "pidof", pkg],
-                                    capture_output=True, text=True)
-                _p = (_r.stdout or "").split()
-                if not _p:
-                    raise RuntimeError(f"attach: процесс {pkg} не запущен; "
-                                       f"запусти приложение, залогинься/пролистай, потом повтори")
-                pid = int(_p[0])
+                # #1 re-warm: процесс мог упасть под форсом предыдущего ключа —
+                # перезапускаем (логин переживает рестарт, он на диске) и ждём.
+                pid = _ensure_warm(device, pkg)
+                if pid is None:
+                    raise RuntimeError(f"attach: процесс {pkg} не поднялся после re-warm")
                 session = device.attach(pid)
             else:
                 pid = device.spawn([pkg])

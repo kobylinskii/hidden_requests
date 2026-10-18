@@ -13,6 +13,12 @@ var harvest = {};
 
 function jclass(name) { return Java.use(name.replace(/\//g, '.')); }
 
+// #2: значение obj — инстанс типа fq (frida-имя класса/интерфейса)? Для выбора
+// СЕМАНТИЧЕСКИ верного живого инстанса ($field/$choose), а не первого по типу поля.
+function isType(obj, fq) {
+    try { return jclass(fq).class.isInstance(obj); } catch (e) { return false; }
+}
+
 // Рекурсивно собрать непустые примитивные листья JSON в harvest по имени поля.
 function recordHarvest(obj) {
     if (obj === null || typeof obj !== 'object') return;
@@ -51,9 +57,10 @@ function coerce(v) {
         return jclass(p.join('.'))[f].value;
     }
     if ('$choose' in v) {
-        var found = null, C = v['$choose'];
-        Java.choose(C, { onMatch: function (i) { found = i; return 'stop'; },
-                         onComplete: function () {} });
+        var found = null, C = v['$choose'], want0 = v.expect;
+        Java.choose(C, { onMatch: function (i) {
+            if (want0 && !isType(i, want0)) return;   // #2: не тот инстанс по типу
+            found = i; return 'stop'; }, onComplete: function () {} });
         if (found === null) throw new Error('$choose: живых инстансов ' + C + ' нет');
         return found;
     }
@@ -61,13 +68,19 @@ function coerce(v) {
     // читаем поле / зовём метод на живом инстансе owner. Один Java.use + Java.choose,
     // без скана кучи. null, если живого инстанса нет (холодный старт — ожидаемо).
     if ('$field' in v) {
-        var fn = v.name, got = null, has = false;
+        var fn = v.name, want = v.expect, got = null;
         if (v.static) { try { return jclass(v['$field'])[fn].value; } catch (e) {} }
+        // #2: среди ВСЕХ живых инстансов owner берём тот, чьё поле непусто и
+        // (если задан expect) нужного типа — иначе Java.choose брал первый
+        // попавшийся (в removeProfile.id попадал каталожный объект вместо id).
         else Java.choose(v['$field'], { onMatch: function (i) {
-            try { got = i[fn].value; has = true; } catch (e) {} return 'stop'; },
+            var val; try { val = i[fn].value; } catch (e) { return; }
+            if (val === null || val === undefined) return;
+            if (want && !isType(val, want)) return;
+            got = val; return 'stop'; },
             onComplete: function () {} });
-        if (has && got !== null) return got;
-        return ('else' in v) ? coerce(v['else']) : null;   // продюсер пуст → болванка (а)
+        if (got !== null && got !== undefined) return got;
+        return ('else' in v) ? coerce(v['else']) : null;   // продюсер пуст/не тот тип → болванка (а)
     }
     if ('$invoke' in v) {
         var iargs = (v.args || []).map(coerce), r = null, ok = false;
