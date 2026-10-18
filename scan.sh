@@ -72,7 +72,8 @@ PY
 # Срез объёмный (call-sites/стражи/провенанс по каждому ключу) — в файл;
 # в терминал только сводка.
 say "5/6  Статический срез скрытых запросов (slice)"
-$PY "$HERE/slice.py" --hidden "$HIDDEN" --apk "$APK" --out "$SLICE" >/dev/null 2>&1
+# stdout (огромный отчёт среза) — в /dev/null; stderr (прогресс) — в терминал.
+$PY "$HERE/slice.py" --hidden "$HIDDEN" --apk "$APK" --out "$SLICE" >/dev/null
 $PY - "$SLICE" >&2 <<'PY'
 import json, sys
 tot = reached = exact = 0

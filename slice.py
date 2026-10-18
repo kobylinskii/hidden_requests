@@ -1613,6 +1613,8 @@ def main():
     if not (args.hidden and args.apk):
         ap.error("нужны --hidden и --apk")
     keys = load_hidden(args.hidden)
+    print(f"[срез] скрытых ключей: {len(keys)}; загрузка APK (androguard, ~1–2 мин)...",
+          file=sys.stderr)
     apk_obj, dx = load_apk(args.apk)
     dx._exported = manifest_entry_classes(apk_obj)  # §7.2: exported — фронтир обхода
     # Spec §4: паритет сборки со static+dynamic (как diff.py) — пакет/версия
@@ -1626,7 +1628,11 @@ def main():
     if want and str(want) != str(meta["versionCode"]):
         sys.exit(f"error: {args.hidden} снят со сборки versionCode={want}, APK — "
                  f"{meta['versionCode']}: чужие ключи молча ушли бы в no_caller")
-    records = run(dx, keys)
+    print(f"[срез] APK загружен, строю срез по {len(keys)} ключам...", file=sys.stderr)
+    records = []
+    for i, k in enumerate(keys, 1):
+        records.append(slice_key(dx, k))
+        print(f"  [{i}/{len(keys)}] {k.split('->')[-1]}", file=sys.stderr)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         with args.out.open("w", encoding="utf-8") as f:
