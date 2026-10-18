@@ -57,6 +57,26 @@ function coerce(v) {
         if (found === null) throw new Error('$choose: живых инстансов ' + C + ' нет');
         return found;
     }
+    // $field/$invoke — значение из ЖИВОГО продюсера (статическая карта из slice):
+    // читаем поле / зовём метод на живом инстансе owner. Один Java.use + Java.choose,
+    // без скана кучи. null, если живого инстанса нет (холодный старт — ожидаемо).
+    if ('$field' in v) {
+        var fn = v.name, got = null, has = false;
+        if (v.static) { try { return jclass(v['$field'])[fn].value; } catch (e) {} }
+        else Java.choose(v['$field'], { onMatch: function (i) {
+            try { got = i[fn].value; has = true; } catch (e) {} return 'stop'; },
+            onComplete: function () {} });
+        if (has && got !== null) return got;
+        return ('else' in v) ? coerce(v['else']) : null;   // продюсер пуст → болванка (а)
+    }
+    if ('$invoke' in v) {
+        var iargs = (v.args || []).map(coerce), r = null, ok = false;
+        Java.choose(v['$invoke'], { onMatch: function (i) {
+            try { r = overloadBySig(i, v.method, v.sig).apply(i, iargs); ok = true; } catch (e) {}
+            return 'stop'; }, onComplete: function () {} });
+        if (ok && r !== null) return r;
+        return ('else' in v) ? coerce(v['else']) : null;
+    }
     if ('$default' in v) return synthDefault(v['$default']);
     if ('$new' in v) {
         var args = (v.args || []).map(coerce);
@@ -335,8 +355,11 @@ function captureRequest(req, source, body, filled) {
         if (body && body.charAt(0) === '{') { try { recordHarvest(JSON.parse(body)); } catch (e) {} }
         if (!cap.key || cap.hits.length >= 10) return;
         var url = req.url().toString();
+        // matched только при СОДЕРЖАТЕЛЬНОМ hint: path '/' (или пустой) совпал бы
+        // с любым проходящим трафиком приложения → поллюция, не наш форс-вызов.
+        var m = (cap.path && cap.path !== '/') ? (url.indexOf(cap.path) !== -1) : false;
         cap.hits.push({ key: cap.key, method: req.method(), url: url, body: body, source: source,
-                        filled: filled || [], matched: cap.path ? (url.indexOf(cap.path) !== -1) : false });
+                        filled: filled || [], matched: m });
     } catch (e) {}
 }
 

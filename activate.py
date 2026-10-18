@@ -307,9 +307,60 @@ def _arg_val(t, recipes, depth=2):
         return {"$default": fq}
     return {"Z": False, "F": 0.0, "D": 0.0}.get(t, 0)
 
+def _fq(desc):
+    return desc[1:-1].replace("/", ".") if desc.startswith("L") and desc.endswith(";") else desc
+
+def _sig_param_types(sig):
+    m = re.search(r"\(([^)]*)\)", sig or "")
+    if not m:
+        return []
+    s, out, i = m.group(1), [], 0
+    while i < len(s):
+        arr = ""
+        while i < len(s) and s[i] == "[":
+            arr += "["; i += 1
+        if i >= len(s):
+            break
+        c = s[i]
+        if c == "L":
+            e = s.index(";", i); out.append(arr + s[i:e + 1]); i = e + 1
+        else:
+            out.append(arr + c); i += 1
+    return out
+
+def _prov_val(prov, recipes, ftype):
+    """Значение аргумента из провенанса slice (статический продюсер), с откатом
+    на рецепт-болванку _arg_val(ftype) — чтобы пустой продюсер (холодный старт,
+    нет живого инстанса) не рушил уровень (а). field -> $field (поле живого
+    owner); invoke -> $invoke (метод живого owner, его args — болванки по
+    сигнатуре); new+ctor_args -> $new, каждое поле из своего провенанса."""
+    dflt = _arg_val(ftype, recipes)
+    if not prov:
+        return dflt
+    k, d = prov.get("source_kind"), prov.get("detail")
+    if k == "field" and d and "->" in d:
+        owner, rest = d.split("->", 1)
+        return {"$field": _fq(owner), "name": rest.split()[0], "else": dflt}
+    if k == "invoke" and d and "->" in d:
+        owner, rest = d.split("->", 1)
+        m = re.match(r"([^(]+)(\([^)]*\)\S*)", rest)
+        if m:
+            return {"$invoke": _fq(owner), "method": m.group(1), "sig": m.group(2),
+                    "args": [_arg_val(p, recipes) for p in _sig_param_types(m.group(2))],
+                    "else": dflt}
+    if k == "new" and prov.get("ctor_args") is not None and ftype.startswith("L"):
+        r = recipes.get(ftype)
+        if r:
+            pts, ca = r["ctor"], prov["ctor_args"]
+            return {"$new": _fq(ftype), "sig": "(" + "".join(pts) + ")V",
+                    "args": [_prov_val(ca[i] if i < len(ca) else None, recipes, pts[i])
+                             for i in range(len(pts))]}
+    return dflt
+
 def _args_from_types(rec):
     recipes = rec.get("arg_recipes", {})
-    return [{"index": i, "value": _arg_val(t, recipes)}
+    prov = {a["index"]: a for a in (rec.get("args") or [])}
+    return [{"index": i, "value": _prov_val(prov.get(i), recipes, t)}
             for i, t in enumerate(rec.get("arg_types", []))]
 
 def make_plan(rec, stage):
@@ -503,7 +554,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         # fired — ключ-точный оракул из hook.js (Proxy.invoke по cls->method).
         # snap — advisory-артефакт; строгая привязка к key — доработка пилотной фазы.
         fired = seen["hit"]
-        real = fired and _params_real(plan, snap)
+        real = fired and _params_real(plan, snap, rec)
         exc = (res.get("exceptions", []) if isinstance(res, dict) else []) + exc
         return {"stage": stage, "valid": True, "exceptions": exc,
                 "fired": fired, "real_params": real, "request": snap, "plan": plan}
@@ -511,47 +562,80 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
     return run_stage
 
 
-def _params_real(plan, snap):
-    """Уровень (б1): запрос СОБРАН ПРИЛОЖЕНИЕМ — непустой снимок И ни один
-    аргумент на сработавшем пути не был НАШЕЙ синтетической болванкой.
-    Проходят: none-тир (args пуст — запрос полностью определён методом) и
-    invoke/trigger_entry с пустыми args (живой вызывающий сам собрал DTO из
-    состояния приложения). Не проходят: любой наш внедрённый аргумент —
-    примитив-дефолт, String-болванка (вкл. ""), $new/$default-конструкция.
-    Значения из живого приложения ($choose/$field/$invoke) болванками не
-    считаются (spec §15: граница (а)=запрос сформирован / (б1)=app-built).
-    Снимок обязан быть matched (url содержит ожидаемый endpoint ключа) — иначе
-    это попутный стартовый трафик приложения, а не НАШ форс-вызов (suspend мог
-    не дойти до okhttp.newCall, и snapshot() вернул чужой запрос)."""
+def _has_real_data(url, body):
+    """В запросе есть хоть один непустой РЕАЛЬНЫЙ лист данных: непустой query-
+    параметр или непустое строковое/ненулевое числовое поле JSON-тела. Пустые
+    строки, false, 0 и пустые контейнеры — не данные (наши болванки / пустой
+    продюсер)."""
+    from urllib.parse import urlparse, parse_qsl
+    for _, v in parse_qsl(urlparse(url or "").query, keep_blank_values=True):
+        if v.strip():
+            return True
+    if body and body.strip().startswith("{"):
+        try:
+            obj = json.loads(body)
+        except Exception:
+            return False
+        def walk(o):
+            if isinstance(o, dict):
+                return any(walk(x) for x in o.values())
+            if isinstance(o, list):
+                return any(walk(x) for x in o)
+            if isinstance(o, bool):
+                return False
+            if isinstance(o, str):
+                return o.strip() != ""
+            if isinstance(o, (int, float)):
+                return o != 0
+            return False
+        return walk(obj)
+    return False
+
+
+def _params_real(plan, snap, rec=None):
+    """Уровень (б1): запрос СОБРАН ПРИЛОЖЕНИЕМ С РЕАЛЬНЫМИ ДАННЫМИ. Метрика по
+    ФАКТУ снимка, не по плану: $field/$invoke в плане «не болванка», но продюсер
+    в рантайме мог вернуть пусто / откатиться на болванку — поэтому доверяем
+    только наблюдаемому запросу. matched обязателен (url содержит ожидаемый
+    endpoint — НАШ форс-вызов, не попутный трафик; поллюция с hint '/' отсечена
+    ещё в activate.js). none-тир (нет семантических аргументов) — запрос
+    полностью определён методом, app-built при matched. data-тир — нужен хотя бы
+    один непустой реальный лист в query/теле, иначе продюсер был пуст = уровень
+    (а). data_cost берём из среза (rec); без rec — выводим из плана (none =
+    нет args)."""
     if not snap or not snap.get("url") or not snap.get("matched"):
         return False
-    for a in plan.get("args", []):
-        v = a.get("value")
-        if isinstance(v, (int, float, bool, str)):          # примитив/String-болванка
-            return False
-        if isinstance(v, dict) and ("$new" in v or "$default" in v):  # наша конструкция
-            return False
-    return True
+    data_cost = (rec or {}).get("data_cost")
+    if data_cost is None:
+        data_cost = "none" if not plan.get("args") else "object"
+    if data_cost == "none":
+        return True
+    return _has_real_data(snap.get("url", ""), snap.get("body", ""))
 
 
 def _check_params_real():
-    snap = {"url": "/x", "matched": True}
-    # none-тир (args пуст, запрос полностью определён методом) — app-built (б1)
-    assert _params_real({"args": [], "trigger": {"kind": "call_retrofit"}}, snap)
-    # invoke/trigger_entry с пустыми args (живой вызывающий собрал DTO) — б1
-    assert _params_real({"args": [], "trigger": {"kind": "invoke"}}, snap)
-    # наши болванки — НЕ б1
-    assert not _params_real({"args": [{"index": 0, "value": ""}]}, snap)            # String-болванка
-    assert not _params_real({"args": [{"index": 0, "value": 0}]}, snap)             # примитив
-    assert not _params_real({"args": [{"index": 0, "value": {"$new": "p.Dto"}}]}, snap)   # конструкция
-    assert not _params_real({"args": [{"index": 0, "value": {"$default": "p.T"}}]}, snap)  # дефолт по типу
-    # значение из живого приложения — допустимо
-    assert _params_real({"args": [{"index": 0, "value": {"$choose": "p.T"}}]}, snap)
-    # снимок НЕ matched (попутный трафик приложения) — не б1
-    assert not _params_real({"args": []}, {"url": "/x", "matched": False})
-    # пустой снимок — не б1 в любом случае
-    assert not _params_real({"args": []}, None)
-    assert not _params_real({"args": []}, {"url": "", "matched": True})
+    # none-тир (нет семантических args) matched — app-built по методу (б1)
+    none_rec = {"data_cost": "none"}
+    assert _params_real({"args": []}, {"url": "/x", "matched": True}, none_rec)
+    assert _params_real({"args": []}, {"url": "/x", "matched": True})  # без rec: none из пустых args
+    # data-тир: matched, но тело/параметры ПУСТЫ (продюсер пуст / откат на болванку) — НЕ б1
+    obj_rec = {"data_cost": "object"}
+    assert not _params_real({"args": [{"index": 0, "value": {"$field": "p.S", "name": "C"}}]},
+                            {"url": "/x", "matched": True, "body": '{"a":"","b":false,"c":0}'}, obj_rec)
+    # data-тир с реальными данными в теле — б1
+    assert _params_real({"args": [{"index": 0, "value": {"$field": "p.S", "name": "C"}}]},
+                        {"url": "/x", "matched": True, "body": '{"a":"val"}'}, obj_rec)
+    # data-тир с реальным query-параметром — б1
+    assert _params_real({"args": [{"index": 0}]}, {"url": "/x?code=123", "matched": True}, obj_rec)
+    # пустой query (?code=) — не данные
+    assert not _params_real({"args": [{"index": 0}]}, {"url": "/x?code=", "matched": True}, obj_rec)
+    # снимок НЕ matched (попутный трафик / поллюция hint='/') — не б1
+    assert not _params_real({"args": []}, {"url": "/x", "matched": False}, none_rec)
+    # пустой снимок — не б1
+    assert not _params_real({"args": []}, None, none_rec)
+    assert not _params_real({"args": []}, {"url": "", "matched": True}, none_rec)
+    # _has_real_data: вложенность, пустые листья
+    assert _has_real_data("/x", '{"a":{"b":"z"}}') and not _has_real_data("/x", '{"a":{"b":""}}')
     print("  params_real ok")
 
 
@@ -914,6 +998,23 @@ def _check_arg_synth():
             "Lp/C;": {"ctor": ["Lp/D;"]}, "Lp/D;": {"ctor": ["I"]}}
     v = _arg_val("Lp/A;", deep)   # A(depth2)->B(1)->C(0): C уже $default, не раскрыт
     assert v["args"][0]["$new"] == "p.B" and v["args"][0]["args"][0] == {"$default": "p.C"}, v
+    # провенанс (статический продюсер): field->$field, invoke->$invoke, new+ctor->$new по полям
+    recp = {"Lp/Dto;": {"ctor": ["Ljava/lang/String;"]}}
+    rf = {"arg_types": ["Lp/Dto;"], "arg_recipes": recp,
+          "args": [{"index": 0, "source_kind": "field", "detail": "Lp/Store;->C Ljava/lang/Object;"}]}
+    a0 = _args_from_types(rf)[0]["value"]
+    assert a0["$field"] == "p.Store" and a0["name"] == "C" and "else" in a0, a0
+    ri = {"arg_types": ["Lp/Dto;"], "arg_recipes": recp,
+          "args": [{"index": 0, "source_kind": "invoke",
+                    "detail": "Lp/M;->map(Ljava/lang/String;)Lp/Dto;"}]}
+    a1 = _args_from_types(ri)[0]["value"]
+    assert a1["$invoke"] == "p.M" and a1["method"] == "map" and a1["args"] == [""], a1
+    rn = {"arg_types": ["Lp/Dto;"], "arg_recipes": recp,
+          "args": [{"index": 0, "source_kind": "new", "detail": "Lp/Dto;",
+                    "ctor_args": [{"index": 0, "source_kind": "field",
+                                   "detail": "Lp/S;->t Ljava/lang/String;"}]}]}
+    a2 = _args_from_types(rn)[0]["value"]
+    assert a2["$new"] == "p.Dto" and a2["args"][0]["$field"] == "p.S", a2
     print("  arg_synth ok")
 
 

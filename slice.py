@@ -35,6 +35,8 @@ def _kind_of(ins):
         return ("field", ins.args[0] if ins.args else None)
     if ins.op.startswith("move-result"):
         return ("invoke", ins.args[0] if ins.args else None)
+    if ins.op.startswith("new-instance"):  # инлайн-конструкция DTO — продюсер полей в <init>
+        return ("new", ins.args[0] if ins.args else None)
     if ins.op == "instance-of":  # `if (r is Result.Error)` — сигнал Server/Error handling
         return ("instanceof", ins.args[0] if ins.args else None)
     return ("unknown", None)
@@ -277,7 +279,30 @@ def _check_classify_operand():
     g.add_node("B",  insns=[Insn("other",None,())])
     g.add_edge("P1","B"); g.add_edge("P2","B")
     assert classify_operand(g,"B",0,"v0",{}) == ("unknown",None)
+    # new-instance -> ("new", type): инлайн-конструкция DTO
+    g,b,p = one_block([Insn("new-instance","v0",("Lp/Dto;",)), Insn("other",None,())])
+    assert classify_operand(g,b,1,"v0",p) == ("new","Lp/Dto;")
     print("  classify_operand ok")
+
+
+def _check_ctor_args():
+    """Статический продюсер полей: из инлайн-<init> DTO вытягиваются источники
+    каждого ctor-аргумента (кто порождает поле тела запроса)."""
+    import networkx as nx
+    insns = [
+        Insn("new-instance", "v0", ("Lp/Dto;",)),
+        Insn("const", "v1", ("promo",)),                       # поле 0: литерал
+        Insn("iget", "v2", ("Lp/Store;->token Ljava/lang/String;",)),  # поле 1: из поля-стора
+        Insn("invoke-direct", None,
+             ("Lp/Dto;-><init>(Ljava/lang/String;Ljava/lang/String;)V", "v0", "v1", "v2")),
+        Insn("invoke-interface", None, ("Lp/Api;->send(Lp/Dto;)V", "v9", "v0")),
+    ]
+    g = nx.DiGraph(); g.add_node("B", insns=insns)
+    fr = {"cfg": g, "params": {}}
+    ca = _ctor_args_of(fr, "B", 4, "v0", "Lp/Dto;")
+    assert ca == [{"index": 0, "source_kind": "const", "detail": "promo"},
+                  {"index": 1, "source_kind": "field", "detail": "Lp/Store;->token Ljava/lang/String;"}], ca
+    print("  ctor_args ok")
 
 
 #  Task 3: слой androguard — загрузка APK, XREF call-sites, нормализация CFG.
@@ -482,6 +507,12 @@ def _norm(instructions):
             prev_invoke_sig = None
             field = next((_kindstr(o) for o in operands if len(o) == 3), None)
             out.append(Insn(op, regs[0] if regs else None, (field,)))
+        elif op.startswith("new-instance"):
+            # new-instance vDst, Type — тип в constant-pool-операнде (len==3),
+            # приёмник — единственный регистр. Нужен для резолва ctor-продюсера.
+            prev_invoke_sig = None
+            typ = next((_kindstr(o) for o in operands if len(o) == 3), None)
+            out.append(Insn(op, regs[0] if regs else None, (typ,)))
         elif "put" in op:
             prev_invoke_sig = None
             field = next((_kindstr(o) for o in operands if len(o) == 3), None)
@@ -903,8 +934,45 @@ def args_of_call(fr, offset, cls, method):
     out = []
     for idx, reg in enumerate(regs):
         kind, detail = classify_operand(fr["cfg"], block, use_pos, reg, fr["params"])
-        out.append({"index": idx, "source_kind": kind, "detail": detail})
+        entry = {"index": idx, "source_kind": kind, "detail": detail}
+        # Статический продюсер полей: если аргумент — инлайн-сконструированный
+        # DTO (new-instance), дорезолвить провенанс каждого его ctor-аргумента —
+        # это источники полей тела запроса (кто порождает code/id/token/…).
+        if kind == "new" and detail:
+            ca = _ctor_args_of(fr, block, use_pos, reg, detail)
+            if ca:
+                entry["ctor_args"] = ca
+        out.append(entry)
     return out
+
+
+def _ctor_args_of(fr, block, use_pos, dto_reg, dto_type):
+    """Провенанс фактических ctor-аргументов инлайн-DTO (статический продюсер
+    полей тела запроса). Ищет invoke-direct <dto_type>-><init> на регистре
+    dto_reg (в блоке и по цепочке единственных предшественников назад от
+    use_pos) и классифицирует каждый ctor-аргумент тем же classify_operand.
+    [] если <init> не найден (DTO собран не тривиально / построен фабрикой)."""
+    b, start, seen = block, use_pos, set()
+    while True:
+        insns = fr["cfg"].nodes[b]["insns"]
+        for i in range(min(start, len(insns) - 1), -1, -1):
+            ins = insns[i]
+            if (ins.op.startswith("invoke") and ins.args and ins.args[0]
+                    and "-><init>(" in ins.args[0] and dto_type in ins.args[0]
+                    and len(ins.args) > 1 and ins.args[1] == dto_reg):
+                out = []
+                for idx, reg in enumerate(ins.args[2:]):  # args[1]=receiver(dto_reg)
+                    k, d = classify_operand(fr["cfg"], b, i, reg, fr["params"])
+                    out.append({"index": idx, "source_kind": k, "detail": d})
+                return out
+        if b in seen:
+            return []
+        seen.add(b)
+        preds = list(fr["cfg"].predecessors(b))
+        if len(preds) != 1:
+            return []
+        b = preds[0]
+        start = len(fr["cfg"].nodes[b]["insns"]) - 1
 
 
 _COROUTINE_FRAME_METHODS = {"invokeSuspend", "invoke", "create"}
@@ -1449,6 +1517,7 @@ def _selfcheck(apk=None):
     _check_min_path()
     _check_control_deps()
     _check_classify_operand()
+    _check_ctor_args()
     _check_walk_predicates()
     _check_guard_operand()
     _check_framework_guard()
