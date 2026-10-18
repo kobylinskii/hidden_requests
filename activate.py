@@ -1263,6 +1263,9 @@ def main():
     ap.add_argument("--out", type=Path)
     ap.add_argument("--attach", action="store_true",
                     help="warm-state (План А): attach к УЖЕ запущенному+пролистанному процессу, не spawn и не kill — $field/liveReceiver читают реальные сессионные данные")
+    ap.add_argument("--all-reached", action="store_true",
+                    help="активировать ВСЕ достижимые скрытые ключи (сканер), а не только "
+                         "activation_exact — ступень 0 зовёт метод напрямую, точный путь не нужен")
     ap.add_argument("--recurse-args", action="store_true",
                     help="stage0: аргументы рекурсивно из arg_sources, $stub на user-input листьях (тир synthesized)")
     ap.add_argument("--dry-run", action="store_true", help="prompt+plan+validate без устройства")
@@ -1280,7 +1283,12 @@ def main():
         keyset |= {k.strip() for k in args.keys_file.read_text(encoding="utf-8").splitlines() if k.strip()}
     if keyset:
         recs = [r for r in recs if r["key"] in keyset]
+    elif args.all_reached:
+        # сканер: ступень 0 (call_retrofit) минтит прокси и зовёт метод напрямую —
+        # работает для ЛЮБОГО достижимого ключа, не только activation_exact.
+        recs = [r for r in recs if r.get("reached")]
     else:
+        # research-подвыборка: только ключи с точным минимальным путём (Таблица IV).
         recs = [r for r in recs if r.get("activation_exact")]
     results = []
     dxbox = {}

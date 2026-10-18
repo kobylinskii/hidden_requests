@@ -108,8 +108,10 @@ PY
 say "6/6  Принудительный вызов скрытых запросов (activate)"
 # stdout (итоговый отчёт) — в /dev/null (покажем из файла ниже), stderr
 # (прогресс по ключам) — в терминал.
+# --all-reached: пробуем ВСЕ достижимые скрытые ключи (ступень 0 зовёт метод
+# напрямую), а не только строгую подвыборку activation_exact.
 $PY "$HERE/activate.py" --slice "$SLICE" --apk "$APK" --package "$PKG" \
-    --backend mech --recurse-args --skip-dx --hidden "$HIDDEN" \
+    --backend mech --recurse-args --all-reached --skip-dx --hidden "$HIDDEN" \
     --out "$ACT" ${ACT_ATTACH:+--attach} >/dev/null
 
 say "ГОТОВО — отчёты в $OUT"
