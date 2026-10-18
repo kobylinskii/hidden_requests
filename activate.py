@@ -767,50 +767,83 @@ def _best_snap(r):
     return snap
 
 
+def _honest_level(r):
+    """Честный уровень ключа ПО ФАКТУ снимка (не по плану): ('б1'|'в'|'а', snap,
+    stage). matched-снимок (url содержит endpoint; hint '/' отсечён в activate.js)
+    + реальные непустые данные в query/теле → 'б1' app-built. Те же данные, но с
+    нашей заглушкой ($stub в плане / маркер "stub" в теле) → 'в' synthesized.
+    Иначе (не matched / тело пусто) → 'а'."""
+    msnap = mstage = mplan = None
+    first = None
+    for s in r.get("stages", []):
+        rq = s.get("request") or {}
+        if not rq.get("url"):
+            continue
+        if first is None:
+            first = rq
+        if rq.get("matched"):
+            msnap, mstage, mplan = rq, s.get("stage"), (s.get("plan") or {})
+            break
+    if msnap is None:
+        return ("а", first, None)
+    url, body = msnap.get("url", "") or "", msnap.get("body", "") or ""
+    if not _has_real_data(url, body):
+        return ("а", msnap, mstage)
+    synth = _has_stub_marker(url, body) or any(_plan_has_stub(a.get("value"))
+                                               for a in (mplan or {}).get("args", []))
+    return ("в" if synth else "б1", msnap, mstage)
+
+
+def _has_stub_marker(url, body):
+    """В снимке есть наша $stub-заглушка: маркер "stub" в JSON-теле ИЛИ значение
+    query-параметра == 'stub' (GET кладёт заглушку в URL, не в тело)."""
+    if body and '"stub"' in body:
+        return True
+    from urllib.parse import urlparse, parse_qsl
+    return any(v == "stub" for _, v in parse_qsl(urlparse(url or "").query, keep_blank_values=True))
+
+
 def report(results):
-    """HTTP-аналог Таблицы IV ICSE 2025: распределение ключей по минимальной
-    ступени уровня (б) {0,1,2,none} + уровень (а) отдельно + оговорка о
-    несопоставимости с RQ3 (активити vs сетевые вызовы, другой стенд)."""
-    n = len(results)
-    reached = sum(r["reached"] for r in results)
-    real = sum(r["activated_real"] for r in results)
+    """HTTP-аналог Таблицы IV ICSE 2025. ЧЕСТНАЯ метрика по факту снимка:
+    (а) достижим / (б1) app-built с реальными данными / (в) synthesized (тело
+    наполнено нашими заглушками). Распределение (б1) по минимальной ступени +
+    оговорка о несопоставимости с RQ3."""
     from collections import Counter
-    dist = Counter(r["min_stage"] for r in results if r["activated_real"])
-    none = n - real
-    # (б2): форс-запрос получил реальные значения из harvest (matched-снимок с
-    # непустым filled). Отдельная метрика «наполненности» (может пересекаться с б1).
-    b2 = [r for r in results if (_best_snap(r) or {}).get("matched") and (_best_snap(r) or {}).get("filled")]
+    n = len(results)
+    reached = sum(r.get("reached") for r in results)
+    lvl = {r["key"]: _honest_level(r) for r in results}
+    b1 = sum(1 for v in lvl.values() if v[0] == "б1")
+    synth = sum(1 for v in lvl.values() if v[0] == "в")
+    dist = Counter(v[2] for v in lvl.values() if v[0] == "б1")
     L = [f"Всего ключей: {n}",
-         f"(а) достижим (запрос ушёл, параметры любые): {reached}/{n}",
-         f"(б1) собран приложением (matched, без наших болванок): {real}/{n}",
-         f"(б2) наполнен реальными значениями из harvest:         {len(b2)}/{n}",
+         f"(а) достижим (запрос ушёл, параметры любые):              {reached}/{n}",
+         f"(б1) app-built с РЕАЛЬНЫМИ данными (matched, без заглушек): {b1}/{n}",
+         f"(в)  synthesized (тело наполнено нашими $stub-заглушками):  {synth}/{n}",
          "",
          "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
          f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
          f"  ступень 1 (вызывающий + стражи):   {dist.get(1,0)}",
          f"  ступень 2 (UI-фронтир):            {dist.get(2,0)}",
-         f"  не активирован (нужна продвинутая техника/сервер): {none}",
+         f"  без реальных данных (болванка/synthesized/недостижим): {n - b1}",
          "",
          "Оговорка: сравнение с RQ3/Таблицей IV ICSE 2025 — качественное; "
          "метрики несопоставимы напрямую (активити vs сетевые вызовы, другой стенд).",]
-    # Дамп сформированных запросов по каждому ключу (артефакт для ВКР): что
-    # именно ушло и чем наполнено тело — app-built (б1) / наполнено harvest (б2) /
-    # наша болванка (а).
+    # Дамп сформированных запросов (артефакт для ВКР): [а]=пусто/болванка,
+    # [б1]=реальные app-данные, [в]=наполнено нашими заглушками.
     dump = []
     for r in results:
-        snap = _best_snap(r)
+        level, snap, _ = lvl[r["key"]]
         if not snap:
             continue
-        filled = snap.get("filled") or []
-        lvl = "б2" if (snap.get("matched") and filled) else ("б1" if r["activated_real"] else "а")
         body = snap.get("body")
         body = "" if body is None else (" body=" + str(body)[:120])
         src = snap.get("source")
         src = f" [{src}]" if src else ""
-        fl = f" filled={filled}" if filled else ""
-        dump.append(f"  [{lvl}]{src} {r['key'].split('->')[-1]}: {snap.get('method','?')} {snap.get('url','')}{body}{fl}")
+        dump.append(f"  [{level}]{src} {r['key'].split('->')[-1]}: "
+                    f"{snap.get('method','?')} {snap.get('url','')}{body}")
     if dump:
-        L += ["", "Сформированные запросы (по ключам, [а]=болванка / [б1]=app-built / [б2]=наполнен harvest):"] + dump
+        L += ["", "Сформированные запросы ([а]=пусто/болванка / [б1]=реальные app-данные / "
+              "[в]=наполнено заглушками):"] + dump
     return "\n".join(L)
 
 
@@ -1148,15 +1181,26 @@ def _check_arg_synth():
 
 
 def _check_report():
+    def st(stage, url, body, matched, plan_args):
+        return {"stage": stage, "request": {"url": url, "body": body, "matched": matched,
+                                            "method": "POST"},
+                "plan": {"args": plan_args}}
     results = [
-        {"key": "a", "reached": True, "activated_real": True, "min_stage": 0},
-        {"key": "b", "reached": True, "activated_real": True, "min_stage": 1},
-        {"key": "c", "reached": True, "activated_real": False, "min_stage": None},
+        # б1: matched, реальные данные, без заглушек
+        {"key": "a", "reached": True, "stages": [st(0, "/x?id=42", None, True, [])]},
+        # в: matched, реальные данные, но тело из заглушки
+        {"key": "b", "reached": True, "stages": [st(0, "/y", '{"id":"stub"}', True,
+                                                     [{"value": {"$stub": "java.lang.String"}}])]},
+        # а: matched, но тело пустое
+        {"key": "c", "reached": True, "stages": [st(0, "/z", '{"ids":[]}', True, [])]},
+        # а: не matched
+        {"key": "d", "reached": False, "stages": [st(0, "/w", None, False, [])]},
     ]
     txt = report(results)
-    assert "ступень 0" in txt and "ступень 1" in txt
-    assert "достижим" in txt                    # уровень (а) отдельно
-    assert "RQ3" in txt and "несопостав" in txt.lower()  # оговорка
+    levels = {k: _honest_level(r)[0] for k, r in zip("abcd", results)}
+    assert levels == {"a": "б1", "b": "в", "c": "а", "d": "а"}, levels
+    assert "(б1) app-built с РЕАЛЬНЫМИ данными" in txt and "synthesized" in txt
+    assert "ступень 0" in txt and "RQ3" in txt and "несопостав" in txt.lower()
     print("  report ok")
 
 
