@@ -531,13 +531,32 @@ def _pidof(device, pkg):
     return int(p[0]) if p else None
 
 def _ensure_warm(device, pkg, tries=3):
-    """#1 re-warm (attach-режим): вернуть pid тёплого процесса; если упал —
-    перезапустить через LAUNCHER (логин на диске переживает рестарт) и подождать
-    инициализацию. None — поднять не удалось."""
-    import subprocess, time as _t
+    """attach-режим: вернуть pid ЖИВОГО тёплого процесса. Если процесс жив —
+    сразу (приложение НЕ перезапускается между ключами, тёплое состояние —
+    логин/пинкод/подгруженные данные — держится весь прогон). Если упал:
+      - интерактивно (TTY): пауза — пользователь сам поднимает приложение,
+        логинится, вводит пинкод и жмёт Enter (тёплое состояние восстанавливается
+        ПОЛНОСТЬЮ, включая то, что авто-перезапуск не вернул бы — PIN, навигацию);
+      - не-TTY (nohup): авто-перезапуск через LAUNCHER (логин с диска) как фолбэк.
+    None — поднять не удалось / прервано."""
     pid = _pidof(device, pkg)
     if pid is not None:
         return pid
+    import time as _t, signal
+    if sys.stdin and sys.stdin.isatty():
+        signal.alarm(0)   # не дать per-key таймауту сработать во время ожидания человека
+        while True:
+            try:
+                input(f"\n[!] процесс {pkg} упал. Подними приложение, залогинься и введи "
+                      f"пинкод, затем нажми Enter для продолжения (Ctrl-C — прервать): ")
+            except (EOFError, KeyboardInterrupt):
+                return None
+            pid = _pidof(device, pkg)
+            if pid is not None:
+                _t.sleep(2)
+                return pid
+            print("  всё ещё не вижу процесс — попробуй ещё раз.")
+    import subprocess
     for _ in range(tries):
         subprocess.run(["adb", "-s", device.id, "shell", "monkey", "-p", pkg,
                         "-c", "android.intent.category.LAUNCHER", "1"],
