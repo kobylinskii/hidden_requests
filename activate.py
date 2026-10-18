@@ -1312,7 +1312,11 @@ def main():
                 continue
             h = json.loads(l)
             if h.get("status") == "hidden" and h.get("path"):
-                paths.setdefault(h["key"], h["path"])
+                # Обрезаем путь до первого path-параметра {slug}/{id}: литерал
+                # "{slug}" в реальном URL не встретится, и matched был бы ложно
+                # False, хотя запрос пойман (напр. /uma-api/.../cardgroup_info/{slug}
+                # → префикс /uma-api/.../cardgroup_info/ матчит реальный .../stub).
+                paths.setdefault(h["key"], h["path"].split("{", 1)[0])
     plans = {}
     if args.plans_file and args.plans_file.exists():
         plans = json.loads(args.plans_file.read_text(encoding="utf-8"))
