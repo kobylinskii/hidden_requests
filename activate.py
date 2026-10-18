@@ -615,13 +615,25 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         # устройства — реальные значения попадают в harvest-пул агента ещё до
         # форс-вызова, и patchForced наполняет ими пустые поля. §4.8.
         _SETTLE = 4.0
-        # Таймаут на ключ: на свопящем эмуляторе device.spawn/attach иногда виснет
-        # намертво (во frida нет таймаута) — SIGALRM в главном потоке прерывает
-        # зависший вызов, ключ помечается timeout и прогон идёт дальше (пилот-правка).
-        def _on_timeout(sig, frm):
-            raise TimeoutError("per-key timeout (spawn/attach завис)")
-        _old_h = signal.signal(signal.SIGALRM, _on_timeout)
-        signal.alarm(int(wait_t) + 45 + int(_SETTLE))
+        # Таймаут на ключ через WATCHDOG-ПОТОК (не SIGALRM!): форс-вызов может
+        # заблокировать frida-RPC агента (метод ушёл в бесконечный цикл/блокирующий
+        # вызов в приложении) — тогда синхронный exports_sync.arm() НЕ возвращается,
+        # а SIGALRM бессилен (Python не прерывает нативный frida-вызов). Watchdog в
+        # отдельном потоке по таймауту ПРИБИВАЕТ процесс приложения → заблокированный
+        # RPC падает с ошибкой → главный поток разблокируется, ключ помечен timeout,
+        # прогон идёт дальше (следующий ключ поднимет приложение свежим).
+        import threading
+        _timedout = {"v": False}
+        def _watchdog():
+            _timedout["v"] = True
+            try:
+                if pid is not None: device.kill(pid)
+            except Exception: pass
+            try:
+                if session is not None: session.detach()
+            except Exception: pass
+        _wd = threading.Timer(int(wait_t) + 45 + int(_SETTLE), _watchdog)
+        _wd.start()
         try:
             # attach-режим (warm-state, План А): подключиться к УЖЕ запущенному и
             # пролистанному процессу (живая сессия/токены/id в куче → $field/
@@ -660,14 +672,15 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         except Exception as e:
             exc.append("session: " + str(e))
         finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, _old_h)
+            _wd.cancel()
             if session is not None:
                 try: session.detach()
                 except Exception: pass
-            if pid is not None and not attach:   # attach: НЕ убивать — процесс должен остаться тёплым
+            if pid is not None and not attach:   # attach: НЕ убивать — процесс переиспользуется между ключами
                 try: device.kill(pid)
                 except Exception: pass
+        if _timedout["v"]:
+            exc.append("per-key timeout — форс завис, процесс прибит, ключ пропущен")
         # fired — ключ-точный оракул из hook.js (Proxy.invoke по cls->method).
         # snap — advisory-артефакт; строгая привязка к key — доработка пилотной фазы.
         fired = seen["hit"]
