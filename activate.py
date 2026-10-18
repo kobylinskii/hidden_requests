@@ -517,7 +517,7 @@ def _agent(name):
     return b if b.exists() else HERE / name
 
 
-def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False):
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False):
     """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
     только когда dx реально нужен (валидация overrides/fields, smali для openai-
@@ -587,8 +587,27 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         _old_h = signal.signal(signal.SIGALRM, _on_timeout)
         signal.alarm(int(wait_t) + 45 + int(_SETTLE))
         try:
-            pid = device.spawn([pkg])
-            session = device.attach(pid)
+            # attach-режим (warm-state, План А): подключиться к УЖЕ запущенному и
+            # пролистанному процессу (живая сессия/токены/id в куче → $field/
+            # liveReceiver читают РЕАЛЬНЫЕ значения) и НЕ убивать его между ключами.
+            # spawn-режим: холодный старт (пустая сессия). attach пропускает ранний
+            # Proxy.newProxyInstance-хук, но mintProxy создаёт свой прокси (хук ловит
+            # его) — stage-0 call_retrofit работает.
+            if attach:
+                # pid через adb pidof (frida get_process не находит по имени пакета
+                # на этом frida-server); attach по числовому pid.
+                import subprocess
+                _r = subprocess.run(["adb", "-s", device.id, "shell", "pidof", pkg],
+                                    capture_output=True, text=True)
+                _p = (_r.stdout or "").split()
+                if not _p:
+                    raise RuntimeError(f"attach: процесс {pkg} не запущен; "
+                                       f"запусти приложение, залогинься/пролистай, потом повтори")
+                pid = int(_p[0])
+                session = device.attach(pid)
+            else:
+                pid = device.spawn([pkg])
+                session = device.attach(pid)
             # ТОЛЬКО activate.js: он сам кэширует прокси, несёт key-exact оракул
             # (эмитит {t:'retrofit',cls,m}) и снимает запрос. hook.js НЕ грузим —
             # двойной хук Proxy.newProxyInstance (hook.js+activate.js) рекурсивно
@@ -596,8 +615,9 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             agent = session.create_script(_agent("activate.js").read_text(encoding="utf-8"))
             agent.on("message", _on_hook_msg)
             agent.load()
-            device.resume(pid)
-            time.sleep(_SETTLE)
+            if not attach:
+                device.resume(pid)
+            time.sleep(1.0 if attach else _SETTLE)
             try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
             except Exception as e: exc.append("capture_on: " + str(e))
             try: res = agent.exports_sync.arm(json.dumps(plan))
@@ -613,7 +633,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             if session is not None:
                 try: session.detach()
                 except Exception: pass
-            if pid is not None:
+            if pid is not None and not attach:   # attach: НЕ убивать — процесс должен остаться тёплым
                 try: device.kill(pid)
                 except Exception: pass
         # fired — ключ-точный оракул из hook.js (Proxy.invoke по cls->method).
@@ -1151,6 +1171,8 @@ def main():
     ap.add_argument("--hidden", type=Path, help="out/<pkg>.hidden.jsonl — карта ключ→путь для привязки снимка")
     ap.add_argument("--wait", type=float, default=5.0, help="окно ожидания сетевого события, сек")
     ap.add_argument("--out", type=Path)
+    ap.add_argument("--attach", action="store_true",
+                    help="warm-state (План А): attach к УЖЕ запущенному+пролистанному процессу, не spawn и не kill — $field/liveReceiver читают реальные сессионные данные")
     ap.add_argument("--recurse-args", action="store_true",
                     help="stage0: аргументы рекурсивно из arg_sources, $stub на user-input листьях (тир synthesized)")
     ap.add_argument("--dry-run", action="store_true", help="prompt+plan+validate без устройства")
@@ -1197,7 +1219,7 @@ def main():
     if args.plans_file and args.plans_file.exists():
         plans = json.loads(args.plans_file.read_text(encoding="utf-8"))
     run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan,
-                                   paths, args.skip_dx, plans, args.recurse_args)
+                                   paths, args.skip_dx, plans, args.recurse_args, args.attach)
     for r in recs:
         results.append(run_key(r, stages=(0, 1, 2), run_stage=run_stage))
     txt = report(results)
