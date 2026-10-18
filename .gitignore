@@ -6,3 +6,4 @@ out/
 BFScan/
 .frida17/
 *.whl
+traffic-backups/
