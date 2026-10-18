@@ -530,41 +530,26 @@ def _pidof(device, pkg):
     p = (r.stdout or "").split()
     return int(p[0]) if p else None
 
-def _ensure_warm(device, pkg, tries=3):
-    """attach-режим: вернуть pid ЖИВОГО тёплого процесса. Если процесс жив —
-    сразу (приложение НЕ перезапускается между ключами, тёплое состояние —
-    логин/пинкод/подгруженные данные — держится весь прогон). Если упал:
-      - интерактивно (TTY): пауза — пользователь сам поднимает приложение,
-        логинится, вводит пинкод и жмёт Enter (тёплое состояние восстанавливается
-        ПОЛНОСТЬЮ, включая то, что авто-перезапуск не вернул бы — PIN, навигацию);
-      - не-TTY (nohup): авто-перезапуск через LAUNCHER (логин с диска) как фолбэк.
-    None — поднять не удалось / прервано."""
+def _ensure_running(device, pkg, tries=3):
+    """attach-режим без перезапуска: вернуть pid ЖИВОГО процесса — между ключами
+    приложение НЕ перезапускается, куча переиспользуется. Если процесс УПАЛ —
+    поднять СВЕЖИМ (force-stop + LAUNCHER): чистая куча, как при холодном spawn
+    (холодная логика сохраняется, просто без рестарта на каждый ключ). None —
+    поднять не удалось."""
+    import subprocess, time as _t
     pid = _pidof(device, pkg)
     if pid is not None:
         return pid
-    import time as _t, signal
-    if sys.stdin and sys.stdin.isatty():
-        signal.alarm(0)   # не дать per-key таймауту сработать во время ожидания человека
-        while True:
-            try:
-                input(f"\n[!] процесс {pkg} упал. Подними приложение, залогинься и введи "
-                      f"пинкод, затем нажми Enter для продолжения (Ctrl-C — прервать): ")
-            except (EOFError, KeyboardInterrupt):
-                return None
-            pid = _pidof(device, pkg)
-            if pid is not None:
-                _t.sleep(2)
-                return pid
-            print("  всё ещё не вижу процесс — попробуй ещё раз.")
-    import subprocess
     for _ in range(tries):
+        subprocess.run(["adb", "-s", device.id, "shell", "am", "force-stop", pkg],
+                       capture_output=True, text=True)
         subprocess.run(["adb", "-s", device.id, "shell", "monkey", "-p", pkg,
                         "-c", "android.intent.category.LAUNCHER", "1"],
                        capture_output=True, text=True)
         _t.sleep(12)
         pid = _pidof(device, pkg)
         if pid is not None:
-            _t.sleep(4)   # дать инициализироваться (DI/сессия)
+            _t.sleep(4)   # дать инициализироваться (DI/startup)
             return pid
     return None
 
@@ -645,9 +630,9 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             # Proxy.newProxyInstance-хук, но mintProxy создаёт свой прокси (хук ловит
             # его) — stage-0 call_retrofit работает.
             if attach:
-                # #1 re-warm: процесс мог упасть под форсом предыдущего ключа —
-                # перезапускаем (логин переживает рестарт, он на диске) и ждём.
-                pid = _ensure_warm(device, pkg)
+                # attach без рестарта: живой процесс переиспользуем; если упал — свежий
+                # подъём (force-stop+launch), куча как при холодном spawn.
+                pid = _ensure_running(device, pkg)
                 if pid is None:
                     raise RuntimeError(f"attach: процесс {pkg} не поднялся после re-warm")
                 session = device.attach(pid)
@@ -663,7 +648,8 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             agent.load()
             if not attach:
                 device.resume(pid)
-            time.sleep(1.0 if attach else _SETTLE)
+            time.sleep(_SETTLE)   # и attach ждёт полный settle: иначе okhttp/build-хук
+                                  # не успевает встать и запрос не ловится (проверено)
             try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
             except Exception as e: exc.append("capture_on: " + str(e))
             try: res = agent.exports_sync.arm(json.dumps(plan))

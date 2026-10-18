@@ -124,13 +124,19 @@ fi
 # тяжёлой загрузки APK (срез уже несёт типы/рецепты/провенанс). Прогресс по
 # ключам печатает сам activate.py; итоговый отчёт — ниже.
 say "6/6  Принудительный вызов скрытых запросов (activate)"
+# Поднимаем приложение СВЕЖИМ (чистая куча = холодная логика) и активируем в
+# attach-режиме: процесс НЕ перезапускается между ключами (быстро, без мигания),
+# а результат идентичен холодному spawn (проверено). Отдельного «тёплого» режима
+# нет — куча свежая, потому что мы только что запустили и не листали.
+adb -s "$DEV" shell am force-stop "$PKG" >/dev/null 2>&1 || true
+adb -s "$DEV" shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+sleep 12
 # stdout (итоговый отчёт) — в /dev/null (покажем из файла ниже), stderr
 # (прогресс по ключам) — в терминал.
-# --all-reached: пробуем ВСЕ достижимые скрытые ключи (ступень 0 зовёт метод
-# напрямую), а не только строгую подвыборку activation_exact.
+# --all-reached: ВСЕ достижимые скрытые ключи; --attach: без рестарта между ключами.
 $PY "$HERE/activate.py" --slice "$SLICE" --apk "$APK" --package "$PKG" \
-    --backend mech --recurse-args --all-reached --skip-dx --hidden "$HIDDEN" \
-    --out "$ACT" ${ACT_ATTACH:+--attach} >/dev/null
+    --backend mech --recurse-args --all-reached --skip-dx --attach --hidden "$HIDDEN" \
+    --out "$ACT" >/dev/null
 
 say "ГОТОВО — отчёты в $OUT"
 echo "  скрытые запросы:        $HIDDEN  (+ .report.txt)" >&2
