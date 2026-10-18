@@ -4,6 +4,10 @@
 #   выход: отчёт в $OUT_DIR — какие запросы скрытые, сколько удалось дёрнуть и
 #          с какими данными.
 # Устройство/эмулятор — на хосте, контейнер цепляется по $ADB_DEVICE.
+#
+# HIDDEN_IN=<hidden.jsonl> — старт СРАЗУ с готового списка скрытых запросов:
+#   пропускает BFScan+сбор трафика+diff, идёт на срез и активацию. hidden-файл
+#   должен быть снят с той же сборки APK (slice.py сверяет versionCode).
 set -euo pipefail
 
 APK=${1:?Использование: scan.sh <path-to.apk>   (устройство — через ADB_DEVICE=host:port)}
@@ -35,6 +39,18 @@ HIDDEN="$OUT/${PKG}.hidden.jsonl"
 SLICE="$OUT/${PKG}.slice.jsonl"
 ACT="$OUT/${PKG}.activation.jsonl"
 
+if [ -n "${HIDDEN_IN:-}" ]; then
+    # ── Старт с готового списка скрытых запросов: пропускаем BFScan+трафик+diff.
+    # Полезно для повторной активации без нового сбора трафика.
+    [ -f "$HIDDEN_IN" ] || { echo "нет файла HIDDEN_IN: $HIDDEN_IN" >&2; exit 1; }
+    say "2–4/6  Старт с готового hidden-файла (BFScan/трафик/diff пропущены)"
+    [ "$(readlink -f "$HIDDEN_IN")" = "$(readlink -f "$HIDDEN")" ] || cp -p "$HIDDEN_IN" "$HIDDEN"
+    $PY - "$HIDDEN" >&2 <<'PY'
+import json, sys
+h = sum(json.loads(l).get("status") == "hidden" for l in open(sys.argv[1], encoding="utf-8"))
+print(f"  взят готовый список: {h} скрытых запросов ({sys.argv[1]})")
+PY
+else
 # ── 2. Статика: все HTTP-эндпоинты из кода ──────────────────────────────────
 say "2/6  Статическое извлечение эндпоинтов (BFScan)"
 "$HERE/bfscan.sh" "$APK" "$STATIC" >&2
@@ -67,6 +83,7 @@ for l in open(sys.argv[2], encoding="utf-8"):
 print(f"  скрытых запросов: {h}  (из {stat} статических записей) | "
       f"вызвано-но-нет-в-статике: {n} | вне retrofit: {nr}")
 PY
+fi
 
 # ── 5. Срез скрытых запросов ────────────────────────────────────────────────
 # Срез объёмный (call-sites/стражи/провенанс по каждому ключу) — в файл;
