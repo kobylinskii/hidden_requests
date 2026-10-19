@@ -330,6 +330,20 @@ function doTrigger(t, args) {
 
 rpc.exports = {
     captureOn: function (key, pathHint) { cap.key = key; cap.path = pathHint || ''; cap.hits = []; },
+    // Case-1 префлайт: доступен ли сам Retrofit? stage-0 mintProxies минтит прокси
+    // ТОЛЬКО через retrofit2.Retrofit.create() (имя класса захардкожено). Если R8
+    // обфусцировал саму библиотеку Retrofit (dodo: retrofit2.Retrofit → retrofit2.z/
+    // f0/..., класс под этим именем не грузится), create() недостижим → ни один
+    // ключ не выстрелит. loadable=false — верный (и постоянный) признак; instances
+    // advisory (0 может быть и временно — холодный старт, фича не открыта).
+    retrofitProbe: function () {
+        var r = { loadable: false, instances: 0 };
+        Java.perform(function () {
+            try { jclass('retrofit2.Retrofit'); r.loadable = true; } catch (e) {}
+            try { Java.choose('retrofit2.Retrofit', { onMatch: function () { r.instances++; }, onComplete: function () {} }); } catch (e) {}
+        });
+        return JSON.stringify(r);
+    },
     snapshot: function () {
         if (!cap.hits.length) return null;
         for (var i = 0; i < cap.hits.length; i++) if (cap.hits[i].matched) return cap.hits[i];

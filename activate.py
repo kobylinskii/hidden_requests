@@ -557,7 +557,7 @@ def _pidof(device, pkg):
     p = (r.stdout or "").split()
     return int(p[0]) if p else None
 
-def _ensure_running(device, pkg, tries=3):
+def _ensure_running(device, pkg, tries=3, non_interactive=False):
     """attach-режим без перезапуска: вернуть pid ЖИВОГО процесса — между ключами
     приложение НЕ перезапускается, куча переиспользуется. Если процесс УПАЛ
     (форс сломал приложение) — поднять СВЕЖИМ (force-stop + LAUNCHER) и, если
@@ -580,7 +580,7 @@ def _ensure_running(device, pkg, tries=3):
         pid = _pidof(device, pkg)
         if pid is None:
             continue
-        if interactive:
+        if interactive and not non_interactive:
             # приложение сломалось форсом и перезапущено — сессия/пинкод потеряны;
             # просим пользователя восстановить вручную, чтобы дальше ловить данные.
             try:
@@ -595,8 +595,8 @@ def _ensure_running(device, pkg, tries=3):
         return pid
     return None
 
-def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False):
-    """Возвращает run_stage(rec, stage), замкнутый на пакет и одну Frida-сессию.
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False, non_interactive=False):
+    """Возвращает namespace(run_key, preflight), замкнутый на пакет и Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
     только когда dx реально нужен (валидация overrides/fields, smali для openai-
     промпта). Для manual call_retrofit dx не нужен → APK не грузится (иначе прогон
@@ -612,13 +612,19 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             _me["f"] = dex_member_exists(dx_provider())
         return _me["f"](cls, kind, name, sig)
     device = trace.pick_device(None)
+    import threading, types
+    # _SETTLE даёт Retrofit построить прокси ДО arm (иначе call_retrofit не найдёт
+    # инстанс) и служит ОКНОМ HARVEST (б2b): залогиненное приложение на старте
+    # рефрешит токен, грузит профиль/устройства — реальные значения попадают в
+    # harvest-пул агента ещё до форс-вызова, и patchForced наполняет ими поля. §4.8.
+    _SETTLE = 4.0
 
-    def run_stage(rec, stage):
+    def _plan_for(rec, stage):
+        """План ступени (offline, без устройства) + список проблем валидации."""
         if backend == "plans":
             plan = (plans or {}).get(rec["key"])  # готовый план на ключ (напр. от субагента)
             if not isinstance(plan, dict) or plan.get("stage") != stage:
-                return {"stage": stage, "valid": False, "exceptions": ["нет плана для этой ступени"],
-                        "fired": False, "real_params": False, "request": None, "plan": plan}
+                return plan, ["нет плана для этой ступени"]
         elif backend == "mech":
             plan = make_plan(rec, stage, recurse_args)  # детерминированно из среза, без dx/LLM
         else:
@@ -632,39 +638,82 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 prompt = build_prompt(rec, stage, {rec["cls"] + "->" + rec["method"]:
                                                    method_smali(dx_provider(), rec["cls"], rec["method"])})
             plan = generate_plan(prompt, backend=backend, manual_path=manual_path)
-        probs = validate_plan(plan, me)
-        if probs:
-            return {"stage": stage, "valid": False, "exceptions": probs,
-                    "fired": False, "real_params": False, "request": None, "plan": plan}
-        session = pid = None
+        return plan, validate_plan(plan, me)
+
+    def _open(pid, on_message):
+        """attach+load+settle ОДИН раз. attach: к уже поднятому pid; spawn: холодный
+        старт. Возвращает (session, pid, agent). ТОЛЬКО activate.js: он кэширует
+        прокси, несёт key-exact оракул ({t:'retrofit',cls,m}) и снимает запрос;
+        hook.js НЕ грузим — двойной хук Proxy.newProxyInstance роняет приложение."""
+        if attach:
+            session = device.attach(pid)
+        else:
+            pid = device.spawn([pkg])
+            session = device.attach(pid)
+        agent = session.create_script(_agent("activate.js").read_text(encoding="utf-8"))
+        if on_message:
+            agent.on("message", on_message)
+        agent.load()
+        if not attach:
+            device.resume(pid)
+        time.sleep(_SETTLE)   # иначе okhttp/build-хук не успевает встать (проверено)
+        return session, pid, agent
+
+    def preflight():
+        """Case 1: доступен ли сам Retrofit? stage-0 mintProxies минтит прокси ТОЛЬКО
+        через retrofit2.Retrofit.create() (имя класса захардкожено в agent). Если R8
+        обфусцировал библиотеку Retrofit (dodo: retrofit2.Retrofit → retrofit2.z/f0/
+        ..., класс под этим именем не грузится), create() недостижим и ни один ключ
+        не выстрелит. Проверяем ОДНИМ дешёвым probe'ом (без перебора ключей — он
+        же и вис в прошлой версии) и падаем ДО молотьбы всего среза. Ключи dodo —
+        сами по себе Retrofit-интерфейсы (аннотация @retrofit2.http.o), так что
+        проверять isInterface бессмысленно; решает именно доступность Retrofit."""
+        pid = _ensure_running(device, pkg, non_interactive=non_interactive) if attach else None
+        if attach and pid is None:
+            raise RuntimeError(f"preflight: процесс {pkg} не поднялся")
+        session = None
+        try:
+            session, pid, agent = _open(pid, None)
+            info = json.loads(agent.exports_sync.retrofit_probe())
+        finally:
+            if session is not None:
+                try: session.detach()
+                except Exception: pass
+            if pid is not None and not attach:
+                try: device.kill(pid)
+                except Exception: pass
+        if not info.get("loadable"):
+            raise RuntimeError(
+                f"приложение {pkg}: класс retrofit2.Retrofit не загружается под этим "
+                f"именем — библиотека Retrofit обфусцирована R8 (имена вида retrofit2.z/"
+                f"f0/g0). stage-0 call_retrofit минтит прокси только через "
+                f"retrofit2.Retrofit.create() → форс не выстрелит ни на одном ключе. "
+                f"Деобфускация имени Retrofit-класса (heap-поиск по сигнатуре create()) "
+                f"— отдельная задача.")
+        return info
+
+    def run_key_dev(rec, stages):
+        """Одна Frida-сессия НА КЛЮЧ: attach+load агента ОДИН раз, затем arm всех
+        ступеней на этом же скрипте (было: re-attach+re-load 741-КБ бандла на
+        КАЖДУЮ ступень — 3× накладных). Семантику петли (перебор ступеней, break
+        на real, терпимость к исключениям) переиспользуем из run_key."""
+        stages = tuple(stages)
+        session = pid = agent = None
         seen = {"hit": False}
 
         def _on_hook_msg(message, data):
+            # fired — асинхронный ключ-точный оракул (его ставит хендлер, когда
+            # форс-вызов дёргает Proxy.invoke нужного cls->method); валиден даже
+            # если приложение умерло до snapshot.
             if message.get("type") == "send":
                 if _retrofit_hit(message.get("payload") or {}, rec["key"]):
                     seen["hit"] = True
 
-        # Приложения с анти-frida само-завершаются через секунды после старта:
-        # сессия/скрипт умирают в окне ожидания, и тогда ЛЮБОЙ exports-вызов
-        # кидает "script has been destroyed". Поэтому каждый device-вызов — под
-        # своим guard'ом, а fired берём из асинхронного seen["hit"] (его ставит
-        # хендлер hook.js, когда наш форс-вызов дёргает Proxy.invoke) — он валиден,
-        # даже если приложение умерло до snapshot. _SETTLE даёт Retrofit построить
-        # прокси до arm (иначе call_retrofit не найдёт инстанс). Пилот-правка, §15.
-        res, snap, exc = {}, None, []
-        # _SETTLE даёт Retrofit построить прокси ДО arm, и служит ОКНОМ HARVEST
-        # (б2b): залогиненное приложение на старте рефрешит токен, грузит профиль/
-        # устройства — реальные значения попадают в harvest-пул агента ещё до
-        # форс-вызова, и patchForced наполняет ими пустые поля. §4.8.
-        _SETTLE = 4.0
-        # Таймаут на ключ через WATCHDOG-ПОТОК (не SIGALRM!): форс-вызов может
-        # заблокировать frida-RPC агента (метод ушёл в бесконечный цикл/блокирующий
-        # вызов в приложении) — тогда синхронный exports_sync.arm() НЕ возвращается,
-        # а SIGALRM бессилен (Python не прерывает нативный frida-вызов). Watchdog в
-        # отдельном потоке по таймауту ПРИБИВАЕТ процесс приложения → заблокированный
-        # RPC падает с ошибкой → главный поток разблокируется, ключ помечен timeout,
-        # прогон идёт дальше (следующий ключ поднимет приложение свежим).
-        import threading
+        # WATCHDOG-ПОТОК (не SIGALRM!): форс-вызов может заблокировать frida-RPC
+        # (метод ушёл в бесконечный/блокирующий вызов) — синхронный arm() не
+        # вернётся, а SIGALRM бессилен (Python не прерывает нативный frida-вызов).
+        # По таймауту поток ПРИБИВАЕТ процесс → заблокированный RPC падает →
+        # главный поток разблокируется. Бюджет масштабируем на число ступеней.
         _timedout = {"v": False}
         def _watchdog():
             _timedout["v"] = True
@@ -674,37 +723,31 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             try:
                 if session is not None: session.detach()
             except Exception: pass
-        _wd = threading.Timer(int(wait_t) + 45 + int(_SETTLE), _watchdog)
-        # Watchdog накрывает ВСЕ frida-операции ключа (attach/load/arm/snapshot —
-        # любая может зависнуть намертво), НО стартует ПОСЛЕ _ensure_running: тот
-        # может ждать ввода человека (логин+пинкод после краша) неопределённо долго,
-        # и его watchdog накрывать не должен (иначе прибьёт приложение в логине).
+        _wd = threading.Timer(len(stages) * int(wait_t) + 45 + int(_SETTLE), _watchdog)
+
+        # _ensure_running ДО watchdog: он может ждать ввода человека (логин+пинкод
+        # после краха, если не non_interactive) неопределённо долго.
+        if attach:
+            pid = _ensure_running(device, pkg, non_interactive=non_interactive)
+        setup_exc = []
         try:
-            # attach-режим: подключиться к УЖЕ запущенному процессу и НЕ убивать его
-            # между ключами (куча переиспользуется). spawn-режим: холодный старт.
-            # attach пропускает ранний Proxy.newProxyInstance-хук, но mintProxies
-            # создаёт свои прокси (хук ловит) — stage-0 call_retrofit работает.
-            if attach:
-                pid = _ensure_running(device, pkg)   # может спросить логин+пинкод — ДО watchdog
-                if pid is None:
-                    raise RuntimeError(f"attach: процесс {pkg} не поднялся")
-                _wd.start()                          # теперь включаем таймаут на frida-операции
-                session = device.attach(pid)
-            else:
-                _wd.start()
-                pid = device.spawn([pkg])
-                session = device.attach(pid)
-            # ТОЛЬКО activate.js: он сам кэширует прокси, несёт key-exact оракул
-            # (эмитит {t:'retrofit',cls,m}) и снимает запрос. hook.js НЕ грузим —
-            # двойной хук Proxy.newProxyInstance (hook.js+activate.js) рекурсивно
-            # роняет приложение на этом ART. Оракул слушаем на самом activate.js.
-            agent = session.create_script(_agent("activate.js").read_text(encoding="utf-8"))
-            agent.on("message", _on_hook_msg)
-            agent.load()
-            if not attach:
-                device.resume(pid)
-            time.sleep(_SETTLE)   # и attach ждёт полный settle: иначе okhttp/build-хук
-                                  # не успевает встать и запрос не ловится (проверено)
+            if attach and pid is None:
+                raise RuntimeError(f"attach: процесс {pkg} не поднялся")
+            _wd.start()                 # теперь таймаут накрывает attach/load/arm/snapshot
+            session, pid, agent = _open(pid, _on_hook_msg)
+        except Exception as e:
+            setup_exc.append("session: " + str(e))
+
+        def arm_stage(rec, stage):
+            plan, probs = _plan_for(rec, stage)
+            if probs:
+                return {"stage": stage, "valid": False, "exceptions": probs,
+                        "fired": False, "real_params": False, "request": None, "plan": plan}
+            if agent is None:
+                return {"stage": stage, "valid": False, "exceptions": setup_exc or ["нет сессии"],
+                        "fired": False, "real_params": False, "request": None, "plan": plan}
+            seen["hit"] = False   # оракул на ступень (captureOn чистит cap.hits — нет утечки снимка)
+            res, snap, exc = {}, None, []
             try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
             except Exception as e: exc.append("capture_on: " + str(e))
             try: res = agent.exports_sync.arm(json.dumps(plan))
@@ -712,27 +755,31 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             time.sleep(wait_t)
             try: snap = agent.exports_sync.snapshot()
             except Exception as e: exc.append("snapshot: " + str(e))
-        except Exception as e:
-            exc.append("session: " + str(e))
+            fired = seen["hit"]
+            real = fired and _params_real(plan, snap, rec)
+            exc = (res.get("exceptions", []) if isinstance(res, dict) else []) + exc
+            if _timedout["v"]:
+                exc.append("per-key timeout — форс завис, процесс прибит")
+            return {"stage": stage, "valid": True, "exceptions": exc,
+                    "fired": fired, "real_params": real, "request": snap, "plan": plan}
+
+        try:
+            out = run_key(rec, stages, arm_stage)
         finally:
             _wd.cancel()
             if session is not None:
                 try: session.detach()
                 except Exception: pass
-            if pid is not None and not attach:   # attach: НЕ убивать — процесс переиспользуется между ключами
+            # attach: НЕ убивать — процесс переиспользуется между ключами (если его
+            # не прибил watchdog); spawn: всегда убить холодный процесс.
+            if pid is not None and not attach:
                 try: device.kill(pid)
                 except Exception: pass
         if _timedout["v"]:
-            exc.append("per-key timeout — форс завис, процесс прибит, ключ пропущен")
-        # fired — ключ-точный оракул из hook.js (Proxy.invoke по cls->method).
-        # snap — advisory-артефакт; строгая привязка к key — доработка пилотной фазы.
-        fired = seen["hit"]
-        real = fired and _params_real(plan, snap, rec)
-        exc = (res.get("exceptions", []) if isinstance(res, dict) else []) + exc
-        return {"stage": stage, "valid": True, "exceptions": exc,
-                "fired": fired, "real_params": real, "request": snap, "plan": plan}
+            out["timeout"] = True
+        return out
 
-    return run_stage
+    return types.SimpleNamespace(run_key=run_key_dev, preflight=preflight)
 
 
 def _has_real_data(url, body):
@@ -1310,6 +1357,9 @@ def main():
                          "activation_exact — ступень 0 зовёт метод напрямую, точный путь не нужен")
     ap.add_argument("--recurse-args", action="store_true",
                     help="stage0: аргументы рекурсивно из arg_sources, $stub на user-input листьях (тир synthesized)")
+    ap.add_argument("--non-interactive", action="store_true",
+                    help="после краха форсом не ждать логина человека (Docker/CI): "
+                         "поднять приложение свежим и продолжить")
     ap.add_argument("--dry-run", action="store_true", help="prompt+plan+validate без устройства")
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args()
@@ -1362,13 +1412,19 @@ def main():
     plans = {}
     if args.plans_file and args.plans_file.exists():
         plans = json.loads(args.plans_file.read_text(encoding="utf-8"))
-    run_stage = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan,
-                                   paths, args.skip_dx, plans, args.recurse_args, args.attach)
+    runner = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan,
+                                paths, args.skip_dx, plans, args.recurse_args, args.attach,
+                                args.non_interactive)
     total = len(recs)
     print(f"[активация] ключей к вызову: {total}", file=sys.stderr)
+    # Case-1: mech/stage-0 (call_retrofit) минтит прокси через retrofit2.Retrofit.
+    # Если библиотека Retrofit обфусцирована (dodo), форс не выстрелит ни на одном
+    # ключе — падаем ДО молотьбы всего среза с понятной ошибкой.
+    if args.backend == "mech":
+        runner.preflight()
     _mark = {"б1": "реальные app-данные", "в": "наполнено заглушками", "а": "достижим (тело пусто/болванка)"}
     for i, r in enumerate(recs, 1):
-        res = run_key(r, stages=(0, 1, 2), run_stage=run_stage)
+        res = runner.run_key(r, (0, 1, 2))
         results.append(res)
         fired = any(s.get("fired") for s in res.get("stages", []))
         lvl = _honest_level(res)[0]

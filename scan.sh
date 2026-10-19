@@ -134,9 +134,11 @@ sleep 12
 # stdout (итоговый отчёт) — в /dev/null (покажем из файла ниже), stderr
 # (прогресс по ключам) — в терминал.
 # --all-reached: ВСЕ достижимые скрытые ключи; --attach: без рестарта между ключами.
+# --non-interactive: в Docker (-it) после краха форсом НЕ ждём логина человека —
+# поднимаем приложение свежим и продолжаем (иначе прогон зависает на input()).
 $PY "$HERE/activate.py" --slice "$SLICE" --apk "$APK" --package "$PKG" \
-    --backend mech --recurse-args --all-reached --skip-dx --attach --hidden "$HIDDEN" \
-    --out "$ACT" >/dev/null
+    --backend mech --recurse-args --all-reached --skip-dx --attach --non-interactive \
+    --hidden "$HIDDEN" --out "$ACT" >/dev/null
 
 say "ГОТОВО — отчёты в $OUT"
 echo "  скрытые запросы:        $HIDDEN  (+ .report.txt)" >&2
