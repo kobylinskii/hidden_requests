@@ -402,6 +402,18 @@ def _src_val(src, recipes, ftype):
         return best if best is not None else _stub_val(ftype)
     if k == "const":
         v = src.get("value")
+        if ftype.startswith(("L", "[")):
+            # Объектный слот. Валиден только строковый литерал для String/
+            # CharSequence/Object. Числовой const (const/4 v,#0) в объектный регистр —
+            # это загрузка NULL, а не число; отдать его числом ломает подбор
+            # перегрузки (регрессия catalogFeedsCardgroup: 0 прилетал на
+            # java.lang.String → "argument types do not match"). По типу несовместимо
+            # → типизированная болванка (как было до phi: unknown→$stub, вызов шёл).
+            if isinstance(v, str) and not isinstance(v, bool) and ftype in (
+                    "Ljava/lang/String;", "Ljava/lang/CharSequence;", "Ljava/lang/Object;"):
+                return v
+            return _stub_val(ftype)
+        # Примитивный слот: скаляр как есть.
         return v if isinstance(v, (str, int, float, bool)) else _stub_val(ftype)
     if k == "field" and src.get("detail") and "->" in src["detail"]:
         owner, rest = src["detail"].split("->", 1)
@@ -1308,6 +1320,19 @@ def _check_arg_synth():
            "arg_sources": [{"index": 0, "source": {"k": "phi", "alts": [
                {"k": "param", "index": 1}, {"k": "unknown", "reason": "op:x"}]}}]}
     assert _args_from_sources(rp2)[0]["value"] == {"$stub": "java.lang.String"}, _args_from_sources(rp2)[0]["value"]
+    # const 0 в ОБЪЕКТНЫЙ слот = null-загрузка (const/4 v,#0) -> типизированная
+    # болванка, НЕ целое 0 (регрессия catalogFeedsCardgroup: 0 на java.lang.String
+    # ломал подбор перегрузки → запрос не уходил)
+    rc0 = {"arg_types": ["Ljava/lang/String;"], "arg_recipes": {},
+           "arg_sources": [{"index": 0, "source": {"k": "const", "value": 0}}]}
+    assert _args_from_sources(rc0)[0]["value"] == {"$stub": "java.lang.String"}, _args_from_sources(rc0)[0]["value"]
+    # const-string в String-слот -> литерал; const int в примитивный слот -> как есть
+    rc1 = {"arg_types": ["Ljava/lang/String;"], "arg_recipes": {},
+           "arg_sources": [{"index": 0, "source": {"k": "const", "value": "x"}}]}
+    assert _args_from_sources(rc1)[0]["value"] == "x"
+    rc2 = {"arg_types": ["I"], "arg_recipes": {},
+           "arg_sources": [{"index": 0, "source": {"k": "const", "value": 5}}]}
+    assert _args_from_sources(rc2)[0]["value"] == 5
     print("  arg_synth ok")
 
 
