@@ -660,25 +660,23 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 if session is not None: session.detach()
             except Exception: pass
         _wd = threading.Timer(int(wait_t) + 45 + int(_SETTLE), _watchdog)
-        # ВАЖНО: watchdog стартуем ПОЗЖЕ — только вокруг frida-RPC (capture_on/
-        # arm/snapshot), где бывает зависание. _ensure_running может ждать ввода
-        # человека (логин+пинкод после краша) неопределённо долго — его watchdog
-        # накрывать НЕ должен, иначе прибьёт приложение посреди логина.
+        # Watchdog накрывает ВСЕ frida-операции ключа (attach/load/arm/snapshot —
+        # любая может зависнуть намертво), НО стартует ПОСЛЕ _ensure_running: тот
+        # может ждать ввода человека (логин+пинкод после краша) неопределённо долго,
+        # и его watchdog накрывать не должен (иначе прибьёт приложение в логине).
         try:
-            # attach-режим (warm-state, План А): подключиться к УЖЕ запущенному и
-            # пролистанному процессу (живая сессия/токены/id в куче → $field/
-            # liveReceiver читают РЕАЛЬНЫЕ значения) и НЕ убивать его между ключами.
-            # spawn-режим: холодный старт (пустая сессия). attach пропускает ранний
-            # Proxy.newProxyInstance-хук, но mintProxy создаёт свой прокси (хук ловит
-            # его) — stage-0 call_retrofit работает.
+            # attach-режим: подключиться к УЖЕ запущенному процессу и НЕ убивать его
+            # между ключами (куча переиспользуется). spawn-режим: холодный старт.
+            # attach пропускает ранний Proxy.newProxyInstance-хук, но mintProxies
+            # создаёт свои прокси (хук ловит) — stage-0 call_retrofit работает.
             if attach:
-                # attach без рестарта: живой процесс переиспользуем; если упал — свежий
-                # подъём (force-stop+launch), куча как при холодном spawn.
-                pid = _ensure_running(device, pkg)
+                pid = _ensure_running(device, pkg)   # может спросить логин+пинкод — ДО watchdog
                 if pid is None:
-                    raise RuntimeError(f"attach: процесс {pkg} не поднялся после re-warm")
+                    raise RuntimeError(f"attach: процесс {pkg} не поднялся")
+                _wd.start()                          # теперь включаем таймаут на frida-операции
                 session = device.attach(pid)
             else:
+                _wd.start()
                 pid = device.spawn([pkg])
                 session = device.attach(pid)
             # ТОЛЬКО activate.js: он сам кэширует прокси, несёт key-exact оракул
@@ -692,7 +690,6 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 device.resume(pid)
             time.sleep(_SETTLE)   # и attach ждёт полный settle: иначе okhttp/build-хук
                                   # не успевает встать и запрос не ловится (проверено)
-            _wd.start()   # с этого момента включаем таймаут — дальше frida-RPC, может зависнуть
             try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
             except Exception as e: exc.append("capture_on: " + str(e))
             try: res = agent.exports_sync.arm(json.dumps(plan))
