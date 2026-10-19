@@ -403,11 +403,23 @@ def _src_val(src, recipes, ftype):
             return {"$invoke": _fq(owner), "method": meth, "sig": sig, "args": args,
                     "else": _stub_val(ftype)}
     if k == "new" and src.get("type"):
-        t = src["type"]; r = recipes.get(t)
+        t = src["type"]; r = recipes.get(t); ca = src.get("ctor_args") or []
+        if ca:
+            # Конструктор, который РЕАЛЬНО использовал вызывающий (из arg_sources),
+            # а не наименьший из рецепта: рецепт часто берёт no-arg ctor и теряет
+            # ВСЕ продюсеры (так registerSmart давал пустое тело вместо device-данных
+            # от getDeviceModel/getOsVersion/...). Типы берём из рецепта, если длина
+            # совпала; иначе строим без sig — frida подберёт перегрузку по аргументам.
+            pts = r["ctor"] if (r and len(r["ctor"]) == len(ca)) else None
+            args = [_src_val(ca[i], recipes, pts[i] if pts else "Ljava/lang/Object;")
+                    for i in range(len(ca))]
+            node = {"$new": _fq(t), "args": args}
+            if pts:
+                node["sig"] = "(" + "".join(pts) + ")V"
+            return node
         if r:
-            pts = r["ctor"]; ca = src.get("ctor_args") or []
-            args = [_src_val(ca[i], recipes, pts[i]) if i < len(ca) else _stub_val(pts[i])
-                    for i in range(len(pts))]
+            pts = r["ctor"]
+            args = [_src_val(None, recipes, p) for p in pts]   # нет ctor_args → по типам
             return {"$new": _fq(t), "sig": "(" + "".join(pts) + ")V", "args": args}
     return _stub_val(ftype)  # param / unknown / capped / instanceof / нерезолвнутое
 
@@ -532,14 +544,17 @@ def _pidof(device, pkg):
 
 def _ensure_running(device, pkg, tries=3):
     """attach-режим без перезапуска: вернуть pid ЖИВОГО процесса — между ключами
-    приложение НЕ перезапускается, куча переиспользуется. Если процесс УПАЛ —
-    поднять СВЕЖИМ (force-stop + LAUNCHER): чистая куча, как при холодном spawn
-    (холодная логика сохраняется, просто без рестарта на каждый ключ). None —
-    поднять не удалось."""
+    приложение НЕ перезапускается, куча переиспользуется. Если процесс УПАЛ
+    (форс сломал приложение) — поднять СВЕЖИМ (force-stop + LAUNCHER) и, если
+    это интерактивный терминал, ПОПРОСИТЬ пользователя заново залогиниться и
+    ввести пинкод (чтобы сессия восстановилась, а не терялась после краша), затем
+    по Enter продолжить. Не-TTY (фон) — просто ждём инициализацию. None — не
+    удалось поднять."""
     import subprocess, time as _t
     pid = _pidof(device, pkg)
     if pid is not None:
         return pid
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
     for _ in range(tries):
         subprocess.run(["adb", "-s", device.id, "shell", "am", "force-stop", pkg],
                        capture_output=True, text=True)
@@ -548,9 +563,21 @@ def _ensure_running(device, pkg, tries=3):
                        capture_output=True, text=True)
         _t.sleep(12)
         pid = _pidof(device, pkg)
-        if pid is not None:
+        if pid is None:
+            continue
+        if interactive:
+            # приложение сломалось форсом и перезапущено — сессия/пинкод потеряны;
+            # просим пользователя восстановить вручную, чтобы дальше ловить данные.
+            try:
+                input(f"\n[!] приложение {pkg} сломалось форс-вызовом и перезапущено.\n"
+                      f"    Залогинься заново и введи пинкод в эмуляторе, затем нажми Enter "
+                      f"для продолжения скана (Ctrl-C — прервать): ")
+            except (EOFError, KeyboardInterrupt):
+                pass
+            pid = _pidof(device, pkg) or pid   # мог пересоздаться за время логина
+        else:
             _t.sleep(4)   # дать инициализироваться (DI/startup)
-            return pid
+        return pid
     return None
 
 def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False):
@@ -633,7 +660,10 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 if session is not None: session.detach()
             except Exception: pass
         _wd = threading.Timer(int(wait_t) + 45 + int(_SETTLE), _watchdog)
-        _wd.start()
+        # ВАЖНО: watchdog стартуем ПОЗЖЕ — только вокруг frida-RPC (capture_on/
+        # arm/snapshot), где бывает зависание. _ensure_running может ждать ввода
+        # человека (логин+пинкод после краша) неопределённо долго — его watchdog
+        # накрывать НЕ должен, иначе прибьёт приложение посреди логина.
         try:
             # attach-режим (warm-state, План А): подключиться к УЖЕ запущенному и
             # пролистанному процессу (живая сессия/токены/id в куче → $field/
@@ -662,6 +692,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 device.resume(pid)
             time.sleep(_SETTLE)   # и attach ждёт полный settle: иначе okhttp/build-хук
                                   # не успевает встать и запрос не ловится (проверено)
+            _wd.start()   # с этого момента включаем таймаут — дальше frida-RPC, может зависнуть
             try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
             except Exception as e: exc.append("capture_on: " + str(e))
             try: res = agent.exports_sync.arm(json.dumps(plan))
