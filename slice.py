@@ -998,22 +998,23 @@ def args_of_call(fr, offset, cls, method):
 
 
 def _def_insn(cfg, block, use_pos, reg):
-    """Инструкция-определение reg (обратный def-use один хоп, как
-    classify_operand, но возвращает (block, idx, Insn)). None — не нашли
-    локального def (параметр / >=2 предшественника)."""
+    """Инструкция-определение reg (обратный def-use один хоп, как classify_operand).
+    Возвращает ((block, idx, Insn), 'found') либо (None, причина): 'merge' (>=2
+    предшественника — phi/слияние, def неоднозначен), 'no_pred' (0 предшественников
+    — вход метода: параметр или не определён), 'cycle' (петля блоков)."""
     b, start, seen = block, use_pos - 1, set()
     while True:
         insns = cfg.nodes[b]["insns"]
         for i in range(min(start, len(insns) - 1), -1, -1):
             if insns[i].out == reg:
-                return (b, i, insns[i])
+                return (b, i, insns[i]), "found"
         if b in seen:
-            return None
+            return None, "cycle"
         seen.add(b)
         preds = list(cfg.predecessors(b))
         if len(preds) == 1:
             b = preds[0]; start = len(cfg.nodes[b]["insns"]) - 1; continue
-        return None
+        return None, ("merge" if len(preds) >= 2 else "no_pred")
 
 
 def _resolve_source(fr, block, use_pos, reg, depth=3, seen=None):
@@ -1025,9 +1026,11 @@ def _resolve_source(fr, block, use_pos, reg, depth=3, seen=None):
     интрапроцедурный (тело вызывающего) — продюсер в чужом методе становится
     листом invoke, его аргументы синтезируются/стопаются на уровне make_plan."""
     seen = seen or set()
-    loc = _def_insn(fr["cfg"], block, use_pos, reg)
+    loc, why = _def_insn(fr["cfg"], block, use_pos, reg)
     if loc is None:
-        return {"k": "param", "index": fr["params"][reg]} if reg in fr["params"] else {"k": "unknown"}
+        if reg in fr["params"]:
+            return {"k": "param", "index": fr["params"][reg]}
+        return {"k": "unknown", "reason": why}   # merge / no_pred / cycle
     b, idx, ins = loc
     key = (b, idx, reg)
     if depth <= 0 or key in seen:
@@ -1055,10 +1058,10 @@ def _resolve_source(fr, block, use_pos, reg, depth=3, seen=None):
         # move-exception — пойманное исключение (не алиас). depth НЕ тратим: копия
         # не продюсерский хоп, цикл ловит seen. (check-cast прозрачен и так — out=None
         # в _norm, _def_insn идёт мимо него к доcast-определению.)
-        return _resolve_source(fr, b, idx, ins.args[0], depth, seen) if ins.args else {"k": "unknown"}
+        return _resolve_source(fr, b, idx, ins.args[0], depth, seen) if ins.args else {"k": "unknown", "reason": "move_noargs"}
     if op == "instance-of":
         return {"k": "instanceof", "detail": ins.args[0] if ins.args else None}
-    return {"k": "unknown"}
+    return {"k": "unknown", "reason": "op:" + op}
 
 
 def _invoke_source(fr, b, pos, inv, depth, seen):
