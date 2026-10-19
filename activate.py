@@ -1446,22 +1446,51 @@ def main():
     if args.backend == "mech":
         runner.preflight()
     _mark = {"б1": "реальные app-данные", "в": "наполнено заглушками", "а": "достижим (тело пусто/болванка)"}
+    # Инкрементальная запись: результат по каждому ключу дописываем в .jsonl сразу
+    # и флашим. Внешний обрыв (SIGTERM/docker stop/закрытая вкладка — активация
+    # всех ключей идёт ~30 мин) НЕ стирает весь прогон: в .jsonl остаётся всё, что
+    # успели, отчёт пересобираем из него. _finalize закрывает файл и пишет отчёт.
+    outf = None
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        outf = args.out.open("w", encoding="utf-8")
+
+    def _finalize():
+        if outf and not outf.closed:
+            try: outf.flush(); outf.close()
+            except Exception: pass
+        txt = report(results)
+        if args.out:
+            try: args.out.with_suffix(".report.txt").write_text(txt, encoding="utf-8")
+            except Exception: pass
+        return txt
+
+    # По SIGTERM/SIGINT: сохранить частичный отчёт и выйти (os._exit, без frida-
+    # teardown — тот может висеть). .jsonl уже дописан по ключам, так что данные
+    # целы даже если сигнал пришёл во время нативного frida-RPC (обработчик тогда
+    # отработает только по его возврату — но терять уже нечего).
+    import signal
+    def _on_signal(signum, _frame):
+        sys.stderr.write(f"\n[активация] сигнал {signum} — сохраняю частичный результат "
+                         f"({len(results)}/{total}) и выхожу\n")
+        _finalize()
+        os._exit(128 + signum)
+    for _s in (signal.SIGTERM, signal.SIGINT):
+        try: signal.signal(_s, _on_signal)
+        except Exception: pass
+
     for i, r in enumerate(recs, 1):
         res = runner.run_key(r, (0, 1, 2))
         results.append(res)
+        if outf:
+            outf.write(json.dumps(res, ensure_ascii=False) + "\n"); outf.flush()
         fired = any(s.get("fired") for s in res.get("stages", []))
         lvl = _honest_level(res)[0]
         print(f"  [{i}/{total}] {r['key'].split('->')[-1]}: "
               f"{'вызван' if fired else 'НЕ вызван'}"
               f"{' / ' + _mark.get(lvl, '') if fired else ''}", file=sys.stderr)
-    txt = report(results)
+    txt = _finalize()
     print(txt)
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        with args.out.open("w", encoding="utf-8") as f:
-            for r in results:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        args.out.with_suffix(".report.txt").write_text(txt, encoding="utf-8")
 
 
 if __name__ == "__main__":
