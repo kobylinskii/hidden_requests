@@ -328,6 +328,12 @@ def _sig_param_types(sig):
             out.append(arr + c); i += 1
     return out
 
+def _sig_ret_type(sig):
+    """Тип возврата из дескриптора метода '(...)ret' — для типизированной
+    заглушки else у $invoke (иначе Object-заглушка ломает подбор перегрузки)."""
+    i = (sig or "").rfind(")")
+    return sig[i + 1:] if (0 <= i < len(sig) - 1) else ""
+
 def _prov_val(prov, recipes, ftype):
     """Значение аргумента из провенанса slice (статический продюсер), с откатом
     на рецепт-болванку _arg_val(ftype) — чтобы пустой продюсер (холодный старт,
@@ -387,7 +393,11 @@ def _src_val(src, recipes, ftype):
         return v if isinstance(v, (str, int, float, bool)) else _stub_val(ftype)
     if k == "field" and src.get("detail") and "->" in src["detail"]:
         owner, rest = src["detail"].split("->", 1)
-        fv = {"$field": _fq(owner), "name": rest.split()[0], "else": _stub_val(ftype)}
+        parts = rest.split()
+        # else-заглушка типа ПОЛЯ (а не ожидаемого слота): при no-sig ctor ftype=
+        # Object сломал бы подбор перегрузки — тип поля точнее.
+        ftype_field = parts[1] if len(parts) > 1 and parts[1].startswith(("L", "[")) else ftype
+        fv = {"$field": _fq(owner), "name": parts[0], "else": _stub_val(ftype_field)}
         if ftype.startswith("L"):      # #2: нужный тип значения поля
             fv["expect"] = _fq(ftype)
         return fv
@@ -400,26 +410,32 @@ def _src_val(src, recipes, ftype):
             sa = src.get("args") or []
             args = [_src_val(sa[i], recipes, pts[i]) if i < len(sa) else _stub_val(pts[i])
                     for i in range(len(pts))]
+            # else-заглушка типа ВОЗВРАТА продюсера (иначе Object ломает подбор ctor)
+            ret = _sig_ret_type(sig)
             return {"$invoke": _fq(owner), "method": meth, "sig": sig, "args": args,
-                    "else": _stub_val(ftype)}
+                    "else": _stub_val(ret if ret.startswith(("L", "[")) else (ret or ftype))}
     if k == "new" and src.get("type"):
         t = src["type"]; r = recipes.get(t); ca = src.get("ctor_args") or []
-        if ca:
-            # Конструктор, который РЕАЛЬНО использовал вызывающий (из arg_sources),
-            # а не наименьший из рецепта: рецепт часто берёт no-arg ctor и теряет
-            # ВСЕ продюсеры (так registerSmart давал пустое тело вместо device-данных
-            # от getDeviceModel/getOsVersion/...). Типы берём из рецепта, если длина
-            # совпала; иначе строим без sig — frida подберёт перегрузку по аргументам.
-            pts = r["ctor"] if (r and len(r["ctor"]) == len(ca)) else None
-            args = [_src_val(ca[i], recipes, pts[i] if pts else "Ljava/lang/Object;")
-                    for i in range(len(ca))]
-            node = {"$new": _fq(t), "args": args}
-            if pts:
-                node["sig"] = "(" + "".join(pts) + ")V"
-            return node
+        # Конструктор из arg_sources (реальный, что использовал вызывающий) ценен,
+        # когда его ctor_args РАЗРЕШЕНЫ в продюсеры (invoke/field/const/new) — тогда
+        # зовём getDeviceModel/getOsVersion/... и получаем реальные данные
+        # (registerSmart). Но если ctor_args — unknown/param, мы не знаем их типов:
+        # Object-заглушки ломают подбор перегрузки конструктора (frida: «argument
+        # types do not match») → ключ вообще не вызывается. Поэтому:
+        if ca and r and len(r["ctor"]) == len(ca):
+            # длины совпали с рецептом → есть типы → sig + типизированные заглушки
+            pts = r["ctor"]
+            args = [_src_val(ca[i], recipes, pts[i]) for i in range(len(ca))]
+            return {"$new": _fq(t), "sig": "(" + "".join(pts) + ")V", "args": args}
+        if ca and all(c.get("k") in ("invoke", "field", "const", "new") for c in ca):
+            # типов нет (рецепт иной длины), но все ctor_args — конкретные продюсеры:
+            # их значения корректно типизированы, frida подберёт перегрузку по ним
+            args = [_src_val(c, recipes, "Ljava/lang/Object;") for c in ca]
+            return {"$new": _fq(t), "args": args}
+        # иначе (ctor_args с unknown/param или их нет) — рецепт: безопасно вызывается
         if r:
             pts = r["ctor"]
-            args = [_src_val(None, recipes, p) for p in pts]   # нет ctor_args → по типам
+            args = [_src_val(None, recipes, p) for p in pts]
             return {"$new": _fq(t), "sig": "(" + "".join(pts) + ")V", "args": args}
     return _stub_val(ftype)  # param / unknown / capped / instanceof / нерезолвнутое
 
