@@ -253,22 +253,34 @@ function invokeOverload(ov, receiver, args) {
 // транзиентных DTO). Создаём прокси тем же публичным API, что и приложение —
 // retrofit.create(InterfaceClass). create() внутри зовёт Proxy.newProxyInstance,
 // наш хук регистрирует прокси в proxyByIface и вешает оракул на его handler.
-function mintProxy(clsName) {
+function mintProxies(clsName) {
+    // Прокси интерфейса от КАЖДОГО живого Retrofit-инстанса (у приложения их
+    // несколько — разные baseUrl/конвертеры). create() не валидирует конвертер
+    // (ошибка «Unable to create converter» всплывает позже при вызове метода),
+    // поэтому возвращаем ВСЕ кандидаты, а doTrigger переберёт их: конвертер-
+    // ошибка кидается ДО отправки запроса, так что неподходящие безопасно
+    // пропускаются, а шлёт запрос только тот Retrofit, что реально обслужил.
     var iface;
-    try { iface = jclass(clsName).class; } catch (e) { return null; }
+    try { iface = jclass(clsName).class; } catch (e) { return []; }
     var rets = [];
     Java.choose('retrofit2.Retrofit', {
         onMatch: function (r) { try { rets.push(Java.retain(r)); } catch (e) {} },
         onComplete: function () {}
     });
+    var proxies = [];
     for (var i = 0; i < rets.length; i++) {
-        // Любой Retrofit собирает прокси для интерфейса (create не валидирует
-        // baseUrl); при нескольких хостах endpoint снимка — advisory.
-        try { rets[i].create(iface); } catch (e) { continue; }
-        var got = proxyByIface[clsName] || proxyByIface[clsName.replace(/\./g, '/')];
-        if (got) return got;
+        try {
+            var p = rets[i].create(iface);   // create() возвращает прокси; хук вешает оракул
+            if (p) proxies.push(Java.retain(p));
+        } catch (e) {}
     }
-    return null;
+    return proxies;
+}
+
+function _isConverterError(e) {
+    var s = String(e);
+    return s.indexOf('Unable to create') !== -1 || s.indexOf('converter') !== -1 ||
+           s.indexOf('ServiceMethod') !== -1 || s.indexOf('annotation') !== -1;
 }
 
 // Живой инстанс класса из кучи (уровень б1): вызывающие/ViewModel/UseCase —
@@ -289,9 +301,25 @@ function liveReceiver(clsName) {
 function doTrigger(t, args) {
     var C = jclass(t.cls);
     if (t.kind === 'call_retrofit') {
-        var inst = proxyByIface[t.cls] || proxyByIface[t.cls.replace(/\./g, '/')] || mintProxy(t.cls);
-        if (!inst) throw new Error('прокси-инстанс ' + t.cls + ' ещё не создан и не удалось создать через retrofit.create (нет живого Retrofit?)');
-        return invokeOverload(overloadBySig(C, t.method, t.sig), inst, args);
+        // кандидаты: ранее зарегистрированный прокси + прокси от ВСЕХ Retrofit.
+        var cands = [], seen = {};
+        var cached = proxyByIface[t.cls] || proxyByIface[t.cls.replace(/\./g, '/')];
+        if (cached) cands.push(cached);
+        mintProxies(t.cls).forEach(function (p) { cands.push(p); });
+        if (!cands.length) throw new Error('прокси-инстанс ' + t.cls + ' не создан (нет живого Retrofit?)');
+        var ov = overloadBySig(C, t.method, t.sig), lastErr = null;
+        for (var i = 0; i < cands.length; i++) {
+            try {
+                return invokeOverload(ov, cands[i], args);
+            } catch (e) {
+                lastErr = e;
+                // конвертер/ServiceMethod не сработал на ЭТОМ Retrofit (запрос ещё
+                // не ушёл) → пробуем следующий; иную ошибку (напр. наши args) не маскируем.
+                if (_isConverterError(e)) continue;
+                throw e;
+            }
+        }
+        throw lastErr || new Error('ни один Retrofit не обслужил ' + t.cls);
     }
     // invoke / trigger_entry: живой вызывающий из кучи → его код сам собирает
     // реальный DTO (уровень б1); фолбэк на $new() (пустое состояние), если
