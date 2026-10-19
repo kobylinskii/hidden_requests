@@ -393,11 +393,10 @@ def _src_val(src, recipes, ftype):
         return v if isinstance(v, (str, int, float, bool)) else _stub_val(ftype)
     if k == "field" and src.get("detail") and "->" in src["detail"]:
         owner, rest = src["detail"].split("->", 1)
-        parts = rest.split()
-        # else-заглушка типа ПОЛЯ (а не ожидаемого слота): при no-sig ctor ftype=
-        # Object сломал бы подбор перегрузки — тип поля точнее.
-        ftype_field = parts[1] if len(parts) > 1 and parts[1].startswith(("L", "[")) else ftype
-        fv = {"$field": _fq(owner), "name": parts[0], "else": _stub_val(ftype_field)}
+        # else-заглушка — типа СЛОТА (ftype), а НЕ объявленного типа поля: поле
+        # континуации часто объявлено java.lang.Object (generic-слот), а аргументу
+        # нужен String — Object-заглушка сломала бы подбор (feedsCardgroupInfo).
+        fv = {"$field": _fq(owner), "name": rest.split()[0], "else": _stub_val(ftype)}
         if ftype.startswith("L"):      # #2: нужный тип значения поля
             fv["expect"] = _fq(ftype)
         return fv
