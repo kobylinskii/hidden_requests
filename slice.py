@@ -322,6 +322,40 @@ def _check_ctor_args():
     print("  ctor_args ok")
 
 
+def _check_alias():
+    """Алиас-трекинг: аргумент, пришедший через move-object (копия регистра) или
+    check-cast (приведение на месте), раскручивается до исходного продюсера, а не
+    теряется в unknown."""
+    import networkx as nx
+    insns = [
+        Insn("const", "v2", ("tok",)),                       # v2 = "tok"
+        Insn("move-object", "v0", ("v2",)),                  # v0 = v2 (АЛИАС копии)
+        Insn("invoke-static", None, ("Lp/F;->mk()Lp/X;",)),
+        Insn("move-result", "v3", ("Lp/F;->mk()Lp/X;",)),    # v3 = mk()
+        Insn("check-cast", None, ("v3",)),                   # (X) v3 — прозрачно (out=None)
+        Insn("invoke-interface", None,
+             ("Lp/Api;->send(Ljava/lang/String;Lp/X;)V", "v9", "v0", "v3")),
+    ]
+    g = nx.DiGraph(); g.add_node("B", insns=insns)
+    fr = {"cfg": g, "params": {}}
+    # arg через move-object → раскрутка до литерала (без фикса было unknown)
+    assert _resolve_source(fr, "B", 5, "v0") == {"k": "const", "value": "tok"}, \
+        _resolve_source(fr, "B", 5, "v0")
+    # arg через check-cast → раскрутка до вызова-продюсера (cast прозрачен)
+    t = _resolve_source(fr, "B", 5, "v3")
+    assert t["k"] == "invoke" and t["detail"] == "Lp/F;->mk()Lp/X;", t
+    # цепочка move→move→const тоже доходит до листа (сквозной def-use)
+    insns2 = [
+        Insn("const", "v5", ("deep",)),
+        Insn("move-object", "v4", ("v5",)),
+        Insn("move-object", "v1", ("v4",)),
+        Insn("invoke-interface", None, ("Lp/Api;->p(Ljava/lang/String;)V", "v9", "v1")),
+    ]
+    g2 = nx.DiGraph(); g2.add_node("B", insns=insns2)
+    assert _resolve_source({"cfg": g2, "params": {}}, "B", 3, "v1") == {"k": "const", "value": "deep"}
+    print("  alias ok")
+
+
 #  Task 3: слой androguard — загрузка APK, XREF call-sites, нормализация CFG.
 #
 #  Discovery (Step 1, на реальном методе DownloadsApiRepository->
@@ -1015,6 +1049,13 @@ def _resolve_source(fr, block, use_pos, reg, depth=3, seen=None):
             if inv.op.startswith("invoke"):
                 return _invoke_source(fr, b, idx - 1, inv, depth - 1, seen)
         return {"k": "invoke", "detail": ins.args[0] if ins.args else None, "args": []}
+    if op.startswith("move") and op != "move-exception":
+        # move / move-object(/from16//16) — алиас-копия регистра: значение берём из
+        # регистра-источника (сквозной def-use), не теряем трассу. move-result выше,
+        # move-exception — пойманное исключение (не алиас). depth НЕ тратим: копия
+        # не продюсерский хоп, цикл ловит seen. (check-cast прозрачен и так — out=None
+        # в _norm, _def_insn идёт мимо него к доcast-определению.)
+        return _resolve_source(fr, b, idx, ins.args[0], depth, seen) if ins.args else {"k": "unknown"}
     if op == "instance-of":
         return {"k": "instanceof", "detail": ins.args[0] if ins.args else None}
     return {"k": "unknown"}
@@ -1652,6 +1693,7 @@ def _selfcheck(apk=None):
     _check_control_deps()
     _check_classify_operand()
     _check_ctor_args()
+    _check_alias()
     _check_walk_predicates()
     _check_guard_operand()
     _check_framework_guard()
