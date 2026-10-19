@@ -388,6 +388,18 @@ def _src_val(src, recipes, ftype):
     if not isinstance(src, dict):
         return _arg_val(ftype, recipes)
     k = src.get("k")
+    if k == "phi":
+        # значение из ≥2 веток (slice._phi_source): берём первую альтернативу,
+        # дающую НЕ-$stub (реальную) ветку; иначе первую. Инструменту достаточно
+        # одного валидного значения.
+        best = None
+        for a in (src.get("alts") or []):
+            v = _src_val(a, recipes, ftype)
+            if best is None:
+                best = v
+            if not (isinstance(v, dict) and "$stub" in v):
+                return v
+        return best if best is not None else _stub_val(ftype)
     if k == "const":
         v = src.get("value")
         return v if isinstance(v, (str, int, float, bool)) else _stub_val(ftype)
@@ -1285,6 +1297,17 @@ def _check_arg_synth():
     rf2 = {"arg_types": ["Ljava/lang/String;"], "arg_recipes": {},
            "arg_sources": [{"index": 0, "source": {"k": "field", "detail": "Lp/S;->t Ljava/lang/String;"}}]}
     assert not _plan_has_stub(_args_from_sources(rf2)[0]["value"])
+    # phi: берём первую НЕ-$stub ветку (реальную), игнорируя stub-альтернативу
+    rp = {"arg_types": ["Ljava/lang/String;"], "arg_recipes": {},
+          "arg_sources": [{"index": 0, "source": {"k": "phi", "alts": [
+              {"k": "param", "index": 1},                 # user-input ветка -> $stub
+              {"k": "const", "value": "real"}]}}]}         # реальная ветка -> берём её
+    assert _args_from_sources(rp)[0]["value"] == "real", _args_from_sources(rp)[0]["value"]
+    # phi из одних stub-веток -> $stub (нечего взять)
+    rp2 = {"arg_types": ["Ljava/lang/String;"], "arg_recipes": {},
+           "arg_sources": [{"index": 0, "source": {"k": "phi", "alts": [
+               {"k": "param", "index": 1}, {"k": "unknown", "reason": "op:x"}]}}]}
+    assert _args_from_sources(rp2)[0]["value"] == {"$stub": "java.lang.String"}, _args_from_sources(rp2)[0]["value"]
     print("  arg_synth ok")
 
 

@@ -356,6 +356,30 @@ def _check_alias():
     print("  alias ok")
 
 
+def _check_phi():
+    """phi-раскрутка: reg, определённый в разных ветках (merge ≥2 предшественников),
+    собирается в phi-узел с альтернативами; сходящиеся ветки схлопываются в один лист."""
+    import networkx as nx
+    # ромб: A (ветвление) → T|F (разные const в v0) → M (использование в вызове)
+    def diamond(tval, fval):
+        g = nx.DiGraph()
+        g.add_node("A", insns=[Insn("if-eqz", None, ("v9",))])
+        g.add_node("T", insns=[Insn("const", "v0", (tval,))])
+        g.add_node("F", insns=[Insn("const", "v0", (fval,))])
+        g.add_node("M", insns=[Insn("invoke-interface", None,
+                                    ("Lp/Api;->send(Ljava/lang/String;)V", "v9", "v0"))])
+        g.add_edge("A", "T"); g.add_edge("A", "F"); g.add_edge("T", "M"); g.add_edge("F", "M")
+        return {"cfg": g, "params": {}}
+    # расходящиеся ветки → phi с двумя альтернативами
+    t = _resolve_source(diamond("x", "y"), "M", 0, "v0")
+    assert t["k"] == "phi", t
+    assert {a["value"] for a in t["alts"]} == {"x", "y"}, t
+    # сходящиеся ветки (одно значение) → схлопывается в один const-лист, не phi
+    t2 = _resolve_source(diamond("same", "same"), "M", 0, "v0")
+    assert t2 == {"k": "const", "value": "same"}, t2
+    print("  phi ok")
+
+
 #  Task 3: слой androguard — загрузка APK, XREF call-sites, нормализация CFG.
 #
 #  Discovery (Step 1, на реальном методе DownloadsApiRepository->
@@ -1007,14 +1031,15 @@ def _def_insn(cfg, block, use_pos, reg):
         insns = cfg.nodes[b]["insns"]
         for i in range(min(start, len(insns) - 1), -1, -1):
             if insns[i].out == reg:
-                return (b, i, insns[i]), "found"
+                return (b, i, insns[i]), "found", None
         if b in seen:
-            return None, "cycle"
+            return None, "cycle", None
         seen.add(b)
         preds = list(cfg.predecessors(b))
         if len(preds) == 1:
             b = preds[0]; start = len(cfg.nodes[b]["insns"]) - 1; continue
-        return None, ("merge" if len(preds) >= 2 else "no_pred")
+        # merge: def неоднозначен (≥2 предш.) — отдаём merge-блок для phi-раскрутки.
+        return None, ("merge" if len(preds) >= 2 else "no_pred"), (b if len(preds) >= 2 else None)
 
 
 def _resolve_source(fr, block, use_pos, reg, depth=3, seen=None):
@@ -1026,11 +1051,13 @@ def _resolve_source(fr, block, use_pos, reg, depth=3, seen=None):
     интрапроцедурный (тело вызывающего) — продюсер в чужом методе становится
     листом invoke, его аргументы синтезируются/стопаются на уровне make_plan."""
     seen = seen or set()
-    loc, why = _def_insn(fr["cfg"], block, use_pos, reg)
+    loc, why, mb = _def_insn(fr["cfg"], block, use_pos, reg)
     if loc is None:
         if reg in fr["params"]:
             return {"k": "param", "index": fr["params"][reg]}
-        return {"k": "unknown", "reason": why}   # merge / no_pred / cycle
+        if why == "merge":
+            return _phi_source(fr, mb, reg, depth, seen)   # def из ≥2 веток
+        return {"k": "unknown", "reason": why}   # no_pred / cycle
     b, idx, ins = loc
     key = (b, idx, reg)
     if depth <= 0 or key in seen:
@@ -1062,6 +1089,29 @@ def _resolve_source(fr, block, use_pos, reg, depth=3, seen=None):
     if op == "instance-of":
         return {"k": "instanceof", "detail": ins.args[0] if ins.args else None}
     return {"k": "unknown", "reason": "op:" + op}
+
+
+def _phi_source(fr, merge_block, reg, depth, seen):
+    """phi-раскрутка: reg определён в ≥2 ветках, сходящихся в merge_block. Резолвим
+    def reg от КОНЦА каждого предшественника и собираем различные деревья-источники.
+    Один уникальный → он и есть; несколько → {k:phi, alts:[...]} (консьюмер _src_val
+    берёт первую не-stub ветку — инструменту достаточно одного валидного значения).
+    depth тратится (ветка — реальный хоп резолва), mkey в seen ловит петли (loop-
+    carried phi, где предшественник ведёт обратно в merge)."""
+    mkey = ("phi", merge_block, reg)
+    if depth <= 0 or mkey in seen:
+        return {"k": "capped"}
+    seen = seen | {mkey}
+    alts, seen_json = [], set()
+    for p in fr["cfg"].predecessors(merge_block):
+        insns = fr["cfg"].nodes[p]["insns"]
+        t = _resolve_source(fr, p, len(insns), reg, depth - 1, seen)
+        j = json.dumps(t, sort_keys=True, ensure_ascii=False)
+        if j not in seen_json:
+            seen_json.add(j); alts.append(t)
+    if not alts:
+        return {"k": "unknown", "reason": "merge_nopreds"}
+    return alts[0] if len(alts) == 1 else {"k": "phi", "alts": alts}
 
 
 def _invoke_source(fr, b, pos, inv, depth, seen):
@@ -1697,6 +1747,7 @@ def _selfcheck(apk=None):
     _check_classify_operand()
     _check_ctor_args()
     _check_alias()
+    _check_phi()
     _check_walk_predicates()
     _check_guard_operand()
     _check_framework_guard()
