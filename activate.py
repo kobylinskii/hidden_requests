@@ -417,6 +417,8 @@ def _src_val(src, recipes, ftype):
         return v if isinstance(v, (str, int, float, bool)) else _stub_val(ftype)
     if k == "field" and src.get("detail") and "->" in src["detail"]:
         owner, rest = src["detail"].split("->", 1)
+        if _fq(owner).startswith("java."):   # генерик java.*-owner — см. $invoke ниже
+            return _stub_val(ftype)
         # else-заглушка — типа СЛОТА (ftype), а НЕ объявленного типа поля: поле
         # континуации часто объявлено java.lang.Object (generic-слот), а аргументу
         # нужен String — Object-заглушка сломала бы подбор (feedsCardgroupInfo).
@@ -426,6 +428,13 @@ def _src_val(src, recipes, ftype):
         return fv
     if k == "invoke" and src.get("detail") and "->" in src["detail"]:
         owner, rest = src["detail"].split("->", 1)
+        # Генерик java.*-owner (java.util.List/Map, java.lang.Object, ...) как
+        # продюсер бессмыслен: coerce делает Java.choose по ВСЕЙ куче нужного типа
+        # (миллионы List/String) — повисает и всё равно даёт случайный объект.
+        # Реальный продюсер — всегда app-класс. → типизированная болванка слота.
+        # (getRestrictionsSchedule: arg = List.get(field) → зависал на Java.choose.)
+        if _fq(owner).startswith("java."):
+            return _stub_val(ftype)
         m = re.match(r"([^(]+)(\([^)]*\)\S*)", rest)
         if m:
             meth, sig = m.group(1), m.group(2)
@@ -433,10 +442,21 @@ def _src_val(src, recipes, ftype):
             sa = src.get("args") or []
             args = [_src_val(sa[i], recipes, pts[i]) if i < len(sa) else _stub_val(pts[i])
                     for i in range(len(pts))]
-            # else-заглушка типа ВОЗВРАТА продюсера (иначе Object ломает подбор ctor)
+            # else-заглушка (продюсер пуст/мёртв) — БОЛЕЕ КОНКРЕТНЫЙ из {тип
+            # параметра ftype, тип возврата ret}: если ftype конкретен (String) —
+            # берём его (getRestrictionsSchedule: List.get()->Object на String-
+            # параметре; Object-заглушка ломала подбор перегрузки → не вызывался);
+            # если ftype генерик (Object), а ret конкретен — берём ret (registerSmart).
             ret = _sig_ret_type(sig)
+            _GEN = ("Ljava/lang/Object;", "")
+            if ftype.startswith(("L", "[")) and ftype not in _GEN:
+                else_t = ftype
+            elif ret.startswith(("L", "[")) and ret not in _GEN:
+                else_t = ret
+            else:
+                else_t = ret or ftype
             return {"$invoke": _fq(owner), "method": meth, "sig": sig, "args": args,
-                    "else": _stub_val(ret if ret.startswith(("L", "[")) else (ret or ftype))}
+                    "else": _stub_val(else_t)}
     if k == "new" and src.get("type"):
         t = src["type"]; r = recipes.get(t); ca = src.get("ctor_args") or []
         # Конструктор из arg_sources (реальный, что использовал вызывающий) ценен,
@@ -581,6 +601,24 @@ def _pidof(device, pkg):
     p = (r.stdout or "").split()
     return int(p[0]) if p else None
 
+def _wait_past_splash(device, pkg, timeout=60):
+    """Ждать, пока приложение выйдет из SplashActivity (ранний старт: деоптимизация
+    vdex + сплеш). Attach+форс в этот момент нестабилен для frida-java-bridge
+    ('script has been destroyed' — процесс гибнет на arm). Готово, когда resumed-
+    активность принадлежит pkg и это НЕ *Splash*. Возврат мгновенный, если уже
+    на основном экране. False — таймаут (всё равно продолжаем, лучше чем висеть)."""
+    import subprocess, time as _t, re as _re
+    deadline = _t.time() + timeout
+    pat = _re.compile(r"ResumedActivity.*?" + _re.escape(pkg) + r"/(\S+)")
+    while _t.time() < deadline:
+        r = subprocess.run(["adb", "-s", device.id, "shell", "dumpsys", "activity", "activities"],
+                           capture_output=True, text=True)
+        m = pat.search(r.stdout or "")
+        if m and "splash" not in m.group(1).lower():
+            return True
+        _t.sleep(2)
+    return False
+
 def _ensure_running(device, pkg, tries=3, non_interactive=False):
     """attach-режим без перезапуска: вернуть pid ЖИВОГО процесса — между ключами
     приложение НЕ перезапускается, куча переиспользуется. Если процесс УПАЛ
@@ -592,6 +630,10 @@ def _ensure_running(device, pkg, tries=3, non_interactive=False):
     import subprocess, time as _t
     pid = _pidof(device, pkg)
     if pid is not None:
+        # Уже запущен — но мог быть только что поднят (scan.sh шаг 6) и висеть на
+        # сплеше/деоптимизации: форс в этот момент роняет сессию. Ждём основной
+        # экран (мгновенно, если уже на нём).
+        _wait_past_splash(device, pkg)
         return pid
     interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
     for _ in range(tries):
@@ -615,7 +657,11 @@ def _ensure_running(device, pkg, tries=3, non_interactive=False):
                 pass
             pid = _pidof(device, pkg) or pid   # мог пересоздаться за время логина
         else:
-            _t.sleep(4)   # дать инициализироваться (DI/startup)
+            # Не-интерактив (Docker/CI): человека не ждём, но ждём выхода из сплеша/
+            # деоптимизации — иначе attach+arm на раннем старте роняет сессию
+            # ('script has been destroyed'). sleep 12 мало (unquickening vdex дольше).
+            _wait_past_splash(device, pkg)
+            _t.sleep(4)   # добор на DI/стабилизацию
         return pid
     return None
 
@@ -948,9 +994,11 @@ def report(results):
     synth = sum(1 for v in lvl.values() if v[0] == "в")
     dist = Counter(v[2] for v in lvl.values() if v[0] == "б1")
     L = [f"Всего ключей: {n}",
-         f"(а) достижим (запрос ушёл, параметры любые):              {reached}/{n}",
-         f"(б1) app-built с РЕАЛЬНЫМИ данными (matched, без заглушек): {b1}/{n}",
-         f"(в)  synthesized (тело наполнено нашими $stub-заглушками):  {synth}/{n}",
+         f"Вызвано (запрос ушёл): {reached}/{n}   |   НЕ вызвано: {n - reached}/{n}",
+         "Из ВЫЗВАННЫХ — наполнение тела (взаимоисключающе, в сумме = вызвано):",
+         f"  (б1) РЕАЛЬНЫЕ app-данные (matched, без заглушек): {b1}",
+         f"  (в)  synthesized ($stub-заглушки):                {synth}",
+         f"  (а)  пустое тело / болванка:                      {reached - b1 - synth}",
          "",
          "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
          f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
@@ -1355,7 +1403,8 @@ def _check_report():
     txt = report(results)
     levels = {k: _honest_level(r)[0] for k, r in zip("abcd", results)}
     assert levels == {"a": "б1", "b": "в", "c": "а", "d": "а"}, levels
-    assert "(б1) app-built с РЕАЛЬНЫМИ данными" in txt and "synthesized" in txt
+    assert "(б1) РЕАЛЬНЫЕ app-данные" in txt and "synthesized" in txt
+    assert "Вызвано (запрос ушёл): 3/4" in txt and "НЕ вызвано: 1/4" in txt  # 3 fired, 1 not (d)
     assert "ступень 0" in txt and "RQ3" in txt and "несопостав" in txt.lower()
     print("  report ok")
 
@@ -1405,6 +1454,11 @@ def main():
                          "activation_exact — ступень 0 зовёт метод напрямую, точный путь не нужен")
     ap.add_argument("--recurse-args", action="store_true",
                     help="stage0: аргументы рекурсивно из arg_sources, $stub на user-input листьях (тир synthesized)")
+    ap.add_argument("--stages", default="0,1,2",
+                    help="ступени форса через запятую (0=прямой Retrofit, 1=invoke "
+                         "вызывающего, 2=frontier). Ступени 1/2 исполняют код приложения "
+                         "и могут ронять процесс — для устойчивого скана reachability "
+                         "ставь --stages 0")
     ap.add_argument("--non-interactive", action="store_true",
                     help="после краха форсом не ждать логина человека (Docker/CI): "
                          "поднять приложение свежим и продолжить")
@@ -1504,8 +1558,9 @@ def main():
         try: signal.signal(_s, _on_signal)
         except Exception: pass
 
+    _stages = tuple(int(x) for x in str(args.stages).split(",") if x.strip() != "")
     for i, r in enumerate(recs, 1):
-        res = runner.run_key(r, (0, 1, 2))
+        res = runner.run_key(r, _stages)
         results.append(res)
         if outf:
             outf.write(json.dumps(res, ensure_ascii=False) + "\n"); outf.flush()
