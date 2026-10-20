@@ -882,7 +882,8 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             try:
                 if session is not None: session.detach()
             except Exception: pass
-        _wd = threading.Timer(len(stages) * int(wait_t) + 45 + int(_SETTLE), _watchdog)
+        # бюджет: ступени + запас на реопены (relaunch+settle до 2 раз при крахе)
+        _wd = threading.Timer(len(stages) * int(wait_t) + 90 + int(_SETTLE) * 4, _watchdog)
 
         # _ensure_running ДО watchdog: он может ждать ввода человека (логин+пинкод
         # после краха, если не non_interactive) неопределённо долго.
@@ -898,23 +899,51 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         except Exception as e:
             setup_exc.append("session: " + str(e))
 
+        def _reopen():
+            # Переоткрыть СТАБИЛЬНЫЙ процесс+агент (после краха прошлого ключа, когда
+            # скрипт «destroyed» ещё до нашего форса). Обновляет session/pid/agent.
+            nonlocal session, pid, agent
+            try:
+                if session is not None: session.detach()
+            except Exception: pass
+            agent = None
+            if attach:
+                pid = _ensure_running(device, pkg, non_interactive=non_interactive, report=_er)
+            try:
+                session, pid, agent = _open(pid, _on_hook_msg)
+            except Exception as e:
+                setup_exc.append("reopen: " + str(e)); agent = None
+
         def arm_stage(rec, stage):
             plan, probs = _plan_for(rec, stage)
             if probs:
                 return {"stage": stage, "valid": False, "exceptions": probs,
                         "fired": False, "real_params": False, "request": None, "plan": plan}
-            if agent is None:
-                return {"stage": stage, "valid": False, "exceptions": setup_exc or ["нет сессии"],
-                        "fired": False, "real_params": False, "request": None, "plan": plan}
-            seen["hit"] = False   # оракул на ступень (captureOn чистит cap.hits — нет утечки снимка)
-            seen["req"] = None    # push-захват на ступень
             res, snap, exc = {}, None, []
-            try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
-            except Exception as e: exc.append("capture_on: " + str(e))
-            try: res = agent.exports_sync.arm(json.dumps(plan))
-            except Exception as e: exc.append("arm: " + str(e))
+            # РЕКАВЕРИ: скрипт мог «destroyed» ещё ДО форса — процесс догорал от краха
+            # ПРЕДЫДУЩЕГО ключа на момент attach. Переоткрываем свежий и повторяем (до
+            # 2 раз). Детерминированный краш-на-форсе исчерпает попытки и честно вернёт
+            # ошибку, но транзиентный догорающий краш так восстанавливается.
+            for attempt in range(3):
+                if agent is None:
+                    if attempt < 2:
+                        _reopen(); continue
+                    return {"stage": stage, "valid": False,
+                            "exceptions": (setup_exc or ["нет сессии"]) + exc,
+                            "fired": False, "real_params": False, "request": None, "plan": plan}
+                seen["hit"] = False; seen["req"] = None; seen["resp"] = None  # оракул/пуш на ступень
+                res, exc = {}, []
+                try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
+                except Exception as e: exc.append("capture_on: " + str(e))
+                try: res = agent.exports_sync.arm(json.dumps(plan))
+                except Exception as e: exc.append("arm: " + str(e))
+                # скрипт умер ДО/во время setup (догорающий краш прошлого ключа) →
+                # переоткрыть стабильный процесс и перевызвать (не на крашащемся форсе)
+                if attempt < 2 and any("destroyed" in x for x in exc):
+                    _reopen(); continue
+                break
             time.sleep(wait_t)
-            try: snap = agent.exports_sync.snapshot()
+            try: snap = agent.exports_sync.snapshot() if agent is not None else None
             except Exception as e: exc.append("snapshot: " + str(e))
             fired = seen["hit"]
             # snapshot потерян (процесс умер до RPC), но push-захват успел — берём его
