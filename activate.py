@@ -1102,19 +1102,32 @@ def report(results):
     lvl = {r["key"]: _honest_level(r) for r in results}
     b1 = sum(1 for v in lvl.values() if v[0] == "б1")
     synth = sum(1 for v in lvl.values() if v[0] == "в")
-    dist = Counter(v[2] for v in lvl.values() if v[0] == "б1")
     # matched = у ключа есть снимок с совпавшим endpoint (запрос РЕАЛЬНО ушёл на
     # нужный URL). Считаем по факту снимка, а НЕ как b1+synth: тело может быть
     # бинарным (protobuf/gRPC pivi-эндпоинты ivi) или пустым — запрос всё равно ушёл.
     def _matched(r):
         return any((s.get("request") or {}).get("matched") for s in r.get("stages", []))
     wire = sum(1 for r in results if _matched(r))
-    # ключи, где ХОТЯ БЫ ОДНО поле наполнено реальным значением из персистентного
-    # стора (SharedPreferences/DataStore) — сессионный тир +Data (token/uid/device).
-    def _store_filled(r):
-        return any("←store:" in f
+    def _filled_any(r, mark):
+        return any(mark in f
                    for s in r.get("stages", []) for f in ((s.get("request") or {}).get("filled") or []))
-    store_n = sum(1 for r in results if _store_filled(r))
+    store_n = sum(1 for r in results if _filled_any(r, "←store:"))     # T3 сессия/uid/device
+    traffic_n = sum(1 for r in results if _filled_any(r, "←traffic:"))  # T4 карта трафика
+    # ЭТАП 1: почему ключ дошёл до Retrofit, но НЕ ушёл на провод. Классифицируем
+    # по строкам исключений (бакеты — что чинить, чтобы поднять число отправленных).
+    def _why_not_sent(r):
+        blob = " ".join(e for s in r.get("stages", []) for e in (s.get("exceptions") or []))
+        if "argument types do not match" in blob:               return "overload (типы аргументов не совпали)"
+        if ("CoroutineSingletons" in blob or "ExecutorCallbackCall" in blob
+                or "Continuation" in blob):                      return "suspend/Call не исполнен"
+        if ("Unable to create" in blob or "converter" in blob
+                or "ServiceMethod" in blob):                     return "Retrofit converter"
+        if "NullPointer" in blob or "checkNotNull" in blob:      return "NPE (null в non-null)"
+        if "script has been destroyed" in blob:                 return "краш процесса"
+        if r.get("timeout"):                                     return "таймаут (форс завис)"
+        return "без исключения / прочее"
+    not_sent = [r for r in results if r.get("reached") and not _matched(r)]
+    why = Counter(_why_not_sent(r) for r in not_sent)
     # ОРАКУЛ: ответ сервера на форс-вызов. accepted = 2xx (сервер принял тело как
     # валидное); rejected = 4xx/5xx (чаще всего называет недостающий/невалидный
     # параметр). Это и есть «качество активации» — не «сформировали», а «приняли».
@@ -1125,24 +1138,24 @@ def report(results):
                 return rq["response"]
         return None
     resps = [(r["key"].split("->")[-1], _resp(r)) for r in results if _resp(r)]
-    L = [f"Всего ключей: {n}",
-         f"Форс-вызов дошёл до Retrofit-метода: {reached}/{n}   |   не дошёл: {n - reached}/{n}",
-         "  (это вход в интерфейс-прокси; НЕ гарантирует запрос на провод —",
-         "   suspend/Call мог не исполниться, конвертер/NPE упасть до отправки)",
-         f"Исходящий запрос ушёл на нужный endpoint (matched): {wire}/{n}",
-         "Из них — наполнение тела (взаимоисключающе, в сумме = matched):",
-         f"  (б1) РЕАЛЬНЫЕ app-данные (без заглушек):          {b1}",
-         f"  (в)  synthesized ($stub-заглушки):               {synth}",
-         f"  (а)  тело бинарное (protobuf) / пустое:           {wire - b1 - synth}",
-         f"  из matched: наполнено реальным из персистентного стора (сессия/uid/device): {store_n}",
+    L = [f"Всего скрытых запросов (ключей): {n}",
          "",
-         f"Ответ сервера снят (сырая улика, БЕЗ вердикта): {len(resps)}/{wire}  (status+тело, см. дамп)",
+         "══ ЭТАП 1 — ДОСТАВКА (сколько доведено до бэкенда; заглушки допустимы) ══",
+         f"  ушло на провод (matched):       {wire}/{n}",
+         f"  дошло до Retrofit, но НЕ ушло:   {len(not_sent)}/{n}" + ("  — причины:" if why else ""),]
+    for name, c in why.most_common():
+        L.append(f"       {c:>3}  {name}")
+    L += [f"  не дошло до Retrofit:            {n - reached}/{n}",
          "",
-         "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
-         f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
-         f"  ступень 1 (вызывающий + стражи):   {dist.get(1,0)}",
-         f"  ступень 2 (UI-фронтир):            {dist.get(2,0)}",
-         f"  без реальных данных (болванка/synthesized/недостижим): {n - b1}",
+         "══ ЭТАП 2 — РЕАЛИЗАЦИЯ (из ушедших — с какими данными) ══",
+         f"  (б1) реальные данные на проводе:  {b1}/{wire}",
+         f"  (в)  уцелела заглушка ($stub):    {synth}/{wire}",
+         f"  (а)  тело пустое/бинарное:        {wire - b1 - synth}/{wire}",
+         "  источник реальных (наполнено ≥1 поле; T0–T2 без маркера — считаем остатком):",
+         f"       T4 harvest (карта трафика):  {traffic_n}",
+         f"       T3 стор (сессия/uid/device): {store_n}",
+         "",
+         f"ОТВЕТ СЕРВЕРА снят (сырая улика, толкует человек/агент): {len(resps)}/{wire}",
          "",
          "Оговорка: сравнение с RQ3/Таблицей IV ICSE 2025 — качественное; "
          "метрики несопоставимы напрямую (активити vs сетевые вызовы, другой стенд).",]
@@ -1554,10 +1567,11 @@ def _check_report():
     txt = report(results)
     levels = {k: _honest_level(r)[0] for k, r in zip("abcd", results)}
     assert levels == {"a": "б1", "b": "в", "c": "а", "d": "а"}, levels
-    assert "(б1) РЕАЛЬНЫЕ app-данные" in txt and "synthesized" in txt
-    assert "дошёл до Retrofit-метода: 3/4" in txt and "не дошёл: 1/4" in txt  # 3 fired, 1 not (d)
-    assert "ушёл на нужный endpoint (matched): 3/4" in txt  # a,b,c matched; d — нет
-    assert "ступень 0" in txt and "RQ3" in txt and "несопостав" in txt.lower()
+    assert "(б1) реальные данные на проводе:  1/3" in txt and "уцелела заглушка" in txt
+    assert "ушло на провод (matched):       3/4" in txt           # a,b,c matched; d — нет
+    assert "не дошло до Retrofit:            1/4" in txt           # d не reached
+    assert "ЭТАП 1" in txt and "ЭТАП 2" in txt
+    assert "RQ3" in txt and "несопостав" in txt.lower()
     print("  report ok")
 
 
