@@ -1,14 +1,16 @@
-# Поиск скрытых HTTP-запросов: сопоставление статика/динамика + статический срез
+# Поиск скрытых HTTP-запросов: сопоставление, срез, принудительная активация
 
 Скрытый запрос — эндпоинт, который есть в коде APK, но ни разу не выполнился при
-исследовании приложения. Репозиторий даёт два независимых инструмента:
+исследовании приложения. Репозиторий даёт инструменты для всех трёх этапов:
 
 ```
                       ┌─ diff.py ──────> hidden.jsonl (точное сопоставление ключей)
 APK ──BFScan──> *_methods.md ─┤
-                      └─ slice.py ─────> slice.jsonl (обратный срез: call-sites,
-                                          стражи вызова, источники аргументов)
-APK ──trace.py+hook.js──> *.dynamic.jsonl ─┘
+                      └─ slice.py ─────> slice.jsonl ──┐ (обратный срез: call-sites,
+APK ──trace.py+hook.js──> *.dynamic.jsonl ─┘            │  стражи вызова, источники арг-в)
+                                                        ▼
+                           activate.py+activate.js ──> activation.jsonl
+                           (принудительный вызов через Frida: reached/matched/(б1)/(в))
 ```
 
 1. **`diff.py`** — что из статики реально вызывалось в динамике (Frida), по точному ключу
@@ -18,10 +20,14 @@ APK ──trace.py+hook.js──> *.dynamic.jsonl ─┘
    и аргументов. Не требует устройства — работает по одному APK.
 3. **`eval_slice.py`** — детерминированная подвыборка ключей для ручной разметки в JADX и
    скорер precision/recall слайсера против неё (ground truth для RQ2 диплома).
+4. **`activate.py` / `activate.js`** — принудительно вызывают скрытый запрос через Frida
+   по срезу и измеряют, какой минимальной техникой он активируется (HTTP-аналог Таблицы IV
+   ICSE 2025). Требует устройства с frida-server. См. Часть 3.
 
 Контекст задачи, разбор статей-оснований и позиционирование диплома — `CONTEXT.md`.
 Дизайн `slice.py` — `docs/superpowers/specs/2026-09-28-static-backward-slice-design.md`,
-план реализации — `docs/superpowers/plans/2026-09-28-static-backward-slice.md`.
+дизайн активации — `docs/superpowers/specs/2026-10-16-frida-forced-activation-design.md`,
+планы реализации — `docs/superpowers/plans/`.
 
 ---
 
@@ -324,6 +330,85 @@ python3 eval_slice.py --slice out/gpm.tnt_premier.slice.jsonl --truth out/tnt_tr
 
 ---
 
+## Часть 3. `activate.py` / `activate.js`: принудительная активация
+
+Следующее звено после среза: взять скрытый ключ и его срез (`slice.jsonl`) и
+**принудительно вызвать запрос через Frida**, подтвердив достижимость динамически.
+Это HTTP-аналог RQ3 / Таблицы IV из ICSE 2025 (перспектива №2 курсовой). Подробный
+журнал реализации и честные оговорки — `CONTEXT.md` §4.8; дизайн —
+`docs/superpowers/specs/2026-10-16-frida-forced-activation-design.md`.
+
+**Как это работает.** `activate.js` — фиксированный Frida-рантайм; `activate.py` —
+оркестратор. На каждый ключ пробуются **ступени** снизу вверх (0 — прямой вызов
+Retrofit-метода; 1 — ближайший вызывающий + форс стражей; 2 — UI-фронтир), берётся
+минимальная сработавшая. Аргументы объектных request-body-DTO **конструируются**
+(`$new` с рекурсивным синтезом полей из `arg_recipes` среза), а не берутся из кучи
+(транзиентные DTO там отсутствуют). Retrofit-прокси минтится из живого
+`retrofit2.Retrofit`-синглтона (`retrofit.create(Iface)`), если на холодном старте
+сервис ещё не инициализирован. Возвращённый вызовом объект **отправляется на провод
+по типу возврата**: `retrofit2.Call`→`enqueue`, RxJava→`subscribe` (без этого
+не-suspch методы строят `Call`, но запрос не уходит). Подтверждение — key-exact
+оракул (хук `InvocationHandler.invoke`); фактический исходящий запрос снимается на
+сборке (`Request$Builder.build`) и диспетче (`okhttp.newCall`) и эмитится сразу
+(push-захват), чтобы пережить краш приложения до снятия снимка.
+
+**Уровни успеха** (в отчёте, взаимоисключающе):
+* **reached** — форс дошёл до Retrofit-метода (вход в прокси); НЕ гарантирует запрос.
+* **matched** — запрос реально ушёл на нужный endpoint (снимок `matched`), из них:
+  **(б1)** реальные app-данные · **(в)** synthesized (наши `$stub`) · бинарное
+  (protobuf/gRPC) / пустое тело.
+
+**По умолчанию — механический бэкенд без LLM** (`--backend mech --recurse-args`).
+Опционально `--backend openai`/`manual`/`plans` (LLM выдаёт декларативный JSON-план,
+строго валидируемый против DEX до касания устройства).
+
+### Запуск
+
+```bash
+./build-agents.sh                      # пересобрать build/*.js ПОСЛЕ правок *.js (frida 17!)
+.venv/bin/python activate.py --selfcheck
+.venv/bin/python activate.py \
+  --slice out/<pkg>.slice.jsonl --apk apk/<pkg>.apk --package <pkg> \
+  --hidden out/<pkg>.hidden.jsonl --backend mech --recurse-args --skip-dx \
+  --attach --non-interactive --out out/<pkg>.activation.jsonl
+```
+
+> **Критично (frida 17):** рантайм грузит **скомпилированный** `build/activate.js`
+> (бандл с `frida-java-bridge`), а НЕ исходник. После любой правки `*.js` обязателен
+> `./build-agents.sh`, иначе изменения — тихий no-op. Это же касается Docker-образа
+> (`COPY . /app` печёт `build/` как есть — см. `DOCKER.md`).
+
+`--attach` цепляется к уже запущенному приложению без рестарта между ключами;
+`--non-interactive` — после краха форсом поднимает свежим без ожидания человека;
+`--keys`/`--keys-file` — подвыборка; `--all-reached` — все достижимые ключи.
+
+### Результаты (device-verified)
+
+| Приложение | reached | matched (запрос ушёл) | из них (б1)/(в) |
+|---|---|---|---|
+| TNT Premier 2.134.0 (suspend/Retrofit) | 47/48 | — | (б1) 10 |
+| ivi `ru.ivi.client` (Call+RxJava, protobuf) | 101/118 | **79/118** | (б1) 2 / (в) 39 |
+
+Уровень (б2) «наполнить реальными user-данными» механически **не берётся** — это
+прямой HTTP-аналог тира «+Data support» RQ3 ICSE (сессия/логин, выбранный id, PIN,
+платёжные данные). `CONTEXT.md` §4.8 — полный разбор границы.
+
+### Ограничения `activate.py`/`activate.js`
+
+* **Ступень 0 завышает достижимость** — прямой вызов обходит всю логику; заголовочная
+  метрика — matched (запрос на проводе), а не reached.
+* **Нестабильность эмулятора.** Десятки force-stop+spawn на крэш-ключах замораживают
+  Genymotion в `offline` — лечится перезапуском VM (`gmtool admin stop/start`) +
+  подъёмом frida-server. Прогон вести батчами с проверкой `adb devices`.
+* **Корректный хост требует тёплого состояния** — на холодном старте feature-Retrofit
+  ещё не создан, форс уходит на первый живой инстанс (сторонний SDK); path/body верны.
+* **protobuf-тела нечитаемы** (`<unreadable>`) без `.proto`-схем (в APK их нет) —
+  запрос засчитывается matched, но тело не рендерится в текст.
+* **~35% не-matched** — сложные DTO/параметры, которые сборщик аргументов не осилил
+  (предел статического синтеза среза), либо suspend/Call не дошёл до сети.
+
+---
+
 ## Файлы
 
 | Файл | Назначение |
@@ -334,7 +419,12 @@ python3 eval_slice.py --slice out/gpm.tnt_premier.slice.jsonl --truth out/tnt_tr
 | `diff.py` | разбор BFScan `.md`, сведение со трафиком, отчёт. `--selfcheck` гоняет тесты |
 | `slice.py` | обратный срез скрытых запросов: call-sites, стражи, источники аргументов |
 | `eval_slice.py` | сэмплер ground truth + скорер precision/recall для `slice.py` |
+| `activate.py` | оркестратор принудительной активации: ступени, бэкенды (mech/openai/manual/plans), отчёт. `--selfcheck` гоняет тесты |
+| `activate.js` | фиксированный Frida-рантайм активации: коэрсия аргументов, конструирование DTO, минтинг прокси, отправка Call/RxJava, захват запроса |
+| `prelude.js` | общий пролог Frida-агентов |
+| `build-agents.sh` | компиляция `*.js` → `build/*.js` (frida 17 + frida-java-bridge). Запускать ПОСЛЕ любой правки `*.js` |
+| `build/` | скомпилированные Frida-агенты (их грузит рантайм, НЕ исходники) |
 | `apk/` | APK, снятый с устройства, и вывод BFScan по нему |
-| `out/` | `*.dynamic.jsonl`, `*.hidden.jsonl`, `*.slice.jsonl`, `*.report.txt` |
-| `docs/superpowers/specs/` | дизайн-документы (текущий: обратный срез) |
+| `out/` | `*.dynamic.jsonl`, `*.hidden.jsonl`, `*.slice.jsonl`, `*.activation.jsonl`, `*.report.txt` |
+| `docs/superpowers/specs/` | дизайн-документы (срез, принудительная активация) |
 | `docs/superpowers/plans/` | планы реализации |
