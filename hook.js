@@ -57,6 +57,10 @@ var paramSent = 0;
 var PARAM_MAX = 50000;
 function emitParam(name, val, url) {
     if (!name) return;
+    // CDN/медиа-ссылки (постеры/логотипы) — не параметры слота: слот берёт
+    // id/slug/токен, не абсолютный URL. Отсекаем — иначе уникальные URL каждого
+    // постера забивают карту (path/slug-значения не начинаются с http, сохранятся).
+    if (typeof val === 'string' && /^https?:\/\//i.test(val)) return;
     var k = name + '\u0000' + val;
     if (seenParam[k]) return;
     seenParam[k] = true;

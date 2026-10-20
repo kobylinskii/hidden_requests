@@ -87,7 +87,7 @@ def main():
     # слота совпали имя И ресурс. Копим в памяти, пишем один раз в конце.
     params_path = args.params or HERE / "out" / f"{args.package}.params.jsonl"
     params = {}
-    PARAMS_CAP = 8000
+    PARAMS_CAP = 30000
     # frida 17 убрал глобал Java → грузим собранный build/hook.js (bundle с
     # frida-java-bridge); исходный hook.js падает "ReferenceError: Java is not defined".
     script_path = args.script or (HERE / "build" / "hook.js"
