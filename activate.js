@@ -108,6 +108,10 @@ function _addStore(k, v) {
     if (cls === 'java.lang.Boolean') return;        // флаги (shown-tip и т.п.) — не данные
     var vs; try { vs = v.toString(); } catch (e) { return; }
     if (!vs || !vs.length || vs === 'stub') return;
+    // Не атомарное значение → не параметр слота: склейка с пробелами (okhttp
+    // User-Agent-блоб лез в platform/deviceModel) или структура/дата в скобках
+    // ([2026-10-20] лез в deviceName). Токены/id/slug пробелов и скобок не несут.
+    if (/\s/.test(vs) || '[{('.indexOf(vs.charAt(0)) !== -1) return;
     var nk = normKey(k);
     if (nk && !(nk in storeDump)) storeDump[nk] = { val: vs, orig: String(k) };
 }

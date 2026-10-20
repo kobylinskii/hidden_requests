@@ -984,8 +984,9 @@ def _params_real(plan, snap, rec=None):
     нет args)."""
     if not snap or not snap.get("url") or not snap.get("matched"):
         return False
-    # $stub в плане = user-input заглушен нами → тир (в) synthesized, НЕ app-built
-    if any(_plan_has_stub(a.get("value")) for a in plan.get("args", [])):
+    # Заглушка УЦЕЛЕЛА в запросе (не затёрта harvest) → тир (в), НЕ app-built.
+    # Смотрим на факт снимка, а не на план: harvest-наполненное поле = реальное.
+    if _has_stub_marker(snap.get("url", ""), snap.get("body", "")):
         return False
     data_cost = (rec or {}).get("data_cost")
     if data_cost is None:
@@ -1018,6 +1019,16 @@ def _check_params_real():
     assert not _params_real({"args": []}, {"url": "", "matched": True}, none_rec)
     # _has_real_data: вложенность, пустые листья
     assert _has_real_data("/x", '{"a":{"b":"z"}}') and not _has_real_data("/x", '{"a":{"b":""}}')
+    # РЕГРЕССИЯ: план нёс $stub, но harvest затёр его реальным → тело без "stub" = б1
+    # (раньше plan-stub ложно метил synth и прятал единственный harvest-win).
+    assert _params_real({"args": [{"index": 0, "value": {"$stub": "Ljava/lang/String;"}}]},
+                        {"url": "/x", "matched": True, "body": '{"code":"1111"}'}, obj_rec)
+    # уцелевшая заглушка в теле → НЕ б1
+    assert not _params_real({"args": [{"index": 0}]},
+                            {"url": "/x", "matched": True, "body": '{"code":"stub"}'}, obj_rec)
+    # path-параметр stub (/streams/stub) ловится маркером; реальный id — нет
+    assert _has_stub_marker("/app/v1/download/streams/stub", "")
+    assert not _has_stub_marker("/app/v1/download/streams/12345", "{}")
     print("  params_real ok")
 
 
@@ -1040,18 +1051,27 @@ def _honest_level(r):
     url, body = msnap.get("url", "") or "", msnap.get("body", "") or ""
     if not _has_real_data(url, body):
         return ("а", msnap, mstage)
-    synth = _has_stub_marker(url, body) or any(_plan_has_stub(a.get("value"))
-                                               for a in (mplan or {}).get("args", []))
+    # synth — ПО ФАКТУ запроса: уцелела ли наша заглушка. Поле, наполненное harvest
+    # из карты/стора (←traffic/←store), заглушку в запросе затирает → это РЕАЛЬНЫЕ
+    # данные (б1), а не synth, даже если план содержал $stub (иначе метрика прячет
+    # ровно то, ради чего harvest и делался).
+    synth = _has_stub_marker(url, body)
     return ("в" if synth else "б1", msnap, mstage)
 
 
 def _has_stub_marker(url, body):
-    """В снимке есть наша $stub-заглушка: маркер "stub" в JSON-теле ИЛИ значение
-    query-параметра == 'stub' (GET кладёт заглушку в URL, не в тело)."""
+    """В ФАКТИЧЕСКОМ запросе уцелела наша $stub-заглушка: маркер "stub" в JSON-теле,
+    или значение query-параметра == 'stub', или path-сегмент == 'stub' (GET с
+    path-параметром: /streams/stub, /pop-up/stub), или form-поле == 'stub'. Если
+    harvest заменил заглушку реальным значением — "stub" в запросе не останется, и
+    это уже не synthesized (ключевой признак тира: смотрим на провод, не на план)."""
     if body and '"stub"' in body:
         return True
     from urllib.parse import urlparse, parse_qsl
-    if any(v == "stub" for _, v in parse_qsl(urlparse(url or "").query, keep_blank_values=True)):
+    u = urlparse(url or "")
+    if any(seg == "stub" for seg in u.path.split("/")):     # path-параметр: /streams/stub
+        return True
+    if any(v == "stub" for _, v in parse_qsl(u.query, keep_blank_values=True)):
         return True
     # form-urlencoded тело: значение параметра == 'stub' (наша $stub-String)
     if body and not body.strip().startswith("{") and "=" in body:
