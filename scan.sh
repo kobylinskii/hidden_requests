@@ -38,6 +38,7 @@ DYN="$OUT/${PKG}.dynamic.jsonl"
 HIDDEN="$OUT/${PKG}.hidden.jsonl"
 SLICE="$OUT/${PKG}.slice.jsonl"
 ACT="$OUT/${PKG}.activation.jsonl"
+PARAMS="$OUT/${PKG}.params.jsonl"   # карта параметров (листья трафика шага 3)
 
 if [ -n "${SLICE_IN:-}" ]; then
     # ── Старт с ГОТОВОГО СРЕЗА: пропускаем BFScan+трафик+diff+slice целиком.
@@ -81,7 +82,7 @@ cat >&2 <<EOF
     Нажмите Ctrl-C в этом терминале, когда наступит насыщение.
 
 EOF
-$PY "$HERE/trace.py" --package "$PKG" --out "$DYN" ${TRACE_APPEND:+--append} >&2 || true
+$PY "$HERE/trace.py" --package "$PKG" --out "$DYN" --params "$PARAMS" ${TRACE_APPEND:+--append} >&2 || true
 [ -s "$DYN" ] || { echo "трафик не собран ($DYN пуст) — прерываю" >&2; exit 1; }
 
 # ── 4. Скрытые запросы: статика ∖ динамика ──────────────────────────────────
@@ -136,9 +137,12 @@ sleep 12
 # --all-reached: ВСЕ достижимые скрытые ключи; --attach: без рестарта между ключами.
 # --non-interactive: в Docker (-it) после краха форсом НЕ ждём логина человека —
 # поднимаем приложение свежим и продолжаем (иначе прогон зависает на input()).
+# --seed: карта параметров из шага 3 → наполняем скрытые запросы реальными
+# значениями трафика вместо $stub (только если файл непустой).
+SEED_ARG=""; [ -s "$PARAMS" ] && SEED_ARG="--seed $PARAMS"
 $PY "$HERE/activate.py" --slice "$SLICE" --apk "$APK" --package "$PKG" \
     --backend mech --recurse-args --all-reached --skip-dx --attach --non-interactive \
-    --hidden "$HIDDEN" --out "$ACT" >/dev/null
+    --hidden "$HIDDEN" $SEED_ARG --out "$ACT" >/dev/null
 
 say "ГОТОВО — отчёты в $OUT"
 echo "  скрытые запросы:        $HIDDEN  (+ .report.txt)" >&2

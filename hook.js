@@ -142,14 +142,75 @@ function recordHttp(verb, url) {
     });
 }
 
+// КАРТА ПАРАМЕТРОВ (б2b): эмитим примитивные листья тел/URL/ответов как
+// {t:'param', name, val, url}. Хост (trace.py) дедуплицирует в param-файл,
+// которым activate.py сеет pool. Канонический сборщик/матчинг — в activate.js;
+// здесь только компактный эмиттер (resource/shape считает activate.js.seedPool).
+// ponytail: сырые тела НЕ шлём (мусорных запросов много) — только листья ≤256 симв.
+function emitLeaves(obj, url) {
+    if (obj === null || typeof obj !== 'object') return;
+    for (var k in obj) {
+        var v = obj[k];
+        if (v !== null && typeof v === 'object') { emitLeaves(v, url); continue; }
+        var ok = (typeof v === 'string' && v !== '' && v !== 'stub' && v.length <= 256) ||
+                 (typeof v === 'number' && v !== 0) || typeof v === 'boolean';
+        if (ok) emit({ t: 'param', name: k, val: v, url: url });
+    }
+}
+function reqBodyText(req) {
+    try {
+        var rb = req.body(); if (rb === null) return null;
+        var B = Java.use('okio.Buffer'), buf = B.$new(); rb.writeTo(buf); return buf.readUtf8();
+    } catch (e) { return null; }
+}
+function harvestReq(request, url) {
+    try {
+        var b = reqBodyText(request);
+        if (b && b.charAt(0) === '{') { try { emitLeaves(JSON.parse(b), url); } catch (e) {} }
+        var qs = String(url).split('?')[1];
+        if (qs) qs.split('&').forEach(function (p) {
+            var i = p.indexOf('='); if (i <= 0) return;
+            try { emit({ t: 'param', name: decodeURIComponent(p.slice(0, i)),
+                         val: decodeURIComponent(p.slice(i + 1)), url: url }); } catch (e) {}
+        });
+        // id в пути (/streams/<num|hex>) — под частым именем слота 'id'
+        String(url).split('?')[0].split('/').forEach(function (seg) {
+            if (/^\d+$/.test(seg) || /^[0-9a-f]{16,}$/i.test(seg))
+                emit({ t: 'param', name: 'id', val: seg, url: url });
+        });
+    } catch (e) {}
+}
+
 function hookOkHttp() {
     try {
         var Client = Java.use('okhttp3.OkHttpClient');
         Client.newCall.implementation = function (request) {
-            try { recordHttp(request.method(), request.url().toString()); } catch (e) {}
+            try {
+                var u = request.url().toString();
+                recordHttp(request.method(), u);
+                harvestReq(request, u);
+            } catch (e) {}
             return this.newCall(request);
         };
         installed.push('okhttp3.OkHttpClient.newCall');
+        // Ответы: id/slug реальных сущностей приходят В ОТВЕТЕ (напр. список
+        // устройств для disallow-device). peekBody НЕ потребляет оригинал.
+        try {
+            var RespB = Java.use('okhttp3.Response$Builder');
+            RespB.build.implementation = function () {
+                var resp = this.build();
+                try {
+                    var ct = resp.header('Content-Type', '') || '';
+                    if (ct.indexOf('json') !== -1) {
+                        var txt = resp.peekBody(131072).string();
+                        if (txt && (txt.charAt(0) === '{' || txt.charAt(0) === '['))
+                            emitLeaves(JSON.parse(txt), resp.request().url().toString());
+                    }
+                } catch (e) {}
+                return resp;
+            };
+            installed.push('okhttp3.Response$Builder.build');
+        } catch (e) {}
         return true;
     } catch (e) {
         return false;      // класс ещё не загружен либо переименован R8

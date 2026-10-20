@@ -687,7 +687,7 @@ def _ensure_running(device, pkg, tries=3, non_interactive=False, report=None):
         return pid
     return None
 
-def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False, non_interactive=False):
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False, non_interactive=False, seed_path=None):
     """Возвращает namespace(run_key, preflight), замкнутый на пакет и Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
     только когда dx реально нужен (валидация overrides/fields, smali для openai-
@@ -696,6 +696,16 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
     import frida/trace здесь, а не на верху модуля — offline-пути должны работать
     без установленного frida."""
     import frida, time, trace, signal
+    # Карта параметров из шага сбора (trace.py --params): листья name/val/url.
+    # Сеется в pool агента ОДИН раз после загрузки (дополняет пассивный harvest).
+    seed_items = []
+    if seed_path and Path(seed_path).exists():
+        for line in Path(seed_path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try: seed_items.append(json.loads(line))
+                except Exception: pass
+        print(f"[seed] карта параметров: {len(seed_items)} записей из {seed_path}", file=sys.stderr)
     _me = {}
     def me(cls, kind, name, sig):
         if skip_dx:                              # без DEX-валидации (кривой член упадёт на устройстве)
@@ -758,6 +768,12 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         if on_message:
             agent.on("message", on_message)
         agent.load()
+        if seed_items:
+            try:
+                n = agent.exports_sync.seed_pool(seed_items)
+                print(f"[seed] засеяно в pool: {n}", file=sys.stderr)
+            except Exception as e:
+                print(f"[seed] seedPool не удался: {e}", file=sys.stderr)
         if not attach:
             device.resume(pid)
         time.sleep(_SETTLE)   # иначе okhttp/build-хук не успевает встать (проверено)
@@ -1531,6 +1547,9 @@ def main():
     ap.add_argument("--all-reached", action="store_true",
                     help="активировать ВСЕ достижимые скрытые ключи (сканер), а не только "
                          "activation_exact — ступень 0 зовёт метод напрямую, точный путь не нужен")
+    ap.add_argument("--seed", type=Path,
+                    help="карта параметров из trace.py (--params): листья трафика для "
+                         "наполнения скрытых запросов реальными значениями вместо $stub")
     ap.add_argument("--recurse-args", action="store_true",
                     help="stage0: аргументы рекурсивно из arg_sources, $stub на user-input листьях (тир synthesized)")
     ap.add_argument("--stages", default="0,1,2",
@@ -1595,7 +1614,7 @@ def main():
         plans = json.loads(args.plans_file.read_text(encoding="utf-8"))
     runner = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan,
                                 paths, args.skip_dx, plans, args.recurse_args, args.attach,
-                                args.non_interactive)
+                                args.non_interactive, args.seed)
     total = len(recs)
     print(f"[активация] ключей к вызову: {total}", file=sys.stderr)
     # Case-1: mech/stage-0 (call_retrofit) минтит прокси через retrofit2.Retrofit.
