@@ -1091,63 +1091,6 @@ def _has_stub_marker(url, body):
     return False
 
 
-def _resp_envelope_error(body):
-    """Ошибка уровня ПРИЛОЖЕНИЯ в теле (многие API, в т.ч. ivi, отдают HTTP 200 и
-    кладут реальный статус в тело: {"error":{"code":400,"message":...}}). Возвращает
-    строку-ошибку или None. Распознаёт error/errors/status=error/code>=400."""
-    if not body or not body.strip().startswith("{"):
-        return None
-    try:
-        o = json.loads(body)
-    except Exception:
-        return None
-    if not isinstance(o, dict):
-        return None
-    err = o.get("error")
-    if isinstance(err, dict):
-        return str(err.get("message") or err.get("user_message") or err.get("code") or "error")
-    if err:
-        return str(err)
-    if o.get("errors"):
-        return str(o["errors"])[:120]
-    if str(o.get("status", "")).lower() in ("error", "fail", "failed"):
-        return str(o.get("message") or o.get("status"))
-    c = o.get("code")
-    if isinstance(c, int) and c >= 400:
-        return str(o.get("message") or c)
-    return None
-
-
-def _resp_ok(x):
-    """Сервер РЕАЛЬНО принял: HTTP 2xx И в теле нет ошибки-envelope. HTTP-статус
-    один недостаточен — ivi отдаёт 200 с {"error":{"code":400}}."""
-    st = x.get("status") or 0
-    if not (200 <= st < 300):
-        return False
-    return _resp_envelope_error(x.get("body") or "") is None
-
-
-def _resp_err(x):
-    """Короткая причина отказа для дампа: envelope-ошибка из тела, иначе HTTP-статус."""
-    e = _resp_envelope_error(x.get("body") or "")
-    if e:
-        return f"{x.get('status')}/envelope: {e}"
-    return f"HTTP {x.get('status')}: {(x.get('body') or '')[:120]}"
-
-
-def _check_resp_oracle():
-    # HTTP 200 + envelope-ошибка ivi → НЕ принят
-    iviErr = '{"error":{"message":"app_version parameter is required","code":400}}'
-    assert not _resp_ok({"status": 200, "body": iviErr})
-    assert "app_version" in _resp_err({"status": 200, "body": iviErr})
-    # HTTP 200 + нормальное тело → принят
-    assert _resp_ok({"status": 200, "body": '{"result":{"id":5}}'})
-    assert _resp_ok({"status": 204, "body": None})
-    # HTTP 4xx → не принят
-    assert not _resp_ok({"status": 400, "body": '{"x":1}'})
-    print("  resp_oracle ok")
-
-
 def report(results):
     """HTTP-аналог Таблицы IV ICSE 2025. ЧЕСТНАЯ метрика по факту снимка:
     (а) достижим / (б1) app-built с реальными данными / (в) synthesized (тело
@@ -1182,8 +1125,6 @@ def report(results):
                 return rq["response"]
         return None
     resps = [(r["key"].split("->")[-1], _resp(r)) for r in results if _resp(r)]
-    accepted = sum(1 for _, x in resps if _resp_ok(x))
-    rejected = [(k, x) for k, x in resps if not _resp_ok(x)]
     L = [f"Всего ключей: {n}",
          f"Форс-вызов дошёл до Retrofit-метода: {reached}/{n}   |   не дошёл: {n - reached}/{n}",
          "  (это вход в интерфейс-прокси; НЕ гарантирует запрос на провод —",
@@ -1195,10 +1136,7 @@ def report(results):
          f"  (а)  тело бинарное (protobuf) / пустое:           {wire - b1 - synth}",
          f"  из matched: наполнено реальным из персистентного стора (сессия/uid/device): {store_n}",
          "",
-         f"ОРАКУЛ — ответ сервера снят: {len(resps)}/{wire}   принял (2xx): {accepted}   "
-         f"отверг (4xx/5xx): {len(rejected)}",
-         "  (принял = тело прошло валидацию сервера; отверг = чаще всего назван "
-         "недостающий/невалидный параметр, см. дамп ниже)",
+         f"Ответ сервера снят (сырая улика, БЕЗ вердикта): {len(resps)}/{wire}  (status+тело, см. дамп)",
          "",
          "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
          f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
@@ -1224,9 +1162,9 @@ def report(results):
     if dump:
         L += ["", "Сформированные запросы ([а]=пусто/болванка / [б1]=реальные app-данные / "
               "[в]=наполнено заглушками):"] + dump
-    if rejected:
-        rd = [f"  {k}: {_resp_err(x)}" for k, x in rejected]
-        L += ["", "ОТВЕТЫ-ОТКАЗЫ сервера (какого параметра не хватает / что невалидно):"] + rd
+    if resps:
+        rd = [f"  [{x.get('status')}] {k}: {(x.get('body') or '')[:160]}" for k, x in resps]
+        L += ["", "ОТВЕТЫ СЕРВЕРА (сырая улика — status + тело, без механического вердикта):"] + rd
     return "\n".join(L)
 
 
@@ -1633,7 +1571,6 @@ def _selfcheck(apk=None):
     _check_staging()
     _check_arg_synth()
     _check_params_real()
-    _check_resp_oracle()
     _check_report()
     if apk is not None:
         if load_apk is None:
