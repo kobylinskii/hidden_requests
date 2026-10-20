@@ -1061,6 +1061,12 @@ def report(results):
     def _matched(r):
         return any((s.get("request") or {}).get("matched") for s in r.get("stages", []))
     wire = sum(1 for r in results if _matched(r))
+    # ключи, где ХОТЯ БЫ ОДНО поле наполнено реальным значением из персистентного
+    # стора (SharedPreferences/DataStore) — сессионный тир +Data (token/uid/device).
+    def _store_filled(r):
+        return any("←store:" in f
+                   for s in r.get("stages", []) for f in ((s.get("request") or {}).get("filled") or []))
+    store_n = sum(1 for r in results if _store_filled(r))
     L = [f"Всего ключей: {n}",
          f"Форс-вызов дошёл до Retrofit-метода: {reached}/{n}   |   не дошёл: {n - reached}/{n}",
          "  (это вход в интерфейс-прокси; НЕ гарантирует запрос на провод —",
@@ -1070,6 +1076,7 @@ def report(results):
          f"  (б1) РЕАЛЬНЫЕ app-данные (без заглушек):          {b1}",
          f"  (в)  synthesized ($stub-заглушки):               {synth}",
          f"  (а)  тело бинарное (protobuf) / пустое:           {wire - b1 - synth}",
+         f"  из matched: наполнено реальным из персистентного стора (сессия/uid/device): {store_n}",
          "",
          "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
          f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",

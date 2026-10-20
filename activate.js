@@ -25,15 +25,77 @@ function recordHarvest(obj) {
     for (var k in obj) {
         var v = obj[k];
         if (v !== null && typeof v === 'object') { recordHarvest(v); }
-        else if ((typeof v === 'string' && v !== '') ||
+        else if ((typeof v === 'string' && v !== '' && v !== 'stub') ||
                  (typeof v === 'number' && v !== 0) || typeof v === 'boolean') {
             harvest[k] = v;   // последнее непустое — обычно самое свежее (напр. свежий токен)
-        }
+        }                     // наш $stub-плейсхолдер ('stub') в пул НЕ берём
     }
 }
 
-// Наполнить пустые поля JSON-тела реальными значениями из harvest по имени поля.
-// Возвращает {changed:bool, filled:[имена], obj} — app-agnostic подстановка.
+// ── Harvest из ПЕРСИСТЕНТНЫХ сторов (SharedPreferences/DataStore) ──────────────
+// Реальные сессионные значения (token/uid/device_id) приложение хранит на диске и
+// держит в куче ПОСЛЕ логина — в отличие от per-action DTO они НЕ транзиентны.
+// Собираем все пары ключ→значение из живых сторов; матчим с пустыми полями запроса
+// по НОРМАЛИЗОВАННОМУ имени (ключи prefs вроде `pref_session_data` не совпадают с
+// полем `session` буквально, но совпадают после нормализации). App-agnostic:
+// перечисляем стандартные Android/Jetpack-классы, без знания классов приложения.
+var storeDump = {}, _storesDone = false;
+function normKey(s) {               // pref_session_data → sessiondata; PREF_DEVICE_ID_…_FROM_SERVER → deviceid…
+    return String(s).toLowerCase()
+        .replace(/^pref[_.]?/, '').replace(/_from_server$/, '').replace(/[^a-z0-9]/g, '');
+}
+function _addStore(k, v) {
+    if (k === null || k === undefined || v === null || v === undefined) return;
+    var cls; try { cls = v.getClass().getName(); } catch (e) { cls = ''; }
+    if (cls === 'java.lang.Boolean') return;        // флаги (shown-tip и т.п.) — не данные
+    var vs; try { vs = v.toString(); } catch (e) { return; }
+    if (!vs || !vs.length || vs === 'stub') return;
+    var nk = normKey(k);
+    if (nk && !(nk in storeDump)) storeDump[nk] = { val: vs, orig: String(k) };
+}
+function harvestStores() {
+    // SharedPreferences (вкл. EncryptedSharedPreferences — getAll() отдаёт расшифрованное)
+    ['android.app.SharedPreferencesImpl',
+     'androidx.security.crypto.EncryptedSharedPreferences'].forEach(function (cn) {
+        try { jclass(cn); } catch (e) { return; }
+        Java.choose(cn, { onMatch: function (sp) {
+            try { var all = sp.getAll(), it = all.keySet().iterator();
+                while (it.hasNext()) { var key = it.next(); _addStore(key ? key.toString() : null, all.get(key)); }
+            } catch (e) {}
+        }, onComplete: function () {} });
+    });
+    // DataStore Preferences (best-effort: токен может быть здесь, напр. TNT refreshToken)
+    ['androidx.datastore.preferences.core.MutablePreferences',
+     'androidx.datastore.preferences.core.PreferencesMap'].forEach(function (cn) {
+        try { jclass(cn); } catch (e) { return; }
+        Java.choose(cn, { onMatch: function (p) {
+            try { var m = p.asMap(), it = m.keySet().iterator();
+                while (it.hasNext()) { var key = it.next();
+                    var name; try { name = key.getName(); } catch (e) { name = key ? key.toString() : null; }
+                    _addStore(name, m.get(key)); }
+            } catch (e) {}
+        }, onComplete: function () {} });
+    });
+}
+function ensureStoreHarvest() { if (_storesDone) return; _storesDone = true; try { harvestStores(); } catch (e) {} }
+
+// Fuzzy-поиск значения стора по имени поля запроса (нормализованное совпадение).
+function storeFuzzy(fieldName) {
+    var fn = normKey(fieldName);
+    if (fn.length < 3) return null;                 // слишком короткое имя → шумный матч
+    var best = null, bestLen = 0;
+    for (var nk in storeDump) {
+        if (nk === fn || nk.indexOf(fn) !== -1 || fn.indexOf(nk) !== -1) {
+            var ov = Math.min(nk.length, fn.length);   // предпочитаем самое длинное пересечение
+            if (ov > bestLen) { bestLen = ov; best = storeDump[nk]; }
+        }
+    }
+    return best;                                    // {val, orig} | null
+}
+
+// Наполнить пустые/заглушечные поля тела реальными значениями. Приоритет: точное
+// имя из сетевого harvest, затем fuzzy из персистентного стора. filled помечает
+// store-источник (артефакт ВКР). App-agnostic: только имена полей.
 function fillFromHarvest(obj, filled) {
     var changed = false;
     if (obj === null || typeof obj !== 'object') return changed;
@@ -41,8 +103,13 @@ function fillFromHarvest(obj, filled) {
         var v = obj[k];
         if (v !== null && typeof v === 'object') {
             if (fillFromHarvest(v, filled)) changed = true;
-        } else if (v === '' && typeof harvest[k] === 'string' && harvest[k] !== '') {
-            obj[k] = harvest[k]; filled.push(k); changed = true;
+        } else if (v === '' || v === 'stub') {      // пустое ИЛИ наш $stub-плейсхолдер
+            if (typeof harvest[k] === 'string' && harvest[k] !== '' && harvest[k] !== 'stub') {
+                obj[k] = harvest[k]; filled.push(k); changed = true;             // точное имя (трафик)
+            } else {
+                var s = storeFuzzy(k);
+                if (s) { obj[k] = s.val; filled.push(k + '←store:' + s.orig); changed = true; }
+            }
         }
     }
     return changed;
@@ -585,15 +652,37 @@ function patchForced(req) {
     try { url = req.url().toString(); } catch (e) { return { req: req }; }
     if (url.indexOf(cap.path) === -1) return { req: req };
     var body = bodyOf(req);
-    if (!body || body.charAt(0) !== '{') return { req: req, body: body };
-    var obj; try { obj = JSON.parse(body); } catch (e) { return { req: req, body: body }; }
+    if (!body) return { req: req, body: body };
+    ensureStoreHarvest();                       // лениво снять персистентные сторы (один раз)
+    // Тело бывает JSON ({...}) и form-urlencoded (a=stub&b=&c=x) — поддерживаем оба.
+    var isJson = body.charAt(0) === '{';
+    var obj, isForm = false;
+    if (isJson) {
+        try { obj = JSON.parse(body); } catch (e) { return { req: req, body: body }; }
+    } else if (body.indexOf('=') !== -1) {
+        isForm = true; obj = {};
+        body.split('&').forEach(function (p) {
+            var i = p.indexOf('='); if (i < 0) return;
+            try { obj[decodeURIComponent(p.slice(0, i))] = decodeURIComponent(p.slice(i + 1)); }
+            catch (e) { obj[p.slice(0, i)] = p.slice(i + 1); }
+        });
+    } else {
+        return { req: req, body: body };
+    }
     var filled = [];
     if (!fillFromHarvest(obj, filled)) return { req: req, body: body };
     try {
-        var json = JSON.stringify(obj);
+        var outBody;
+        if (isForm) {
+            var parts = [];
+            for (var fk in obj) parts.push(encodeURIComponent(fk) + '=' + encodeURIComponent(obj[fk]));
+            outBody = parts.join('&');
+        } else {
+            outBody = JSON.stringify(obj);
+        }
         var ct = req.body().contentType();   // сохранить media type
         var RequestBody = Java.use('okhttp3.RequestBody');
-        var bytes = Java.use('java.lang.String').$new(json).getBytes('UTF-8');
+        var bytes = Java.use('java.lang.String').$new(outBody).getBytes('UTF-8');
         var nb;
         // okhttp менял сигнатуру RequestBody.create между версиями — пробуем обе.
         try { nb = RequestBody.create(ct, bytes); }
@@ -601,7 +690,7 @@ function patchForced(req) {
         _inPatch = true;   // re-entrancy guard: .build() ниже — тот же хук
         var nr = req.newBuilder().method(req.method(), nb).build();
         _inPatch = false;
-        return { req: nr, body: json, filled: filled };
+        return { req: nr, body: outBody, filled: filled };
     } catch (e) { _inPatch = false; return { req: req, body: body }; }
 }
 var _inPatch = false;
