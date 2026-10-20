@@ -623,7 +623,7 @@ def _wait_past_splash(device, pkg, timeout=60):
         _t.sleep(2)
     return False
 
-def _ensure_running(device, pkg, tries=3, non_interactive=False):
+def _ensure_running(device, pkg, tries=3, non_interactive=False, report=None):
     """attach-режим без перезапуска: вернуть pid ЖИВОГО процесса — между ключами
     приложение НЕ перезапускается, куча переиспользуется. Если процесс УПАЛ
     (форс сломал приложение) — поднять СВЕЖИМ (force-stop + LAUNCHER) и, если
@@ -654,7 +654,9 @@ def _ensure_running(device, pkg, tries=3, non_interactive=False):
         # сплеше/деоптимизации: форс в этот момент роняет сессию. Ждём основной
         # экран (мгновенно, если уже на нём).
         _wait_past_splash(device, pkg)
-        return pid
+        return pid                               # нашли живой процесс — не перезапускали
+    if report is not None:
+        report["relaunched"] = True              # дальше — поднимаем свежим (cold после краха)
     interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
     for _ in range(tries):
         subprocess.run(["adb", "-s", device.id, "shell", "am", "force-stop", pkg],
@@ -831,9 +833,21 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         _timedout = {"v": False}
         def _watchdog():
             _timedout["v"] = True
+            # 1) убить процесс → заблокированный RPC падает (VM жива, завис только app).
+            killed = False
             try:
-                if pid is not None: device.kill(pid)
+                if pid is not None: device.kill(pid); killed = True
             except Exception: pass
+            # 2) device.kill упал → устройство могло флапнуть в offline: переподключить
+            # adb и повторить (оживляет флап, НЕ оживляет жёсткий фриз VM).
+            if not killed and pid is not None:
+                import subprocess as _sp
+                _sp.run(["adb", "connect", device.id], capture_output=True, text=True)
+                try: device.kill(pid)
+                except Exception: pass
+            # 3) detach тоже рвёт зависший arm()-RPC ('script destroyed'). ЖЁСТКИЙ фриз
+            # VM посреди RPC здесь не лечится (device недостижим) — на этот случай
+            # нужен ВНЕШНИЙ таймаут процесса (драйвер: subprocess timeout), не watchdog.
             try:
                 if session is not None: session.detach()
             except Exception: pass
@@ -841,8 +855,9 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
 
         # _ensure_running ДО watchdog: он может ждать ввода человека (логин+пинкод
         # после краха, если не non_interactive) неопределённо долго.
+        _er = {}
         if attach:
-            pid = _ensure_running(device, pkg, non_interactive=non_interactive)
+            pid = _ensure_running(device, pkg, non_interactive=non_interactive, report=_er)
         setup_exc = []
         try:
             if attach and pid is None:
@@ -895,6 +910,11 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 except Exception: pass
         if _timedout["v"]:
             out["timeout"] = True
+        if _er.get("relaunched"):
+            # приложение было поднято свежим (после краха/первого ключа) → этот ключ
+            # прогнан на ХОЛОДНОЙ куче; warm/логин-состояние потеряно (методологич.
+            # неоднородность: холодный старт ⇒ часть feature-Retrofit'ов не создана).
+            out["cold_after_crash"] = True
         return out
 
     return types.SimpleNamespace(run_key=run_key_dev, preflight=preflight)
@@ -1612,7 +1632,16 @@ def main():
 
     _stages = tuple(int(x) for x in str(args.stages).split(",") if x.strip() != "")
     for i, r in enumerate(recs, 1):
-        res = runner.run_key(r, _stages)
+        try:
+            res = runner.run_key(r, _stages)
+        except Exception as e:
+            # Изоляция ключа: катастрофа внутри run_key_dev (напр. _ensure_running
+            # до внутреннего try, флап adb → ValueError в _pidof) НЕ должна ронять
+            # весь прогон — синтезируем запись-ошибку и идём дальше (jsonl цел).
+            res = {"key": r["key"], "reached": False, "activated_real": False,
+                   "min_stage": None, "stages": [{"stage": _stages[0] if _stages else 0,
+                   "valid": False, "exceptions": [f"run_key fatal: {e}"],
+                   "fired": False, "real_params": False, "request": None}]}
         results.append(res)
         if outf:
             outf.write(json.dumps(res, ensure_ascii=False) + "\n"); outf.flush()
