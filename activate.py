@@ -513,7 +513,13 @@ def make_plan(rec, stage, recurse_args=False):
     p = {"key": key, "stage": stage, "overrides": [], "fields": [], "args": [],
          "raw_js": None, "rationale": ""}
     if stage == 0:
-        p["trigger"] = {"kind": "call_retrofit", "cls": cls, "method": method, "sig": "*"}
+        # Сигнатура из arg_types — чтобы pickOverload выбрал нужную перегрузку (иначе
+        # frida: «has more than one overload»). Continuation в arg_types нет (срез даёт
+        # логические параметры) — pickOverload доматчивает suspend-хвост сам. return=V
+        # не важен (pickOverload смотрит только типы аргументов).
+        at = rec.get("arg_types") or []
+        sig = ("(" + "".join(at) + ")V") if at else "*"
+        p["trigger"] = {"kind": "call_retrofit", "cls": cls, "method": method, "sig": sig}
         p["args"] = _args_from_sources(rec) if recurse_args else _args_from_types(rec)
         p["rationale"] = ("mech stage0: прямой вызов Retrofit-метода, args "
                           + ("рекурсивно из arg_sources +$stub на user-input" if recurse_args
@@ -1115,19 +1121,23 @@ def report(results):
     traffic_n = sum(1 for r in results if _filled_any(r, "←traffic:"))  # T4 карта трафика
     # ЭТАП 1: почему ключ дошёл до Retrofit, но НЕ ушёл на провод. Классифицируем
     # по строкам исключений (бакеты — что чинить, чтобы поднять число отправленных).
-    def _why_not_sent(r):
+    def _why_fail(r):
         blob = " ".join(e for s in r.get("stages", []) for e in (s.get("exceptions") or []))
-        if "argument types do not match" in blob:               return "overload (типы аргументов не совпали)"
+        if "script has been destroyed" in blob:                 return "краш-каскад (процесс/агент умер)"
+        if "has more than one overload" in blob:                return "overload: не указана сигнатура"
+        if "argument types do not match" in blob:               return "overload: типы аргументов не совпали"
+        if "null array" in blob or "NullPointer" in blob or "checkNotNull" in blob:
+            return "NPE/null-аргумент"
         if ("CoroutineSingletons" in blob or "ExecutorCallbackCall" in blob
                 or "Continuation" in blob):                      return "suspend/Call не исполнен"
         if ("Unable to create" in blob or "converter" in blob
                 or "ServiceMethod" in blob):                     return "Retrofit converter"
-        if "NullPointer" in blob or "checkNotNull" in blob:      return "NPE (null в non-null)"
-        if "script has been destroyed" in blob:                 return "краш процесса"
         if r.get("timeout"):                                     return "таймаут (форс завис)"
         return "без исключения / прочее"
     not_sent = [r for r in results if r.get("reached") and not _matched(r)]
-    why = Counter(_why_not_sent(r) for r in not_sent)
+    why = Counter(_why_fail(r) for r in not_sent)
+    not_reached = [r for r in results if not r.get("reached")]
+    why_nr = Counter(_why_fail(r) for r in not_reached)
     # ОРАКУЛ: ответ сервера на форс-вызов. accepted = 2xx (сервер принял тело как
     # валидное); rejected = 4xx/5xx (чаще всего называет недостающий/невалидный
     # параметр). Это и есть «качество активации» — не «сформировали», а «приняли».
@@ -1145,8 +1155,10 @@ def report(results):
          f"  дошло до Retrofit, но НЕ ушло:   {len(not_sent)}/{n}" + ("  — причины:" if why else ""),]
     for name, c in why.most_common():
         L.append(f"       {c:>3}  {name}")
-    L += [f"  не дошло до Retrofit:            {n - reached}/{n}",
-         "",
+    L.append(f"  не дошло до Retrofit:            {n - reached}/{n}" + ("  — причины:" if why_nr else ""))
+    for name, c in why_nr.most_common():
+        L.append(f"       {c:>3}  {name}")
+    L += ["",
          "══ ЭТАП 2 — РЕАЛИЗАЦИЯ (из ушедших — с какими данными) ══",
          f"  (б1) реальные данные на проводе:  {b1}/{wire}",
          f"  (в)  уцелела заглушка ($stub):    {synth}/{wire}",

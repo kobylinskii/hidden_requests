@@ -292,6 +292,15 @@ var _EMPTY = { 'java.util.List': 'emptyList', 'java.util.Collection': 'emptyList
 function synthDefault(name) {
     if (name in _PRIM_DEFAULT) return _PRIM_DEFAULT[name];
     if (name === 'java.lang.String' || name === 'java.lang.CharSequence') return '';
+    if (name.charAt(0) === '[') {   // массив → ПУСТОЙ массив (иначе null → NPE "length of null array")
+        var el = name.slice(1), prim = {Z:'boolean',B:'byte',S:'short',C:'char',I:'int',J:'long',F:'float',D:'double'};
+        try {
+            if (el in prim) return Java.array(prim[el], []);
+            if (el.charAt(0) === 'L') return Java.array(el.slice(1, -1).replace(/\//g, '.'), []);
+            if (el.charAt(0) === '[') return Java.array(el, []);   // многомерный
+        } catch (e) {}
+        return null;
+    }
     try {
         if (name in _BOXED) return jclass(name).valueOf(_PRIM_DEFAULT[_BOXED[name]]);
         if (name in _EMPTY) return jclass('java.util.Collections')[_EMPTY[name]]();
@@ -315,10 +324,19 @@ function synthDefault(name) {
 // Выбор перегрузки (метода или конструктора C.$new) по JVM-сигнатуре параметров.
 function pickOverload(m, sig) {
     var want = sigArgClassNames(sig);
-    var ov = m.overloads;
+    if (want === null) return m;
+    var ov = m.overloads, CONT = 'kotlin.coroutines.Continuation';
+    // точное совпадение типов аргументов
     for (var i = 0; i < ov.length; i++) {
         var a = ov[i].argumentTypes.map(function (t) { return t.className; });
-        if (want !== null && a.length === want.length && a.join(',') === want.join(',')) return ov[i];
+        if (a.length === want.length && a.join(',') === want.join(',')) return ov[i];
+    }
+    // suspend: реальная перегрузка = want + хвостовой Continuation (в срезе его нет).
+    // invokeOverload дошлёт наш Continuation сам.
+    for (var j = 0; j < ov.length; j++) {
+        var b = ov[j].argumentTypes.map(function (t) { return t.className; });
+        if (b.length === want.length + 1 && b[want.length] === CONT &&
+            b.slice(0, want.length).join(',') === want.join(',')) return ov[j];
     }
     return m;
 }
