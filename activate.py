@@ -1035,16 +1035,21 @@ def report(results):
     b1 = sum(1 for v in lvl.values() if v[0] == "б1")
     synth = sum(1 for v in lvl.values() if v[0] == "в")
     dist = Counter(v[2] for v in lvl.values() if v[0] == "б1")
-    wire = b1 + synth   # ключи, чей ИСХОДЯЩИЙ запрос на нужный endpoint реально снят
+    # matched = у ключа есть снимок с совпавшим endpoint (запрос РЕАЛЬНО ушёл на
+    # нужный URL). Считаем по факту снимка, а НЕ как b1+synth: тело может быть
+    # бинарным (protobuf/gRPC pivi-эндпоинты ivi) или пустым — запрос всё равно ушёл.
+    def _matched(r):
+        return any((s.get("request") or {}).get("matched") for s in r.get("stages", []))
+    wire = sum(1 for r in results if _matched(r))
     L = [f"Всего ключей: {n}",
          f"Форс-вызов дошёл до Retrofit-метода: {reached}/{n}   |   не дошёл: {n - reached}/{n}",
          "  (это вход в интерфейс-прокси; НЕ гарантирует запрос на провод —",
          "   suspend/Call мог не исполниться, конвертер/NPE упасть до отправки)",
-         f"Исходящий запрос на нужный endpoint реально снят (matched): {wire}/{n}",
+         f"Исходящий запрос ушёл на нужный endpoint (matched): {wire}/{n}",
          "Из них — наполнение тела (взаимоисключающе, в сумме = matched):",
-         f"  (б1) РЕАЛЬНЫЕ app-данные (без заглушек): {b1}",
-         f"  (в)  synthesized ($stub-заглушки):       {synth}",
-         f"  (а)  matched, но тело пустое/болванка:   {wire - b1 - synth}",
+         f"  (б1) РЕАЛЬНЫЕ app-данные (без заглушек):          {b1}",
+         f"  (в)  synthesized ($stub-заглушки):               {synth}",
+         f"  (а)  тело бинарное (protobuf) / пустое:           {wire - b1 - synth}",
          "",
          "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
          f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
@@ -1451,7 +1456,7 @@ def _check_report():
     assert levels == {"a": "б1", "b": "в", "c": "а", "d": "а"}, levels
     assert "(б1) РЕАЛЬНЫЕ app-данные" in txt and "synthesized" in txt
     assert "дошёл до Retrofit-метода: 3/4" in txt and "не дошёл: 1/4" in txt  # 3 fired, 1 not (d)
-    assert "реально снят (matched): 2/4" in txt  # a(б1)+b(в) снятые, c/d — нет
+    assert "ушёл на нужный endpoint (matched): 3/4" in txt  # a,b,c matched; d — нет
     assert "ступень 0" in txt and "RQ3" in txt and "несопостав" in txt.lower()
     print("  report ok")
 
