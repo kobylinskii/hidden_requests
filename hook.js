@@ -56,11 +56,16 @@ var seenParam = {};
 var paramSent = 0;
 var PARAM_MAX = 50000;
 function emitParam(name, val, url) {
-    if (!name) return;
-    // CDN/медиа-ссылки (постеры/логотипы) — не параметры слота: слот берёт
-    // id/slug/токен, не абсолютный URL. Отсекаем — иначе уникальные URL каждого
-    // постера забивают карту (path/slug-значения не начинаются с http, сохранятся).
-    if (typeof val === 'string' && /^https?:\/\//i.test(val)) return;
+    if (!name || /^\d+$/.test(name)) return;      // имя-индекс массива ("0","1") — не поле
+    // Отсев заведомо-не-параметров (иначе забивают карту: ivi blurhash/dominant_color/
+    // title/synopsis — 30%+). Слот берёт id/slug/токен: без пробелов, без спецсимволов,
+    // не URL, не цвет, короткий. Числа/булевы проходят как есть.
+    if (typeof val === 'string') {
+        var v = val;
+        if (!v.length || v.length > 96) return;             // длинный текст (описание/синопсис)
+        if (/[\s#{}\[\]<>~*|^]/.test(v)) return;             // пробел(текст)/#(цвет)/blurhash-символы
+        if (/^https?:\/\//i.test(v)) return;                 // абсолютный URL (постер/лого)
+    }
     var k = name + '\u0000' + val;
     if (seenParam[k]) return;
     seenParam[k] = true;

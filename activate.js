@@ -4,7 +4,7 @@
  * один раз. hook.js грузится рядом и подтверждает факт вызова. */
 
 var proxyByIface = {};   // имя интерфейса -> живой прокси-инстанс (для call_retrofit)
-var cap = { key: null, path: '', hits: [] };   // path — ожидаемый endpoint ключа
+var cap = { key: null, path: '', hits: [], resp: null };   // path — ожидаемый endpoint; resp — ответ сервера на форс
 // КАРТА ПАРАМЕТРОВ ПРИЛОЖЕНИЯ (б2b): реальные значения, НАБЛЮДЁННЫЕ в трафике
 // (тела и URL запросов + тела ответов), для подстановки вместо $stub-заглушек.
 // Структура: normName -> [ {val, key, resource, shape} ] — несколько кандидатов
@@ -206,6 +206,7 @@ function fillFromHarvest(obj, filled, targetRes) {
 function coerce(v) {
     if (v === null || typeof v !== 'object') return v;
     if ('$null' in v) return null;
+    if ('$class' in v) { return jclass(v['$class']).class; }   // java.lang.Class литерал
     if ('$enum' in v) {
         var p = v['$enum'].split('.'); var f = p.pop();
         return jclass(p.join('.'))[f].value;
@@ -605,7 +606,7 @@ function doTrigger(t, args) {
 }
 
 if (typeof rpc !== 'undefined') rpc.exports = {
-    captureOn: function (key, pathHint) { cap.key = key; cap.path = pathHint || ''; cap.hits = []; },
+    captureOn: function (key, pathHint) { cap.key = key; cap.path = pathHint || ''; cap.hits = []; cap.resp = null; },
     // Засеять карту параметров из трафика, собранного на шаге сбора (trace.py):
     // items = [{name, val, url}]. Ресурс/форму считаем здесь (resourceOf/_poolAdd),
     // чтобы не дублировать логику на хосте. Дополняет пассивный рантайм-harvest.
@@ -641,7 +642,10 @@ if (typeof rpc !== 'undefined') rpc.exports = {
     },
     snapshot: function () {
         if (!cap.hits.length) return null;
-        for (var i = 0; i < cap.hits.length; i++) if (cap.hits[i].matched) return cap.hits[i];
+        for (var i = 0; i < cap.hits.length; i++) if (cap.hits[i].matched) {
+            if (cap.resp) cap.hits[i].response = cap.resp;   // ответ сервера-оракул
+            return cap.hits[i];
+        }
         // ни один не совпал с ожидаемым endpoint — это ЧУЖОЙ (фоновый) трафик
         // приложения, а не наш форс-вызов. Не отдаём его: иначе отчёт припишет
         // чужое тело имени ключа (ivi: pyrus/gettickets под 22 разными ключами).
@@ -830,11 +834,19 @@ function installOkHttpCapture(attemptsLeft) {
         RespB.build.implementation = function () {
             var resp = this.build();
             try {
+                var rurl = resp.request().url().toString();
                 var ct = resp.header('Content-Type', '') || '';
-                if (ct.indexOf('json') !== -1) {
-                    var txt = resp.peekBody(131072).string();
-                    if (txt && (txt.charAt(0) === '{' || txt.charAt(0) === '['))
-                        recordPool(JSON.parse(txt), resourceOf(resp.request().url().toString()));
+                var txt = (ct.indexOf('json') !== -1) ? resp.peekBody(131072).string() : null;
+                if (txt && (txt.charAt(0) === '{' || txt.charAt(0) === '['))
+                    recordPool(JSON.parse(txt), resourceOf(rurl));
+                // Ответ на НАШ форс-вызов (url совпал с ожидаемым endpoint) — ОРАКУЛ:
+                // статус + тело (сервер в теле называет недостающий/невалидный параметр).
+                if (cap.key && cap.path && cap.path !== '/' && rurl.indexOf(cap.path) !== -1) {
+                    var rb = txt;
+                    if (rb === null) { try { rb = resp.peekBody(8192).string(); } catch (e2) { rb = null; } }
+                    cap.resp = { status: resp.code(), url: rurl,
+                                 body: rb ? String(rb).slice(0, 2000) : null };
+                    try { send({ t: 'captured_response', key: cap.key, resp: cap.resp }); } catch (e3) {}
                 }
             } catch (e) {}
             return resp;

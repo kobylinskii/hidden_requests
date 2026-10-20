@@ -402,6 +402,11 @@ def _src_val(src, recipes, ftype):
         return best if best is not None else _stub_val(ftype)
     if k == "const":
         v = src.get("value")
+        # const-class (литерал класса): JacksonJsoner.getFieldsParameter(Model.class)
+        # и подобные рефлексивные продюсеры принимают java.lang.Class — передаём
+        # НАСТОЯЩИЙ класс, иначе $stub ломает продюсер (ivi: fields=stub → 400).
+        if ftype == "Ljava/lang/Class;" and isinstance(v, str) and v.startswith("L") and v.endswith(";"):
+            return {"$class": _fq(v)}
         if ftype.startswith(("L", "[")):
             # Объектный слот. Валиден только строковый литерал для String/
             # CharSequence/Object. Числовой const (const/4 v,#0) в объектный регистр —
@@ -824,7 +829,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         на real, терпимость к исключениям) переиспользуем из run_key."""
         stages = tuple(stages)
         session = pid = agent = None
-        seen = {"hit": False, "req": None}
+        seen = {"hit": False, "req": None, "resp": None}
 
         def _on_hook_msg(message, data):
             # fired — асинхронный ключ-точный оракул (его ставит хендлер, когда
@@ -840,6 +845,10 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                     h = p.get("hit") or {}
                     if h.get("matched") and h.get("key") == rec["key"]:
                         seen["req"] = h
+                # push-захват ОТВЕТА сервера на форс (оракул: статус + тело ошибки),
+                # спасает ответ, если процесс умрёт до snapshot()-RPC.
+                if p.get("t") == "captured_response" and p.get("key") == rec["key"]:
+                    seen["resp"] = p.get("resp")
 
         # WATCHDOG-ПОТОК (не SIGALRM!): форс-вызов может заблокировать frida-RPC
         # (метод ушёл в бесконечный/блокирующий вызов) — синхронный arm() не
@@ -905,6 +914,9 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             # snapshot потерян (процесс умер до RPC), но push-захват успел — берём его
             if snap is None and seen["req"] is not None:
                 snap = seen["req"]
+            # ответ сервера-оракул: из snapshot или из push (если процесс умер)
+            if snap is not None and not snap.get("response") and seen["resp"]:
+                snap["response"] = seen["resp"]
             real = fired and _params_real(plan, snap, rec)
             exc = (res.get("exceptions", []) if isinstance(res, dict) else []) + exc
             if _timedout["v"]:
@@ -1103,6 +1115,18 @@ def report(results):
         return any("←store:" in f
                    for s in r.get("stages", []) for f in ((s.get("request") or {}).get("filled") or []))
     store_n = sum(1 for r in results if _store_filled(r))
+    # ОРАКУЛ: ответ сервера на форс-вызов. accepted = 2xx (сервер принял тело как
+    # валидное); rejected = 4xx/5xx (чаще всего называет недостающий/невалидный
+    # параметр). Это и есть «качество активации» — не «сформировали», а «приняли».
+    def _resp(r):
+        for s in r.get("stages", []):
+            rq = s.get("request") or {}
+            if rq.get("matched") and rq.get("response"):
+                return rq["response"]
+        return None
+    resps = [(r["key"].split("->")[-1], _resp(r)) for r in results if _resp(r)]
+    accepted = sum(1 for _, x in resps if 200 <= (x.get("status") or 0) < 300)
+    rejected = [(k, x) for k, x in resps if not (200 <= (x.get("status") or 0) < 300)]
     L = [f"Всего ключей: {n}",
          f"Форс-вызов дошёл до Retrofit-метода: {reached}/{n}   |   не дошёл: {n - reached}/{n}",
          "  (это вход в интерфейс-прокси; НЕ гарантирует запрос на провод —",
@@ -1113,6 +1137,11 @@ def report(results):
          f"  (в)  synthesized ($stub-заглушки):               {synth}",
          f"  (а)  тело бинарное (protobuf) / пустое:           {wire - b1 - synth}",
          f"  из matched: наполнено реальным из персистентного стора (сессия/uid/device): {store_n}",
+         "",
+         f"ОРАКУЛ — ответ сервера снят: {len(resps)}/{wire}   принял (2xx): {accepted}   "
+         f"отверг (4xx/5xx): {len(rejected)}",
+         "  (принял = тело прошло валидацию сервера; отверг = чаще всего назван "
+         "недостающий/невалидный параметр, см. дамп ниже)",
          "",
          "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
          f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
@@ -1138,6 +1167,9 @@ def report(results):
     if dump:
         L += ["", "Сформированные запросы ([а]=пусто/болванка / [б1]=реальные app-данные / "
               "[в]=наполнено заглушками):"] + dump
+    if rejected:
+        rd = [f"  [{x.get('status')}] {k}: {(x.get('body') or '')[:160]}" for k, x in rejected]
+        L += ["", "ОТВЕТЫ-ОТКАЗЫ сервера (какого параметра не хватает / что невалидно):"] + rd
     return "\n".join(L)
 
 
@@ -1495,6 +1527,16 @@ def _check_arg_synth():
     rc2 = {"arg_types": ["I"], "arg_recipes": {},
            "arg_sources": [{"index": 0, "source": {"k": "const", "value": 5}}]}
     assert _args_from_sources(rc2)[0]["value"] == 5
+    # const-class литерал в слот java.lang.Class → $class (ivi getFieldsParameter)
+    rc3 = {"arg_types": ["Ljava/lang/Class;"], "arg_recipes": {},
+           "arg_sources": [{"index": 0, "source": {"k": "const", "value": "Lru/ivi/models/Broadcast;"}}]}
+    assert _args_from_sources(rc3)[0]["value"] == {"$class": "ru.ivi.models.Broadcast"}, \
+        _args_from_sources(rc3)[0]["value"]
+    # тот же литерал в String-слот НЕ class-ифицируется ($class только в Class-контексте)
+    rc4 = {"arg_types": ["Ljava/lang/String;"], "arg_recipes": {},
+           "arg_sources": [{"index": 0, "source": {"k": "const", "value": "Lru/ivi/models/Broadcast;"}}]}
+    v4 = _args_from_sources(rc4)[0]["value"]
+    assert not (isinstance(v4, dict) and "$class" in v4), v4
     print("  arg_synth ok")
 
 
