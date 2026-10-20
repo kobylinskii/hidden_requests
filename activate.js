@@ -104,8 +104,11 @@ function coerce(v) {
     }
     if ('$default' in v) return synthDefault(v['$default']);
     if ('$new' in v) {
-        var args = (v.args || []).map(coerce);
         var C = jclass(v['$new']);
+        // интерфейсный тип (DI-зависимость) — $new() кинул бы "cannot instantiate
+        // an interface"; отдаём нативную Proxy-заглушку (app-agnostic).
+        if (C.class.isInterface()) return ifaceStub(v['$new']);
+        var args = (v.args || []).map(coerce);
         var ctor = v.sig ? pickOverload(C.$new, v.sig) : C.$new;
         // receiver конструктора — сам класс C (не null): иначе frida-java-bridge
         // теряет class-handle ($borrowClassHandle of null).
@@ -138,6 +141,10 @@ function synthDefault(name) {
         if (name in _BOXED) return jclass(name).valueOf(_PRIM_DEFAULT[_BOXED[name]]);
         if (name in _EMPTY) return jclass('java.util.Collections')[_EMPTY[name]]();
         var C = jclass(name);
+        if (C.class.isInterface()) {            // интерфейс -> нативная Proxy-заглушка
+            var s = ifaceStub(name);
+            if (s !== null) return s;
+        }
         if (typeof C.values === 'function') {   // enum -> первая константа
             var vs = C.values();
             if (vs && vs.length) return vs[0];
@@ -230,6 +237,55 @@ function makeContinuation() {
     return _cont;
 }
 
+// Универсальная заглушка ПРОИЗВОЛЬНОГО интерфейса. DI-зависимости в конструкторах
+// Requester-классов приходят интерфейсными типами; frida C.$new() на интерфейсе
+// кидает "cannot instantiate an interface" и роняет весь форс-вызов (главный
+// блокер на ivi: 99 падений). Строим JDK-нативным Proxy.newProxyInstance — он
+// обслуживает ЛЮБОЙ интерфейс без перечисления методов (app-agnostic). Один общий
+// InvocationHandler: примитивы->дефолт, объекты->null (зависимость обычно лишь
+// сохраняется в поле; если её метод всё же дёрнут при сборке запроса — вернём
+// дефолт, а вызывающий код уже в try/catch).
+var _stubHandler = null, _ifaceStub = {};
+function stubHandler() {
+    if (_stubHandler !== null) return _stubHandler;
+    var Boolean = Java.use('java.lang.Boolean'), Integer = Java.use('java.lang.Integer'),
+        Long = Java.use('java.lang.Long'), Float = Java.use('java.lang.Float'),
+        Double = Java.use('java.lang.Double');
+    var H = Java.registerClass({
+        name: 'frida.ActivationStub',
+        implements: [Java.use('java.lang.reflect.InvocationHandler')],
+        methods: { invoke: function (proxy, method, args) {
+            var rt; try { rt = method.getReturnType().getName(); } catch (e) { return null; }
+            switch (rt) {
+                case 'boolean': return Boolean.valueOf(false);
+                case 'int': return Integer.valueOf(0);
+                case 'long': return Long.valueOf(0);
+                case 'float': return Float.valueOf(0);
+                case 'double': return Double.valueOf(0);
+                default: return null;   // void/объект/прочие примитивы (редкие)
+            }
+        } }
+    });
+    _stubHandler = H.$new();
+    return _stubHandler;
+}
+function ifaceStub(name) {
+    if (name in _ifaceStub) return _ifaceStub[name];
+    var out = null;
+    try {
+        var C = jclass(name);
+        if (C.class.isInterface()) {
+            var Proxy = Java.use('java.lang.reflect.Proxy');
+            var ld = C.class.getClassLoader();
+            if (ld === null) ld = Java.use('java.lang.ClassLoader').getSystemClassLoader();
+            out = Java.retain(Proxy.newProxyInstance(
+                ld, Java.array('java.lang.Class', [C.class]), stubHandler()));
+        }
+    } catch (e) {}
+    _ifaceStub[name] = out;
+    return out;
+}
+
 function argTypesOf(ov) {
     if (ov.argumentTypes) return ov.argumentTypes;
     if (ov.overloads && ov.overloads.length === 1) return ov.overloads[0].argumentTypes;
@@ -267,10 +323,20 @@ function mintProxies(clsName) {
         onMatch: function (r) { try { rets.push(Java.retain(r)); } catch (e) {} },
         onComplete: function () {}
     });
+    // Порядок кандидатов: основной API-хост приложения обслуживает НЕСКОЛЬКО
+    // feature-Retrofit'ов, одиночный сторонний SDK (pyrus/аналитика) — один. Сперва
+    // пробуем хосты с наибольшей частотой, чтобы форс уходил на реальный API, а не
+    // в SDK (app-agnostic: без хардкода имён хостов). При равенстве — исходный порядок.
+    var freq = {}, hostOf = rets.map(function (r) {
+        var h = ''; try { h = r.baseUrl().host().toString(); } catch (e) {}
+        freq[h] = (freq[h] || 0) + 1; return h;
+    });
+    var order = rets.map(function (_, i) { return i; })
+                    .sort(function (a, b) { return (freq[hostOf[b]] || 0) - (freq[hostOf[a]] || 0); });
     var proxies = [];
-    for (var i = 0; i < rets.length; i++) {
+    for (var k = 0; k < order.length; k++) {
         try {
-            var p = rets[i].create(iface);   // create() возвращает прокси; хук вешает оракул
+            var p = rets[order[k]].create(iface);   // create() возвращает прокси; хук вешает оракул
             if (p) proxies.push(Java.retain(p));
         } catch (e) {}
     }
@@ -296,6 +362,57 @@ function liveReceiver(clsName) {
         });
     } catch (e) {}
     return found;
+}
+
+// ── Форс-отправка результата вызова ──────────────────────────────────────────
+// Non-suspend Retrofit-методы возвращают Call/Observable/Single БЕЗ авто-отправки:
+// пока нет execute()/subscribe(), okhttp-запрос не строится (ivi: reached>0, но
+// matched=0). Форсим отправку по типу возврата (детект по имени реактивного класса
+// — app-agnostic). Запрос уходит асинхронно (своим диспатчером / фоновым потоком),
+// RPC-поток не блокируем; снимок берём после wait_t.
+var _noopCb = null;
+function noopCallback() {
+    if (_noopCb !== null) return _noopCb;
+    var C = Java.registerClass({
+        name: 'frida.ActivationCallback',
+        implements: [Java.use('retrofit2.Callback')],
+        methods: { onResponse: function () {}, onFailure: function () {} }
+    });
+    _noopCb = C.$new();
+    return _noopCb;
+}
+function safeUse(n) { try { return Java.use(n); } catch (e) { return null; } }
+function isA(obj, n) { var C = safeUse(n); try { return C !== null && C.class.isInstance(obj); } catch (e) { return false; } }
+function runAsync(fn) {
+    try {
+        var R = Java.registerClass({
+            implements: [Java.use('java.lang.Runnable')],
+            methods: { run: function () { try { fn(); } catch (e) {} } }
+        });
+        Java.use('java.lang.Thread').$new(R.$new()).start();
+    } catch (e) { try { fn(); } catch (e2) {} }   // не вышло поднять поток — синхронно
+}
+var _RX = ['io.reactivex.Single', 'io.reactivex.Observable', 'io.reactivex.Completable',
+           'io.reactivex.Maybe', 'io.reactivex.Flowable',
+           'io.reactivex.rxjava3.core.Single', 'io.reactivex.rxjava3.core.Observable',
+           'io.reactivex.rxjava3.core.Completable', 'io.reactivex.rxjava3.core.Maybe',
+           'io.reactivex.rxjava3.core.Flowable', 'rx.Observable', 'rx.Single'];
+function dispatchResult(r, ex) {
+    if (r === null || r === undefined) return;
+    var cn; try { cn = r.$className; } catch (e) { return; }
+    ex.push('ret: ' + cn);                        // диагностика типа возврата
+    if (isA(r, 'retrofit2.Call')) {               // Call → enqueue (async, не блокирует)
+        try { Java.cast(r, Java.use('retrofit2.Call')).enqueue(noopCallback()); }
+        catch (e) { ex.push('enqueue: ' + e); }
+        return;
+    }
+    for (var i = 0; i < _RX.length; i++) {        // RxJava → subscribe() на фоновом потоке
+        if (isA(r, _RX[i])) {
+            var rr = Java.retain(r), cls = _RX[i];
+            runAsync(function () { Java.cast(rr, Java.use(cls)).subscribe(); });
+            return;
+        }
+    }
 }
 
 function doTrigger(t, args) {
@@ -324,7 +441,12 @@ function doTrigger(t, args) {
     // invoke / trigger_entry: живой вызывающий из кучи → его код сам собирает
     // реальный DTO (уровень б1); фолбэк на $new() (пустое состояние), если
     // живого инстанса нет.
-    var recv = liveReceiver(t.cls) || C.$new();
+    // фолбэк без живого инстанса: интерфейс (вызывающий — абстракция, кода нет)
+    // → нативная Proxy-заглушка вместо C.$new() ("cannot instantiate an interface");
+    // конкретный класс → пустой инстанс.
+    var recv = liveReceiver(t.cls);
+    if (recv === null) recv = C.class.isInterface() ? ifaceStub(t.cls) : C.$new();
+    if (recv === null) throw new Error('нет приёмника для ' + t.cls);
     return invokeOverload(overloadBySig(C, t.method, t.sig), recv, args);
 }
 
@@ -344,10 +466,22 @@ rpc.exports = {
         });
         return JSON.stringify(r);
     },
+    baseUrls: function () {   // диагностика: baseUrl всех живых Retrofit-инстансов
+        var out = [];
+        Java.perform(function () {
+            try { Java.choose('retrofit2.Retrofit', {
+                onMatch: function (r) { try { out.push(r.baseUrl().toString()); } catch (e) {} },
+                onComplete: function () {} }); } catch (e) {}
+        });
+        return JSON.stringify(out);
+    },
     snapshot: function () {
         if (!cap.hits.length) return null;
         for (var i = 0; i < cap.hits.length; i++) if (cap.hits[i].matched) return cap.hits[i];
-        return cap.hits[0];   // ни один не совпал с ожидаемым путём — отдаём первый (advisory)
+        // ни один не совпал с ожидаемым endpoint — это ЧУЖОЙ (фоновый) трафик
+        // приложения, а не наш форс-вызов. Не отдаём его: иначе отчёт припишет
+        // чужое тело имени ключа (ivi: pyrus/gettickets под 22 разными ключами).
+        return null;
     },
     arm: function (planJson) {
         var plan = JSON.parse(planJson), ex = [];
@@ -360,7 +494,9 @@ rpc.exports = {
                                         .map(function (a) { return coerce(a.value); });
             } catch (e) { ex.push('args: ' + e); args = []; }
             if (plan.raw_js) { try { (1, eval)(plan.raw_js); } catch (e) { ex.push('raw_js: ' + e); } }
-            try { doTrigger(plan.trigger, args); } catch (e) { ex.push('trigger: ' + e); }
+            var tr = null;
+            try { tr = doTrigger(plan.trigger, args); } catch (e) { ex.push('trigger: ' + e); }
+            try { dispatchResult(tr, ex); } catch (e) { ex.push('dispatch: ' + e); }
         });
         return { exceptions: ex };
     }
@@ -429,8 +565,14 @@ function captureRequest(req, source, body, filled) {
         // matched только при СОДЕРЖАТЕЛЬНОМ hint: path '/' (или пустой) совпал бы
         // с любым проходящим трафиком приложения → поллюция, не наш форс-вызов.
         var m = (cap.path && cap.path !== '/') ? (url.indexOf(cap.path) !== -1) : false;
-        cap.hits.push({ key: cap.key, method: req.method(), url: url, body: body, source: source,
-                        filled: filled || [], matched: m });
+        var hit = { key: cap.key, method: req.method(), url: url, body: body, source: source,
+                    filled: filled || [], matched: m };
+        cap.hits.push(hit);
+        // PUSH-захват: эмитим matched-запрос СРАЗУ (не ждём snapshot()). Форс-вызов
+        // часто роняет приложение ПОСЛЕ отправки запроса, но ДО snapshot-RPC → без
+        // push 24 ключа ivi снимались в cap.hits, но терялись (процесс умер). Теперь
+        // Python получает его из on_message в момент снятия.
+        if (m) { try { send({ t: 'captured', hit: hit }); } catch (e) {} }
     } catch (e) {}
 }
 

@@ -581,6 +581,10 @@ def run_key(rec, stages, run_stage):
             out["activated_real"] = True
             out["min_stage"] = stage
             break
+        # [в]/[а]-matched уже снят на этой ступени: верхние ступени тело не улучшат
+        # (синтетика не станет реальнее) и лишь рискуют уронить приложение — выходим.
+        if (r.get("request") or {}).get("matched"):
+            break
     return out
 
 
@@ -628,6 +632,22 @@ def _ensure_running(device, pkg, tries=3, non_interactive=False):
     по Enter продолжить. Не-TTY (фон) — просто ждём инициализацию. None — не
     удалось поднять."""
     import subprocess, time as _t
+    # Устройство офлайн (Genymotion подвис/ушёл) — force-stop/monkey по мёртвой VM
+    # бессмысленны и УСУГУБЛЯЮТ фриз; пробуем мягко переподключить, не оживает —
+    # сдаёмся быстро (None), чтобы не грид-фейлить 100 ключей по дохлой VM.
+    def _online():
+        r = subprocess.run(["adb", "devices"], capture_output=True, text=True)
+        return any(device.id in ln and ln.split()[-1] == "device"
+                   for ln in (r.stdout or "").splitlines() if ln.split())
+    if not _online():
+        for _ in range(5):
+            subprocess.run(["adb", "disconnect", device.id], capture_output=True, text=True)
+            subprocess.run(["adb", "connect", device.id], capture_output=True, text=True)
+            _t.sleep(3)
+            if _online():
+                break
+        else:
+            return None   # VM мертва — ручной рестарт (adb не оживляет фриз)
     pid = _pidof(device, pkg)
     if pid is not None:
         # Уже запущен — но мог быть только что поднят (scan.sh шаг 6) и висеть на
@@ -716,7 +736,19 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         прокси, несёт key-exact оракул ({t:'retrofit',cls,m}) и снимает запрос;
         hook.js НЕ грузим — двойной хук Proxy.newProxyInstance роняет приложение."""
         if attach:
-            session = device.attach(pid)
+            # Гонка: форс уронил приложение, _ensure_running вернул pid, но процесс
+            # исчез к моменту attach (frida.ProcessNotFoundError). Переподнимаем и
+            # повторяем — иначе одна такая гонка роняет ВЕСЬ прогон (было на ключе 14).
+            session = None
+            for _ in range(3):
+                try:
+                    session = device.attach(pid); break
+                except frida.ProcessNotFoundError:
+                    pid = _ensure_running(device, pkg, non_interactive=non_interactive)
+                    if pid is None:
+                        raise
+            if session is None:
+                session = device.attach(pid)   # последняя попытка (пробросит реальную ошибку)
         else:
             pid = device.spawn([pkg])
             session = device.attach(pid)
@@ -745,6 +777,11 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         try:
             session, pid, agent = _open(pid, None)
             info = json.loads(agent.exports_sync.retrofit_probe())
+        except frida.ProcessNotFoundError as e:
+            # Устойчивая гонка attach на старте — preflight лишь оптимизация (fail-fast
+            # на обфускации Retrofit). Не роняем прогон: цикл ключей сам покажет.
+            print(f"[preflight] пропущен (гонка attach: {e})", file=sys.stderr)
+            return
         finally:
             if session is not None:
                 try: session.detach()
@@ -769,15 +806,22 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         на real, терпимость к исключениям) переиспользуем из run_key."""
         stages = tuple(stages)
         session = pid = agent = None
-        seen = {"hit": False}
+        seen = {"hit": False, "req": None}
 
         def _on_hook_msg(message, data):
             # fired — асинхронный ключ-точный оракул (его ставит хендлер, когда
             # форс-вызов дёргает Proxy.invoke нужного cls->method); валиден даже
             # если приложение умерло до snapshot.
             if message.get("type") == "send":
-                if _retrofit_hit(message.get("payload") or {}, rec["key"]):
+                p = message.get("payload") or {}
+                if _retrofit_hit(p, rec["key"]):
                     seen["hit"] = True
+                # push-захват matched-запроса: приходит из captureRequest СРАЗУ при
+                # снятии, спасает запрос, если процесс умрёт до snapshot()-RPC.
+                if p.get("t") == "captured":
+                    h = p.get("hit") or {}
+                    if h.get("matched") and h.get("key") == rec["key"]:
+                        seen["req"] = h
 
         # WATCHDOG-ПОТОК (не SIGALRM!): форс-вызов может заблокировать frida-RPC
         # (метод ушёл в бесконечный/блокирующий вызов) — синхронный arm() не
@@ -817,6 +861,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 return {"stage": stage, "valid": False, "exceptions": setup_exc or ["нет сессии"],
                         "fired": False, "real_params": False, "request": None, "plan": plan}
             seen["hit"] = False   # оракул на ступень (captureOn чистит cap.hits — нет утечки снимка)
+            seen["req"] = None    # push-захват на ступень
             res, snap, exc = {}, None, []
             try: agent.exports_sync.capture_on(rec["key"], (paths or {}).get(rec["key"], ""))
             except Exception as e: exc.append("capture_on: " + str(e))
@@ -826,6 +871,9 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             try: snap = agent.exports_sync.snapshot()
             except Exception as e: exc.append("snapshot: " + str(e))
             fired = seen["hit"]
+            # snapshot потерян (процесс умер до RPC), но push-захват успел — берём его
+            if snap is None and seen["req"] is not None:
+                snap = seen["req"]
             real = fired and _params_real(plan, snap, rec)
             exc = (res.get("exceptions", []) if isinstance(res, dict) else []) + exc
             if _timedout["v"]:
@@ -861,6 +909,11 @@ def _has_real_data(url, body):
     for _, v in parse_qsl(urlparse(url or "").query, keep_blank_values=True):
         if v.strip():
             return True
+    if body and not body.strip().startswith("{") and "=" in body:
+        # form-urlencoded тело (a=stub&b=stub) — частый не-JSON формат (ivi AuthApi)
+        for _, v in parse_qsl(body, keep_blank_values=True):
+            if v.strip():
+                return True
     if body and body.strip().startswith("{"):
         try:
             obj = json.loads(body)
@@ -932,19 +985,6 @@ def _check_params_real():
     print("  params_real ok")
 
 
-def _best_snap(r):
-    """Представительный снимок ключа: matched приоритетно, иначе первый с url."""
-    snap = None
-    for s in r.get("stages", []):
-        rq = s.get("request") or {}
-        if rq.get("url"):
-            if rq.get("matched"):
-                return rq
-            if snap is None:
-                snap = rq
-    return snap
-
-
 def _honest_level(r):
     """Честный уровень ключа ПО ФАКТУ снимка (не по плану): ('б1'|'в'|'а', snap,
     stage). matched-снимок (url содержит endpoint; hint '/' отсечён в activate.js)
@@ -952,18 +992,15 @@ def _honest_level(r):
     нашей заглушкой ($stub в плане / маркер "stub" в теле) → 'в' synthesized.
     Иначе (не matched / тело пусто) → 'а'."""
     msnap = mstage = mplan = None
-    first = None
     for s in r.get("stages", []):
         rq = s.get("request") or {}
-        if not rq.get("url"):
-            continue
-        if first is None:
-            first = rq
-        if rq.get("matched"):
+        if rq.get("url") and rq.get("matched"):
             msnap, mstage, mplan = rq, s.get("stage"), (s.get("plan") or {})
             break
+    # НЕ matched снимок = чужой фоновый трафик, не наш форс-вызов: не выдаём его
+    # за тело ключа (иначе отчёт лжёт — ivi приписывал pyrus/gettickets 22 ключам).
     if msnap is None:
-        return ("а", first, None)
+        return ("а", None, None)
     url, body = msnap.get("url", "") or "", msnap.get("body", "") or ""
     if not _has_real_data(url, body):
         return ("а", msnap, mstage)
@@ -978,7 +1015,12 @@ def _has_stub_marker(url, body):
     if body and '"stub"' in body:
         return True
     from urllib.parse import urlparse, parse_qsl
-    return any(v == "stub" for _, v in parse_qsl(urlparse(url or "").query, keep_blank_values=True))
+    if any(v == "stub" for _, v in parse_qsl(urlparse(url or "").query, keep_blank_values=True)):
+        return True
+    # form-urlencoded тело: значение параметра == 'stub' (наша $stub-String)
+    if body and not body.strip().startswith("{") and "=" in body:
+        return any(v == "stub" for _, v in parse_qsl(body, keep_blank_values=True))
+    return False
 
 
 def report(results):
@@ -993,12 +1035,16 @@ def report(results):
     b1 = sum(1 for v in lvl.values() if v[0] == "б1")
     synth = sum(1 for v in lvl.values() if v[0] == "в")
     dist = Counter(v[2] for v in lvl.values() if v[0] == "б1")
+    wire = b1 + synth   # ключи, чей ИСХОДЯЩИЙ запрос на нужный endpoint реально снят
     L = [f"Всего ключей: {n}",
-         f"Вызвано (запрос ушёл): {reached}/{n}   |   НЕ вызвано: {n - reached}/{n}",
-         "Из ВЫЗВАННЫХ — наполнение тела (взаимоисключающе, в сумме = вызвано):",
-         f"  (б1) РЕАЛЬНЫЕ app-данные (matched, без заглушек): {b1}",
-         f"  (в)  synthesized ($stub-заглушки):                {synth}",
-         f"  (а)  пустое тело / болванка:                      {reached - b1 - synth}",
+         f"Форс-вызов дошёл до Retrofit-метода: {reached}/{n}   |   не дошёл: {n - reached}/{n}",
+         "  (это вход в интерфейс-прокси; НЕ гарантирует запрос на провод —",
+         "   suspend/Call мог не исполниться, конвертер/NPE упасть до отправки)",
+         f"Исходящий запрос на нужный endpoint реально снят (matched): {wire}/{n}",
+         "Из них — наполнение тела (взаимоисключающе, в сумме = matched):",
+         f"  (б1) РЕАЛЬНЫЕ app-данные (без заглушек): {b1}",
+         f"  (в)  synthesized ($stub-заглушки):       {synth}",
+         f"  (а)  matched, но тело пустое/болванка:   {wire - b1 - synth}",
          "",
          "HTTP-аналог Таблицы IV — минимальная ступень уровня (б1):",
          f"  ступень 0 (прямой вызов):          {dist.get(0,0)}",
@@ -1404,7 +1450,8 @@ def _check_report():
     levels = {k: _honest_level(r)[0] for k, r in zip("abcd", results)}
     assert levels == {"a": "б1", "b": "в", "c": "а", "d": "а"}, levels
     assert "(б1) РЕАЛЬНЫЕ app-данные" in txt and "synthesized" in txt
-    assert "Вызвано (запрос ушёл): 3/4" in txt and "НЕ вызвано: 1/4" in txt  # 3 fired, 1 not (d)
+    assert "дошёл до Retrofit-метода: 3/4" in txt and "не дошёл: 1/4" in txt  # 3 fired, 1 not (d)
+    assert "реально снят (matched): 2/4" in txt  # a(б1)+b(в) снятые, c/d — нет
     assert "ступень 0" in txt and "RQ3" in txt and "несопостав" in txt.lower()
     print("  report ok")
 
