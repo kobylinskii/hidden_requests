@@ -49,6 +49,22 @@ function emit(obj) {
     send(obj);
 }
 
+// Параметры карты — ОТДЕЛЬНЫЙ канал: свой предел и дедуп в агенте, чтобы поток
+// листьев (тела+ответы) НЕ вытеснял http/retrofit (их ест только emit/sent →
+// diff не занижается). Дедуп по (name,val) схлопывает повторы/поллинг в агенте.
+var seenParam = {};
+var paramSent = 0;
+var PARAM_MAX = 50000;
+function emitParam(name, val, url) {
+    if (!name) return;
+    var k = name + '\u0000' + val;
+    if (seenParam[k]) return;
+    seenParam[k] = true;
+    if (paramSent >= PARAM_MAX) return;      // свой предел — не трогает MAX_EVENTS
+    paramSent++;
+    send({ t: 'param', name: name, val: val, url: url, ts: Date.now() });
+}
+
 function note(msg) { send({ t: 'log', msg: String(msg) }); }
 
 /* ---------- слой 1: динамические прокси (Retrofit/Ktorfit) ---------- */
@@ -154,7 +170,7 @@ function emitLeaves(obj, url) {
         if (v !== null && typeof v === 'object') { emitLeaves(v, url); continue; }
         var ok = (typeof v === 'string' && v !== '' && v !== 'stub' && v.length <= 256) ||
                  (typeof v === 'number' && v !== 0) || typeof v === 'boolean';
-        if (ok) emit({ t: 'param', name: k, val: v, url: url });
+        if (ok) emitParam(k, v, url);
     }
 }
 function reqBodyText(req) {
@@ -170,13 +186,12 @@ function harvestReq(request, url) {
         var qs = String(url).split('?')[1];
         if (qs) qs.split('&').forEach(function (p) {
             var i = p.indexOf('='); if (i <= 0) return;
-            try { emit({ t: 'param', name: decodeURIComponent(p.slice(0, i)),
-                         val: decodeURIComponent(p.slice(i + 1)), url: url }); } catch (e) {}
+            try { emitParam(decodeURIComponent(p.slice(0, i)), decodeURIComponent(p.slice(i + 1)), url); }
+            catch (e) {}
         });
         // id в пути (/streams/<num|hex>) — под частым именем слота 'id'
         String(url).split('?')[0].split('/').forEach(function (seg) {
-            if (/^\d+$/.test(seg) || /^[0-9a-f]{16,}$/i.test(seg))
-                emit({ t: 'param', name: 'id', val: seg, url: url });
+            if (/^\d+$/.test(seg) || /^[0-9a-f]{16,}$/i.test(seg)) emitParam('id', seg, url);
         });
     } catch (e) {}
 }
