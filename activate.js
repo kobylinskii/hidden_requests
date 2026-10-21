@@ -737,7 +737,18 @@ function bodyOf(req) {
         var Buffer = Java.use('okio.Buffer');
         var buf = Buffer.$new();
         rb.writeTo(buf);
-        return buf.readUtf8();
+        var bytes = buf.readByteArray();
+        if (bytes === null || bytes.length === 0) return (bytes === null) ? null : '';
+        // текст или бинарь (protobuf)? доля печатных байт в начале
+        var printable = 0, lim = Math.min(bytes.length, 512);
+        for (var i = 0; i < lim; i++) {
+            var c = bytes[i] & 0xff;
+            if (c === 9 || c === 10 || c === 13 || (c >= 32 && c < 127) || c >= 0xC0) printable++;
+        }
+        if (printable / lim > 0.85) return Java.use('java.lang.String').$new(bytes, 'UTF-8');
+        // бинарное тело (protobuf) — base64-улика, не теряем (#3: видим блоб)
+        var b64 = Java.use('android.util.Base64').encodeToString(bytes, 2); // NO_WRAP
+        return '<proto ' + bytes.length + 'b b64:' + b64.slice(0, 160) + '>';
     } catch (e) { return '<unreadable>'; }
 }
 

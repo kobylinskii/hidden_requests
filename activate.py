@@ -836,6 +836,11 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         stages = tuple(stages)
         session = pid = agent = None
         seen = {"hit": False, "req": None, "resp": None}
+        # protobuf/gRPC: тело — сырой okhttp3.RequestBody (бинарный блоб), а не JSON-
+        # DTO. JSON-наполнение (заглушки/harvest) неприменимо; форс детерминированно
+        # крашит процесс → НЕ ретраим реопеном (пустая трата: max_open=1).
+        pb = any("okhttp3/RequestBody" in t for t in (rec.get("arg_types") or []))
+        max_open = 1 if pb else 3
 
         def _on_hook_msg(message, data):
             # fired — асинхронный ключ-точный оракул (его ставит хендлер, когда
@@ -924,9 +929,9 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             # ПРЕДЫДУЩЕГО ключа на момент attach. Переоткрываем свежий и повторяем (до
             # 2 раз). Детерминированный краш-на-форсе исчерпает попытки и честно вернёт
             # ошибку, но транзиентный догорающий краш так восстанавливается.
-            for attempt in range(3):
+            for attempt in range(max_open):
                 if agent is None:
-                    if attempt < 2:
+                    if attempt < max_open - 1:
                         _reopen(); continue
                     return {"stage": stage, "valid": False,
                             "exceptions": (setup_exc or ["нет сессии"]) + exc,
@@ -939,7 +944,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
                 except Exception as e: exc.append("arm: " + str(e))
                 # скрипт умер ДО/во время setup (догорающий краш прошлого ключа) →
                 # переоткрыть стабильный процесс и перевызвать (не на крашащемся форсе)
-                if attempt < 2 and any("destroyed" in x for x in exc):
+                if attempt < max_open - 1 and any("destroyed" in x for x in exc):
                     _reopen(); continue
                 break
             time.sleep(wait_t)
@@ -971,6 +976,7 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
             if pid is not None and not attach:
                 try: device.kill(pid)
                 except Exception: pass
+        out["protobuf"] = pb
         if _timedout["v"]:
             out["timeout"] = True
         if _er.get("relaunched"):
@@ -1148,6 +1154,10 @@ def report(results):
                    for s in r.get("stages", []) for f in ((s.get("request") or {}).get("filled") or []))
     store_n = sum(1 for r in results if _filled_any(r, "←store:"))     # T3 сессия/uid/device
     traffic_n = sum(1 for r in results if _filled_any(r, "←traffic:"))  # T4 карта трафика
+    # protobuf/gRPC: тело — бинарный okhttp3.RequestBody, JSON-наполнение неприменимо.
+    # Считаем отдельно, чтобы не путать с обычным пустым [а].
+    pb_wire = sum(1 for r in results if r.get("protobuf") and _matched(r))
+    pb_total = sum(1 for r in results if r.get("protobuf"))
     # ЭТАП 1: почему ключ дошёл до Retrofit, но НЕ ушёл на провод. Классифицируем
     # по строкам исключений (бакеты — что чинить, чтобы поднять число отправленных).
     def _why_fail(r):
@@ -1192,6 +1202,8 @@ def report(results):
          f"  (б1) реальные данные на проводе:  {b1}/{wire}",
          f"  (в)  уцелела заглушка ($stub):    {synth}/{wire}",
          f"  (а)  тело пустое/бинарное:        {wire - b1 - synth}/{wire}",
+         f"       из них protobuf/gRPC (бинарный протокол, вне JSON-наполнения): {pb_wire}"
+         f"  [всего protobuf-ключей: {pb_total}]",
          "  источник реальных (наполнено ≥1 поле; T0–T2 без маркера — считаем остатком):",
          f"       T4 harvest (карта трафика):  {traffic_n}",
          f"       T3 стор (сессия/uid/device): {store_n}",
