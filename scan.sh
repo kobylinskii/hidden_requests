@@ -45,7 +45,7 @@ else
         fi
         if ! "$PY" "$HERE/trace.py" --package "$PKG" --out "$DYN" --device "$DEV" "${APPEND[@]}" >&2; then
             printf '%s\n' '{"t":"collector_error"}' >> "$DYN"
-            echo "Сбор трассы завершился с ошибкой" >&2
+            echo "Трасса завершена с неполными данными; причины указаны выше и в записи end" >&2
         fi
     fi
     ARGS+=(--catalog "$STATIC" --trace "$DYN")

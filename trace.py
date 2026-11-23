@@ -16,6 +16,9 @@
 """
 
 import argparse
+import hashlib
+import io
+import zipfile
 import json
 import re
 import shlex
@@ -46,19 +49,42 @@ def apk_version(package, serial):
             "versionCode": code.group(1) if code else None}
 
 
-def installed_build(package, serial):
-    adb = ["adb", "-s", serial, "shell"]
+def installed_identity(package, serial):
+    """Bind the base APK and verify configuration splits contain no DEX code."""
+    adb = ["adb", "-s", serial]
     try:
-        listing = subprocess.check_output([*adb, "pm", "path", package], text=True, timeout=20)
-        paths = [line.removeprefix("package:") for line in listing.splitlines()
-                 if line.startswith("package:")]
-        if len(paths) != 1:
-            return None
-        digest = subprocess.check_output([*adb, "sha256sum " + shlex.quote(paths[0])],
-                                         text=True, timeout=60).split()[0]
-        return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else None
-    except (OSError, subprocess.SubprocessError, IndexError):
-        return None
+        listing = subprocess.check_output([*adb, "shell", "pm", "path", package],
+                                          text=True, timeout=20)
+        paths = sorted(line.removeprefix("package:").strip() for line in listing.splitlines()
+                       if line.startswith("package:"))
+        if not paths:
+            return None, []
+        bases = [p for p in paths if p.endswith("/base.apk")]
+        base = paths[0] if len(paths) == 1 else bases[0] if len(bases) == 1 else None
+        if base is None:
+            return None, []
+        inventory = []
+        for path in paths:
+            digest = subprocess.check_output(
+                [*adb, "shell", "sha256sum " + shlex.quote(path)], text=True, timeout=60).split()[0]
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                return None, []
+            if path != base:
+                data = subprocess.check_output([*adb, "exec-out", "cat", path], timeout=60)
+                if hashlib.sha256(data).hexdigest() != digest:
+                    return None, []
+                with zipfile.ZipFile(io.BytesIO(data)) as split:
+                    if any(name.lower().endswith(".dex") for name in split.namelist()):
+                        return None, []
+            inventory.append({"name": Path(path).name, "sha256": digest})
+        build = next(item["sha256"] for item in inventory if item["name"] == Path(base).name)
+        return build, inventory
+    except (OSError, subprocess.SubprocessError, IndexError, zipfile.BadZipFile):
+        return None, []
+
+
+def installed_build(package, serial):
+    return installed_identity(package, serial)[0]
 
 
 def pick_device(spec):
@@ -105,10 +131,10 @@ def main():
     device = pick_device(args.device)
     print(f"устройство: {device.id} ({device.name})", file=sys.stderr)
 
-    build = installed_build(args.package, device.id)
+    build, installed_apks = installed_identity(args.package, device.id)
     session_id = uuid4().hex
     meta = {"t": "meta", "package": args.package, "build": build, "session": session_id,
-            **apk_version(args.package, device.id)}
+            "installed_apks": installed_apks, **apk_version(args.package, device.id)}
     if args.append and out.exists() and out.stat().st_size:
         from request_pipeline import read_trace
         if not build or not read_trace(out, build)["complete"]:
@@ -244,7 +270,7 @@ def main():
             issues.add("final_stats_unavailable")
         if limit_hit["yes"] or stats.get("dropped"):
             issues.add("events_dropped")
-        if build is not None and installed_build(args.package, device.id) != build:
+        if build is not None and installed_identity(args.package, device.id) != (build, installed_apks):
             issues.add("installed_build_changed")
         fh.write(json.dumps({"t": "end", "session": session_id, "build": build,
                              "status": "partial" if issues else "complete",
@@ -266,6 +292,7 @@ def main():
         print(f"→ {out}", file=sys.stderr)
 
     if issues:
+        print("Причины частичной трассы: " + ", ".join(sorted(issues)), file=sys.stderr)
         sys.exit("Частичная трасса сохранена для диагностики")
 
 
