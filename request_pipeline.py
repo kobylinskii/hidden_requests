@@ -2,14 +2,44 @@
 
 import argparse
 import hashlib
+import gc
 from collections import Counter
 import json
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from body_report import render_body
 from diff import parse_bfscan
 from request_artifacts import catalog_metadata, sha256, write_rows
+
+
+@contextmanager
+def progress_stage(label):
+    started = time.monotonic()
+    stopped = threading.Event()
+
+    def report():
+        while not stopped.wait(10):
+            print(f"[сканер] {label} — {time.monotonic() - started:.0f} с",
+                  file=sys.stderr, flush=True)
+
+    print(f"[сканер] {label}", file=sys.stderr, flush=True)
+    worker = threading.Thread(target=report, daemon=True)
+    worker.start()
+    try:
+        yield
+    except BaseException:
+        print(f"[сканер] Этап прерван: {label}", file=sys.stderr, flush=True)
+        raise
+    else:
+        print(f"[сканер] Готово: {label} — {time.monotonic() - started:.1f} с",
+              file=sys.stderr, flush=True)
+    finally:
+        stopped.set()
+        worker.join()
 
 
 def read_trace(path, build):
@@ -222,40 +252,83 @@ def bfscan_body_rows(compared):
                "status": "example" if body is not None else "no_bfscan_example", "body": body}
 
 
+def print_statistics(compared):
+    hidden = [row for row in compared if row["status"] == "not_observed"]
+    counts = Counter(row["status"] for row in compared)
+    total = len(compared)
+    print(f"[статистика] Статических HTTP-объявлений: {total}; "
+          f"уникальных класс->метод: {len({row['key'] for row in compared})}", file=sys.stderr, flush=True)
+    for status, title in (("observed", "Наблюдались"), ("not_observed", "Скрытые в этой сессии"),
+                          ("insufficient_data", "Недостаточно данных")):
+        amount = counts[status]
+        percent = amount / total * 100 if total else 0
+        print(f"[статистика] {title}: {amount} ({percent:.1f}%)", file=sys.stderr, flush=True)
+    bodies = list(bfscan_body_rows(hidden))
+    with_body = sum(row["body"] is not None for row in bodies)
+    print(f"[статистика] Скрытые с телом BFScan: {with_body}; "
+          f"без примера тела: {len(hidden) - with_body}", file=sys.stderr, flush=True)
+    verbs = Counter(row["verb"] for row in hidden)
+    print("[статистика] Методы скрытых запросов: " +
+          (", ".join(f"{verb}={count}" for verb, count in sorted(verbs.items())) or "0"),
+          file=sys.stderr, flush=True)
+
+
 def report_bfscan(args, build):
     from slice import load_apk
 
     dx = None
     if args.comparison_in:
-        compared, complete = read_checked_rows(args.comparison_in, build)
+        with progress_stage("Проверка готового списка объявлений"):
+            compared, complete = read_checked_rows(args.comparison_in, build)
     else:
         if not (args.catalog and args.trace):
             raise ValueError("нужны --catalog и --trace либо --comparison-in")
-        _, dx = load_apk(args.apk)
-        compared, complete = compare_artifacts(args, build, dx)
+        with progress_stage("Загрузка APK, разбор DEX и построение связей методов"):
+            _, dx = load_apk(args.apk)
+        with progress_stage("Сравнение BFScan с динамической трассой"):
+            compared, complete = compare_artifacts(args, build, dx)
         for row in compared:
             row["build"] = build
     if not args.comparison_in or args.comparison_in.resolve() != args.comparison.resolve():
         publish(args.comparison, compared, build, complete)
+    print_statistics(compared)
     records = list(bfscan_body_rows(compared))
     publish(args.out, records, build, complete)
-    if args.request_slice:
-        from body_data import request_slice
-
-        hidden = [row for row in compared if row["status"] == "not_observed"]
-        if hidden and dx is None:
-            _, dx = load_apk(args.apk)
-        slices = ({**{k: row[k] for k in ("build", "declaration_id", "key", "descriptor", "verb", "path")},
-                   "body_argument": row.get("body_argument"), **request_slice(dx, row)}
-                  for row in hidden)
-        publish(args.request_slice, slices, build, complete)
     for row in records:
         target = row["path"] + ("?" + row["query"] if row.get("query") else "")
         print(f"{row['verb']} {target}  [{row['key']}]")
         print(row["body"] if row["body"] is not None else "(в BFScan нет примера тела)")
         print()
-    print(f"Скрытых объявлений: {len(records)}. Статус прогона: "
-          f"{'complete' if complete else 'partial'}.", file=sys.stderr)
+    sys.stdout.flush()
+    print(f"[сканер] Список и тела BFScan сохранены. Скрытых объявлений: {len(records)}. "
+          f"Статус прогона: {'complete' if complete else 'partial'}.", file=sys.stderr, flush=True)
+    if args.request_slice:
+        from body_data import request_slice
+
+        hidden = [row for row in compared if row["status"] == "not_observed"]
+        if hidden and dx is None:
+            with progress_stage("Загрузка APK, разбор DEX и построение связей методов"):
+                _, dx = load_apk(args.apk)
+
+        def slices():
+            total = len(hidden)
+            counts = Counter()
+            site_count = 0
+            for index, row in enumerate(hidden, 1):
+                print(f"[срез {index}/{total}] {row['key']}", file=sys.stderr, flush=True)
+                result = request_slice(dx, row)
+                counts[result["status"]] += 1
+                site_count += len(result["call_sites"])
+                print(f"[срез {index}/{total}] Результат: {result['status']}; "
+                      f"мест вызова: {len(result['call_sites'])}", file=sys.stderr, flush=True)
+                yield {**{k: row[k] for k in ("build", "declaration_id", "key", "descriptor", "verb", "path")},
+                       "body_argument": row.get("body_argument"), **result}
+            print(f"[статистика] Срезов: {sum(counts.values())}; мест вызова: {site_count}; " +
+                  (", ".join(f"{status}={count}" for status, count in sorted(counts.items())) or "0"),
+                  file=sys.stderr, flush=True)
+
+        with progress_stage(f"Обратные срезы для {len(hidden)} скрытых объявлений"):
+            publish(args.request_slice, slices(), build, complete)
 
 
 def main():
@@ -302,3 +375,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    print("[сканер] Обработка завершена, результаты сохранены.", file=sys.stderr, flush=True)
+    # Androguard holds millions of cyclic references. After successful CLI
+    # completion the OS releases this memory; skip its final cyclic GC pass.
+    gc.freeze()

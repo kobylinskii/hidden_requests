@@ -23,6 +23,7 @@ def write_rows(path, rows):
                 stream.write(line)
                 digest.update(line)
             stream.close()
+            temporary.chmod(0o644)
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
