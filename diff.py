@@ -64,14 +64,17 @@ def load_dynamic(path: Path):
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
-            print(f"warn: {path}:{n} не JSON, пропущено", file=sys.stderr)
-            continue
+            raise ValueError(f"{path}:{n}: повреждённая запись JSON") from None
         t = ev.get("t")
         if t == "retrofit":
             called.add(f"{ev['cls']}->{ev['m']}")
         elif t == "http":
             http.append(ev)
         elif t == "meta":
+            if meta and (not ev.get("versionCode") or
+                         ev.get("package") != meta.get("package") or
+                         str(ev["versionCode"]) != str(meta.get("versionCode"))):
+                raise ValueError(f"{path}:{n}: несовместимые метаданные сессий")
             meta = ev
     return called, http, meta
 
@@ -84,7 +87,8 @@ def report(static, called, http, meta=None, verbose=False):
         by_key[s["key"]].append(s)
 
     hidden_keys = sorted(k for k in by_key if k not in called)
-    found_keys = sorted(k for k in by_key if k in called)
+    found_keys = sorted(k for k in by_key if k in called and len(by_key[k]) == 1)
+    ambiguous = sorted(k for k in by_key if k in called and len(by_key[k]) > 1)
     # Метод вызван, класс BFScan знает, а самой записи в статике нет.
     static_classes = {s["cls"] for s in static}
     missed_by_bfscan = sorted(k for k in called - set(by_key)
@@ -100,6 +104,7 @@ def report(static, called, http, meta=None, verbose=False):
           f"versionName={meta.get('versionName')} versionCode={meta.get('versionCode')}")
     w(f"Статических эндпоинтов (записей BFScan): {len(static)}")
     w(f"Уникальных ключей класс->метод:          {len(by_key)}")
+    w(f"Вызов с неоднозначным объявлением: {len(ambiguous)}")
     w(f"Вызвано в рантайме:                      {len(found_keys)}")
     pct = f" ({len(hidden_keys) / len(by_key) * 100:.1f}%)" if by_key else ""
     w(f"СКРЫТО (ни разу не вызвано):             {len(hidden_keys)}{pct}")
@@ -155,7 +160,7 @@ def report(static, called, http, meta=None, verbose=False):
     if verbose and found_keys:
         w("")
         w("-" * 78)
-        w(f"НАЙДЕНО В ТРАФИКЕ ({len(found_keys)})")
+        w(f"НАБЛЮДАЛСЯ ВЫЗОВ МЕТОДА ({len(found_keys)})")
         w("-" * 78)
         for key in found_keys:
             for r in by_key[key]:
@@ -176,7 +181,12 @@ def main():
     static = parse_bfscan(args.static)
     if not static:
         sys.exit(f"error: в {args.static} не найдено ни одной записи BFScan")
-    called, http, meta = load_dynamic(args.dynamic)
+    try:
+        called, http, meta = load_dynamic(args.dynamic)
+    except ValueError as error:
+        ap.error(str(error))
+    if not called:
+        ap.error("нет наблюдений методов, список скрытых запросов неопределён")
 
     text, hidden_keys, by_key, missed, non_retrofit = report(
         static, called, http, meta, args.verbose)
@@ -191,6 +201,10 @@ def main():
                 for r in by_key[key]:
                     f.write(json.dumps({**r, "status": "hidden"},
                                        ensure_ascii=False) + "\n")
+            for key in sorted(called.intersection(by_key)):
+                status = "ambiguous" if len(by_key[key]) > 1 else "method_observed"
+                for declaration in by_key[key]:
+                    f.write(json.dumps({**declaration, "status": status}, ensure_ascii=False) + "\n")
             for key in missed:
                 f.write(json.dumps({"key": key, "status": "not_in_static"},
                                    ensure_ascii=False) + "\n")

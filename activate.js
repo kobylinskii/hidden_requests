@@ -5,201 +5,12 @@
 
 var proxyByIface = {};   // имя интерфейса -> живой прокси-инстанс (для call_retrofit)
 var cap = { key: null, path: '', hits: [], resp: null };   // path — ожидаемый endpoint; resp — ответ сервера на форс
-// КАРТА ПАРАМЕТРОВ ПРИЛОЖЕНИЯ (б2b): реальные значения, НАБЛЮДЁННЫЕ в трафике
-// (тела и URL запросов + тела ответов), для подстановки вместо $stub-заглушек.
-// Структура: normName -> [ {val, key, resource, shape} ] — несколько кандидатов
-// на имя, чтобы разрешать коллизии (`id` устройства vs шоу vs профиля). Три слоя:
-//   (1) область видимости по РЕСУРСУ (сегмент пути) — свой домен не мешается с чужим;
-//   (2) сигнатура ФОРМЫ (num/uuid/hex/jwt/slug/str) — отсев явно-чужого типа;
-//   (3) остаточная неоднозначность → пометка [ambig:N] (окончательный арбитр — сервер).
-// App-agnostic: только имена полей, сегменты пути и форма значения.
-var pool = {};
-
 function jclass(name) { return Java.use(name.replace(/\//g, '.')); }
 
 // #2: значение obj — инстанс типа fq (frida-имя класса/интерфейса)? Для выбора
 // СЕМАНТИЧЕСКИ верного живого инстанса ($field/$choose), а не первого по типу поля.
 function isType(obj, fq) {
     try { return jclass(fq).class.isInstance(obj); } catch (e) { return false; }
-}
-
-// Слой 1: сегмент-ресурс из URL. /app/v1.1.3/download/disallow-device -> "download".
-// Отбрасываем host, версии (vN/vN.N) и технические префиксы.
-function resourceOf(url) {
-    try {
-        var p = String(url).replace(/^[a-z]+:\/\/[^/]+/i, '').split('?')[0];
-        var segs = p.split('/').filter(function (s) {
-            return s && !/^v\d+(\.\d+)*$/i.test(s) &&
-                   ['app', 'api', 'catalog', 'uma-api', 'frontend'].indexOf(s.toLowerCase()) === -1;
-        });
-        return segs.length ? segs[0].toLowerCase() : '';
-    } catch (e) { return ''; }
-}
-
-// Слой 2: сигнатура формы значения (грубый класс, без онтологии).
-function shapeOf(v) {
-    var s = String(v);
-    if (/^\d+$/.test(s)) return 'num';
-    if (/^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i.test(s)) return 'uuid';
-    if (/^ey[A-Za-z0-9_-]+\./.test(s)) return 'jwt';
-    if (/^[0-9a-f]{16,}$/i.test(s)) return 'hex';
-    if (/^[a-z0-9]+(-[a-z0-9]+)+$/.test(s)) return 'slug';
-    return 'str';
-}
-
-function _poolAdd(name, val, resource) {
-    var nk = normKey(name);
-    if (!nk || nk.length < 2) return;
-    var sv = String(val);
-    if (!sv.length || sv === 'stub') return;
-    var arr = pool[nk] || (pool[nk] = []);
-    for (var i = 0; i < arr.length; i++)
-        if (arr[i].key === sv && arr[i].resource === resource) return;   // dedup
-    if (arr.length < 40) arr.push({ val: val, key: sv, resource: resource, shape: shapeOf(sv) });
-}
-
-// Собрать непустые примитивные листья JSON (тела запроса/ответа) в карту под ресурсом.
-function recordPool(obj, resource) {
-    if (obj === null || typeof obj !== 'object') return;
-    for (var k in obj) {
-        var v = obj[k];
-        if (v !== null && typeof v === 'object') recordPool(v, resource);
-        else if ((typeof v === 'string' && v !== '' && v !== 'stub') ||
-                 (typeof v === 'number' && v !== 0) || typeof v === 'boolean')
-            _poolAdd(k, v, resource);
-    }
-}
-
-// URL — тоже источник реальных сущностей: query-параметры (?cid=...) и id в пути
-// (/streams/<id> → под именем `id`, частое имя слота). ponytail: path-id кладём
-// только как `id`; именованные path-шаблоны {slug} восстановить из URL нельзя.
-function recordUrl(url) {
-    try {
-        var res = resourceOf(url);
-        var m = String(url).replace(/^[a-z]+:\/\/[^/]+/i, '');
-        var qs = m.split('?')[1];
-        if (qs) qs.split('&').forEach(function (p) {
-            var i = p.indexOf('='); if (i < 0) return;
-            try { _poolAdd(decodeURIComponent(p.slice(0, i)), decodeURIComponent(p.slice(i + 1)), res); }
-            catch (e) {}
-        });
-        m.split('?')[0].split('/').filter(Boolean).forEach(function (seg) {
-            var sh = shapeOf(seg);
-            if (sh === 'num' || sh === 'uuid' || sh === 'hex') _poolAdd('id', seg, res);
-        });
-    } catch (e) {}
-}
-
-// ── Harvest из ПЕРСИСТЕНТНЫХ сторов (SharedPreferences/DataStore) ──────────────
-// Реальные сессионные значения (token/uid/device_id) приложение хранит на диске и
-// держит в куче ПОСЛЕ логина — в отличие от per-action DTO они НЕ транзиентны.
-// Собираем все пары ключ→значение из живых сторов; матчим с пустыми полями запроса
-// по НОРМАЛИЗОВАННОМУ имени (ключи prefs вроде `pref_session_data` не совпадают с
-// полем `session` буквально, но совпадают после нормализации). App-agnostic:
-// перечисляем стандартные Android/Jetpack-классы, без знания классов приложения.
-var storeDump = {}, _storesDone = false;
-function normKey(s) {               // pref_session_data → sessiondata; PREF_DEVICE_ID_…_FROM_SERVER → deviceid…
-    return String(s).toLowerCase()
-        .replace(/^pref[_.]?/, '').replace(/_from_server$/, '').replace(/[^a-z0-9]/g, '');
-}
-function _addStore(k, v) {
-    if (k === null || k === undefined || v === null || v === undefined) return;
-    var cls; try { cls = v.getClass().getName(); } catch (e) { cls = ''; }
-    if (cls === 'java.lang.Boolean') return;        // флаги (shown-tip и т.п.) — не данные
-    var vs; try { vs = v.toString(); } catch (e) { return; }
-    if (!vs || !vs.length || vs === 'stub') return;
-    // Не атомарное значение → не параметр слота: склейка с пробелами (okhttp
-    // User-Agent-блоб лез в platform/deviceModel) или структура/дата в скобках
-    // ([2026-10-20] лез в deviceName). Токены/id/slug пробелов и скобок не несут.
-    if (/\s/.test(vs) || '[{('.indexOf(vs.charAt(0)) !== -1) return;
-    var nk = normKey(k);
-    if (nk && !(nk in storeDump)) storeDump[nk] = { val: vs, orig: String(k) };
-}
-function harvestStores() {
-    // SharedPreferences (вкл. EncryptedSharedPreferences — getAll() отдаёт расшифрованное)
-    ['android.app.SharedPreferencesImpl',
-     'androidx.security.crypto.EncryptedSharedPreferences'].forEach(function (cn) {
-        try { jclass(cn); } catch (e) { return; }
-        Java.choose(cn, { onMatch: function (sp) {
-            try { var all = sp.getAll(), it = all.keySet().iterator();
-                while (it.hasNext()) { var key = it.next(); _addStore(key ? key.toString() : null, all.get(key)); }
-            } catch (e) {}
-        }, onComplete: function () {} });
-    });
-    // DataStore Preferences (best-effort: токен может быть здесь, напр. TNT refreshToken)
-    ['androidx.datastore.preferences.core.MutablePreferences',
-     'androidx.datastore.preferences.core.PreferencesMap'].forEach(function (cn) {
-        try { jclass(cn); } catch (e) { return; }
-        Java.choose(cn, { onMatch: function (p) {
-            try { var m = p.asMap(), it = m.keySet().iterator();
-                while (it.hasNext()) { var key = it.next();
-                    var name; try { name = key.getName(); } catch (e) { name = key ? key.toString() : null; }
-                    _addStore(name, m.get(key)); }
-            } catch (e) {}
-        }, onComplete: function () {} });
-    });
-}
-function ensureStoreHarvest() { if (_storesDone) return; _storesDone = true; try { harvestStores(); } catch (e) {} }
-
-// Fuzzy-поиск значения стора по имени поля запроса (нормализованное совпадение).
-function storeFuzzy(fieldName) {
-    var fn = normKey(fieldName);
-    if (fn.length < 3) return null;                 // слишком короткое имя → шумный матч
-    var best = null, bestLen = 0;
-    for (var nk in storeDump) {
-        if (nk === fn || nk.indexOf(fn) !== -1 || fn.indexOf(nk) !== -1) {
-            var ov = Math.min(nk.length, fn.length);   // предпочитаем самое длинное пересечение
-            if (ov > bestLen) { bestLen = ov; best = storeDump[nk]; }
-        }
-    }
-    return best;                                    // {val, orig} | null
-}
-
-// Выбрать значение из карты под слот (имя поля, целевой ресурс) по слоям 1–3.
-// Слой 1 (ресурс) — жёсткий: междоменный матч ЗАПРЕЩЁН (иначе ложный b1, напр.
-// id шоу в слот устройства). Слой 2/3 — ранжирование и пометка неоднозначности.
-function poolPick(fieldName, targetRes) {
-    var fn = normKey(fieldName);
-    if (fn.length < 2) return null;
-    var cands = [];
-    for (var nk in pool) {
-        if (nk === fn || nk.indexOf(fn) !== -1 || fn.indexOf(nk) !== -1) {
-            var ov = Math.min(nk.length, fn.length), exact = nk === fn;
-            pool[nk].forEach(function (e) {
-                if (e.resource === targetRes) cands.push({ e: e, ov: ov, exact: exact });
-            });
-        }
-    }
-    if (!cands.length) return null;                         // нет своего домена → не заполняем
-    cands.sort(function (a, b) { return (b.exact - a.exact) || (b.ov - a.ov); });
-    var vals = {}; cands.forEach(function (c) { vals[c.e.key] = 1; });
-    return { val: cands[0].e.val, resource: targetRes, shape: cands[0].e.shape,
-             ambig: Object.keys(vals).length };
-}
-
-// Наполнить пустые/заглушечные поля тела реальными значениями. Приоритет: карта
-// параметров (трафик, со слоями) → fuzzy из персистентного стора (сессия/токен,
-// без ресурса). filled помечает источник (артефакт ВКР). App-agnostic.
-function fillFromHarvest(obj, filled, targetRes) {
-    var changed = false;
-    if (obj === null || typeof obj !== 'object') return changed;
-    for (var k in obj) {
-        var v = obj[k];
-        if (v !== null && typeof v === 'object') {
-            if (fillFromHarvest(v, filled, targetRes)) changed = true;
-        } else if (v === '' || v === 'stub') {      // пустое ИЛИ наш $stub-плейсхолдер
-            var p = poolPick(k, targetRes);
-            if (p) {
-                obj[k] = p.val; changed = true;
-                filled.push(k + '←traffic:' + p.resource + '[' + p.shape + ']' +
-                            (p.ambig > 1 ? '(ambig:' + p.ambig + ')' : ''));
-            } else {
-                var s = storeFuzzy(k);
-                if (s) { obj[k] = s.val; filled.push(k + '←store:' + s.orig); changed = true; }
-            }
-        }
-    }
-    return changed;
 }
 
 // JSON-значение -> Java-значение. $choose берёт ЖИВОЙ инстанс (реальные параметры).
@@ -625,16 +436,6 @@ function doTrigger(t, args) {
 
 if (typeof rpc !== 'undefined') rpc.exports = {
     captureOn: function (key, pathHint) { cap.key = key; cap.path = pathHint || ''; cap.hits = []; cap.resp = null; },
-    // Засеять карту параметров из трафика, собранного на шаге сбора (trace.py):
-    // items = [{name, val, url}]. Ресурс/форму считаем здесь (resourceOf/_poolAdd),
-    // чтобы не дублировать логику на хосте. Дополняет пассивный рантайм-harvest.
-    seedPool: function (items) {
-        var n = 0;
-        (items || []).forEach(function (it) {
-            try { _poolAdd(it.name, it.val, resourceOf(it.url || '')); n++; } catch (e) {}
-        });
-        return n;
-    },
     // Case-1 префлайт: доступен ли сам Retrofit? stage-0 mintProxies минтит прокси
     // ТОЛЬКО через retrofit2.Retrofit.create() (имя класса захардкожено). Если R8
     // обфусцировал саму библиотеку Retrofit (dodo: retrofit2.Retrofit → retrofit2.z/
@@ -752,20 +553,15 @@ function bodyOf(req) {
     } catch (e) { return '<unreadable>'; }
 }
 
-function captureRequest(req, source, body, filled) {
+function captureRequest(req, source) {
+    if (!cap.key || cap.hits.length >= 10) return;
     try {
-        if (body === undefined) body = bodyOf(req);
         var url = req.url().toString();
-        // harvest из ЛЮБОГО запроса (в т.ч. собственного трафика приложения): тело + URL
-        var res = resourceOf(url);
-        if (body && body.charAt(0) === '{') { try { recordPool(JSON.parse(body), res); } catch (e) {} }
-        recordUrl(url);
-        if (!cap.key || cap.hits.length >= 10) return;
         // matched только при СОДЕРЖАТЕЛЬНОМ hint: path '/' (или пустой) совпал бы
         // с любым проходящим трафиком приложения → поллюция, не наш форс-вызов.
         var m = (cap.path && cap.path !== '/') ? (url.indexOf(cap.path) !== -1) : false;
-        var hit = { key: cap.key, method: req.method(), url: url, body: body, source: source,
-                    filled: filled || [], matched: m };
+        var hit = { key: cap.key, method: req.method(), url: url, body: bodyOf(req),
+                    source: source, matched: m };
         cap.hits.push(hit);
         // PUSH-захват: эмитим matched-запрос СРАЗУ (не ждём snapshot()). Форс-вызов
         // часто роняет приложение ПОСЛЕ отправки запроса, но ДО snapshot-RPC → без
@@ -775,104 +571,42 @@ function captureRequest(req, source, body, filled) {
     } catch (e) {}
 }
 
-// Если req — НАШ форс-вызов (url совпал с ожидаемым endpoint ключа) и у него
-// пустые поля, которые есть в harvest — построить новый Request с наполненным
-// телом (б2b). App-agnostic: патч на уровне JSON, пересборка okhttp RequestBody.
-function patchForced(req) {
-    if (!cap.key || !cap.path) return { req: req };
-    var url;
-    try { url = req.url().toString(); } catch (e) { return { req: req }; }
-    if (url.indexOf(cap.path) === -1) return { req: req };
-    var body = bodyOf(req);
-    if (!body) return { req: req, body: body };
-    ensureStoreHarvest();                       // лениво снять персистентные сторы (один раз)
-    // Тело бывает JSON ({...}) и form-urlencoded (a=stub&b=&c=x) — поддерживаем оба.
-    var isJson = body.charAt(0) === '{';
-    var obj, isForm = false;
-    if (isJson) {
-        try { obj = JSON.parse(body); } catch (e) { return { req: req, body: body }; }
-    } else if (body.indexOf('=') !== -1) {
-        isForm = true; obj = {};
-        body.split('&').forEach(function (p) {
-            var i = p.indexOf('='); if (i < 0) return;
-            try { obj[decodeURIComponent(p.slice(0, i))] = decodeURIComponent(p.slice(i + 1)); }
-            catch (e) { obj[p.slice(0, i)] = p.slice(i + 1); }
-        });
-    } else {
-        return { req: req, body: body };
-    }
-    var filled = [];
-    if (!fillFromHarvest(obj, filled, resourceOf(url))) return { req: req, body: body };
-    try {
-        var outBody;
-        if (isForm) {
-            var parts = [];
-            for (var fk in obj) parts.push(encodeURIComponent(fk) + '=' + encodeURIComponent(obj[fk]));
-            outBody = parts.join('&');
-        } else {
-            outBody = JSON.stringify(obj);
-        }
-        var ct = req.body().contentType();   // сохранить media type
-        var RequestBody = Java.use('okhttp3.RequestBody');
-        var bytes = Java.use('java.lang.String').$new(outBody).getBytes('UTF-8');
-        var nb;
-        // okhttp менял сигнатуру RequestBody.create между версиями — пробуем обе.
-        try { nb = RequestBody.create(ct, bytes); }
-        catch (e) { nb = RequestBody.create(bytes, ct); }
-        _inPatch = true;   // re-entrancy guard: .build() ниже — тот же хук
-        var nr = req.newBuilder().method(req.method(), nb).build();
-        _inPatch = false;
-        return { req: nr, body: outBody, filled: filled };
-    } catch (e) { _inPatch = false; return { req: req, body: body }; }
-}
-var _inPatch = false;
-
 function installOkHttpCapture(attemptsLeft) {
     var ok = false;
     // Диспетч: okhttp3.OkHttpClient.newCall — запрос реально ушёл в сеть.
     try {
         var Ok = Java.use('okhttp3.OkHttpClient');
         Ok.newCall.implementation = function (req) {
-            var p = patchForced(req);
-            captureRequest(p.req, 'dispatch', p.body, p.filled);
-            return this.newCall(p.req);
+            captureRequest(req, 'dispatch');
+            return this.newCall(req);
         };
         ok = true;
     } catch (e) {}
     // Сборка: okhttp3.Request$Builder.build() — Retrofit строит Request ЗДЕСЬ,
     // синхронно во время вызова, даже если suspend-корутина не дойдёт до
-    // диспетча (наш trivial Continuation её не прокачивает). Ловим тело форс-
-    // запроса, который иначе не виден (пробел захвата фазы б1), и наполняем его
-    // реальными значениями из harvest (б2b).
+    // диспетча (наш trivial Continuation её не прокачивает). Сохраняем снимок
+    // запроса для отчёта.
     try {
         var RB = Java.use('okhttp3.Request$Builder');
         RB.build.implementation = function () {
             var r = this.build();
-            if (_inPatch) return r;   // наша же пересборка внутри patchForced
-            var p = patchForced(r);
-            captureRequest(p.req, 'build', p.body, p.filled);
-            return p.req;
+            captureRequest(r, 'build');
+            return r;
         };
         ok = true;
     } catch (e) {}
-    // Ответы: окно для реальных сущностей (id/slug приходят В ОТВЕТЕ, напр. список
-    // устройств для disallow-device). peekBody НЕ потребляет оригинал (окно для
-    // приложения не ломается). ponytail: cap 128KB + только JSON — не парсим видео/бинарь.
+    // Снимок ответа на исследуемый вызов для отчёта. peekBody оставляет
+    // оригинальное тело доступным приложению.
     try {
         var RespB = Java.use('okhttp3.Response$Builder');
         RespB.build.implementation = function () {
             var resp = this.build();
             try {
+                if (!cap.key || !cap.path || cap.path === '/') return resp;
                 var rurl = resp.request().url().toString();
-                var ct = resp.header('Content-Type', '') || '';
-                var txt = (ct.indexOf('json') !== -1) ? resp.peekBody(131072).string() : null;
-                if (txt && (txt.charAt(0) === '{' || txt.charAt(0) === '['))
-                    recordPool(JSON.parse(txt), resourceOf(rurl));
-                // Ответ на НАШ форс-вызов (url совпал с ожидаемым endpoint) — ОРАКУЛ:
-                // статус + тело (сервер в теле называет недостающий/невалидный параметр).
-                if (cap.key && cap.path && cap.path !== '/' && rurl.indexOf(cap.path) !== -1) {
-                    var rb = txt;
-                    if (rb === null) { try { rb = resp.peekBody(8192).string(); } catch (e2) { rb = null; } }
+                if (rurl.indexOf(cap.path) !== -1) {
+                    var rb = null;
+                    try { rb = resp.peekBody(8192).string(); } catch (e2) {}
                     cap.resp = { status: resp.code(), url: rurl,
                                  body: rb ? String(rb).slice(0, 2000) : null };
                     try { send({ t: 'captured_response', key: cap.key, resp: cap.resp }); } catch (e3) {}
@@ -885,32 +619,4 @@ function installOkHttpCapture(attemptsLeft) {
     if (ok) return;
     if (attemptsLeft <= 0) return;
     setTimeout(function () { installOkHttpCapture(attemptsLeft - 1); }, 1000);
-}
-
-// ── Самопроверка чистой логики матчинга (node activate.js) ────────────────────
-// Под frida Java определён → блок пропускается. Под node — гоняем слои 1–3.
-if (typeof Java === 'undefined') {
-    var _f = 0;
-    function _eq(a, b, m) { if (a !== b) { _f++; console.log('FAIL ' + m + ': ' + JSON.stringify(a) + ' != ' + JSON.stringify(b)); } }
-    // слой 1: ресурс
-    _eq(resourceOf('https://premier.one/app/v1.1.3/download/disallow-device?x=1'), 'download', 'res-download');
-    _eq(resourceOf('https://premier.one/catalog/v1/show/access?id=1'), 'show', 'res-show');
-    _eq(resourceOf('https://premier.one/uma-api/feeds/397'), 'feeds', 'res-feeds');
-    // слой 2: форма
-    _eq(shapeOf('12345'), 'num', 'shape-num');
-    _eq(shapeOf('ab12cd34-ef56-7890-ab12-cd34ef567890'), 'uuid', 'shape-uuid');
-    _eq(shapeOf('little-portrait'), 'slug', 'shape-slug');
-    _eq(shapeOf('eyJhbGc.payload'), 'jwt', 'shape-jwt');
-    _eq(shapeOf('deadbeefdeadbeef'), 'hex', 'shape-hex');
-    _eq(shapeOf('promo'), 'str', 'shape-str');
-    // слои 1+3: коллизия имени `id` между ресурсами + ambig + запрет междоменного
-    pool = {};
-    _poolAdd('id', '777', 'download'); _poolAdd('id', '42', 'show');
-    _eq((poolPick('id', 'download') || {}).val, '777', 'collision-download');   // не берёт id шоу
-    _eq((poolPick('id', 'show') || {}).val, '42', 'collision-show');
-    _eq(poolPick('id', 'profile'), null, 'cross-domain-forbidden');             // чужого домена нет → null
-    _poolAdd('id', '778', 'download');                                          // 2 разных id в одном ресурсе
-    _eq((poolPick('id', 'download') || {}).ambig, 2, 'ambig-count');
-    console.log(_f === 0 ? 'activate.js match selfcheck ok' : ('activate.js selfcheck: ' + _f + ' FAIL'));
-    if (_f) { if (typeof process !== 'undefined') process.exitCode = 1; }
 }
