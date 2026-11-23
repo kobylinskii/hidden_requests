@@ -28,6 +28,22 @@
 OUT_DIR=out HIDDEN_IN=out/demo.local.notes.hidden.jsonl bash scan.sh apk/demo.apk
 ```
 
+## Архив
+
+Файлы активации перенесены в `archivive/activate.py`,
+`archivive/activate.js` и `archivive/build/activate.js`.
+Архивный CLI запускается командой `python -m archivive.activate`.
+`build-agents.sh` записывает сборку агента активации в архив.
+В приведённых ниже исторических материалах пути активации указаны
+относительно прежней структуры проекта.
+
+
+В `archivive/` вынесен код реконструкции JSON, который используется отдельным
+режимом CLI. `body_data.py` содержит прежний анализ DTO,
+`body_report.py` — вспомогательный отчёт, `reconstruction.py` — сборку вариантов
+и запуск старого режима. Опции `--data-slice`, `--slice-in`, `--serializer`
+загружают архивный код по необходимости.
+
 ## Исследовательские материалы
 
 <details>

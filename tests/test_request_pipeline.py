@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from body_report import render_body
+from archivive.body_report import render_body
 from request_pipeline import compare, read_trace
 from diff import parse_bfscan
 
@@ -60,7 +60,7 @@ class RequestPipelineTests(unittest.TestCase):
         self.assertEqual(result["unknown_paths"], ["/0"])
 
     def test_parameter_slice_keeps_dto_write_and_typed_source(self):
-        from request_pipeline import body_rows
+        from archivive.reconstruction import body_rows
         graph = {"root": 1, "limit_hit": False, "nodes": [
             {"id": 1, "kind": "allocation", "type": "Lnotes/Query;",
              "declared_fields": [{"field": "term", "type": "Ljava/lang/String;",

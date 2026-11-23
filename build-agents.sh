@@ -6,11 +6,17 @@
 # иначе берёт исходник (frida 16 / arm-стенд курсовой).
 set -euo pipefail
 cd "$(dirname "$0")"
-mkdir -p .frida17/src build
+mkdir -p .frida17/src build archivive/build
 ( cd .frida17 && [ -f package.json ] || npm init -y >/dev/null
   npm i frida-compile frida-java-bridge >/dev/null )
 for a in prelude hook activate; do
-  { echo "import Java from 'frida-java-bridge';"; cat "$a.js"; } > ".frida17/src/$a.js"
-  ( cd .frida17 && node_modules/.bin/frida-compile "src/$a.js" -o "../build/$a.js" )
+  source="$a.js"
+  output="../build/$a.js"
+  if [ "$a" = activate ]; then
+    source="archivive/activate.js"
+    output="../archivive/build/activate.js"
+  fi
+  { echo "import Java from 'frida-java-bridge';"; cat "$source"; } > ".frida17/src/$a.js"
+  ( cd .frida17 && node_modules/.bin/frida-compile "src/$a.js" -o "$output" )
 done
-echo "built build/{prelude,hook,activate}.js"
+echo "built build/{prelude,hook}.js and archivive/build/activate.js"

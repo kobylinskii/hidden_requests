@@ -4,6 +4,9 @@
 import json, sys, os, argparse, re, urllib.request
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 try:
     from slice import load_apk
 except ImportError:
