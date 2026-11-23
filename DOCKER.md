@@ -24,6 +24,9 @@ APK ─▶ [ контейнер hidden-scanner ]                 [ хост ]
 * Знать adb-адрес устройства (`adb devices` → напр. `127.0.0.1:6562`).
 
 ## Сборка
+
+Dockerfile копирует локальный wheel `frida-17.23.3-cp37-abi3-manylinux_2_5_x86_64.whl` из корня проекта. Для этапа BFScan нужен `BFScan/target/BFScan-3.1.4.jar` в контексте сборки. Оба файла хранятся вне основного Git-репозитория.
+
 ```bash
 ./build-agents.sh            # ПЕРЕД docker build, если правил *.js (frida 17)
 docker build -t hidden-scanner .
@@ -48,7 +51,8 @@ docker run --rm -it --network host \
 ## Переменные
 | env | смысл |
 |---|---|
-| `ADB_DEVICE` | adb-адрес устройства (обязательно) |
+| `ADB_DEVICE` | adb-адрес для полного прогона |
+| `OUT_DIR` | каталог результатов внутри контейнера, по умолчанию `/work/out` |
 | `TRACE_APPEND=1` | дописать трафик к существующему `out/<pkg>.dynamic.jsonl` |
 | `HIDDEN_IN=<путь>` | старт СРАЗУ с готового списка скрытых запросов (пропустить BFScan+сбор трафика+diff); файл должен быть снят с той же сборки APK |
 | `SLICE_IN=<путь>` | старт СРАЗУ с готового среза (пропустить BFScan+трафик+diff+slice) — исключает память-ёмкий androguard-шаг; для схем нужен соответствующий файл BFScan |
@@ -57,19 +61,20 @@ docker run --rm -it --network host \
 Если список скрытых уже есть (например из прошлого прогона — `out/<pkg>.hidden.jsonl`
 или бэкап), можно пропустить сбор трафика и сразу делать срез и схемы тел:
 ```bash
-docker run --rm -it --network host \
-  -v "$PWD/apk:/work/apk" -v "$PWD/out:/work/out" \
-  -e ADB_DEVICE=127.0.0.1:6562 \
+docker run --rm \
+  -v "$PWD/apk:/work/apk:ro" -v "$PWD/out:/work/out" \
   -e HIDDEN_IN=/work/out/приложение.hidden.jsonl \
   hidden-scanner /work/apk/приложение.apk
 ```
 (hidden-файл тоже монтируй в контейнер — например положи в `./out`, тогда путь
 внутри будет `/work/out/...`.)
 
+Режимы `HIDDEN_IN` и `SLICE_IN` работают без устройства. В обоих режимах передайте APK для определения пакета и положите `<pkg>_methods.md` соответствующей сборки в `OUT_DIR` для построения схем. Если заданы обе переменные, скрипт выбирает `SLICE_IN`.
+
 ## Что на выходе (в `./out/`)
 * `<pkg>_methods.md` — все статические эндпоинты (BFScan).
 * `<pkg>.dynamic.jsonl` — трафик, собранный пентестером.
-* `<pkg>.hidden.jsonl` + `.report.txt` — **скрытые запросы** (в коде есть, не вызваны).
+* `<pkg>.hidden.jsonl` + `.report.txt` — статусы объявлений и сводка. Срез использует только записи со статусом `hidden`.
 * `<pkg>.slice.jsonl` — срез скрытых (call-sites, стражи, провенанс аргументов).
 * `<pkg>.body-schema.jsonl` — варианты схем из примеров BFScan. Для готового среза положите соответствующий `<pkg>_methods.md` в выходную директорию. При отсутствии описания запись получает статус `missing_declaration`.
 
