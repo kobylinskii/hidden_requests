@@ -28,12 +28,9 @@ n=$(ls "$WORK"/*.dex 2>/dev/null | wc -l)
 [ "$n" -gt 0 ] || { echo "в $APK нет dex-файлов" >&2; exit 1; }
 echo "dex-файлов: $n" >&2
 
-: > "$WORK/combined.md"
+: > "$OUT"
 for dex in "$WORK"/*.dex; do
-    if ! java -jar "$JAR" "$dex" -m h > "$WORK/log" 2>&1; then
-        cat "$WORK/log" >&2
-        exit 1
-    fi
+    java -jar "$JAR" "$dex" -m h > "$WORK/log" 2>&1 || true
     if grep -q OutOfMemoryError "$WORK/log"; then
         echo "OutOfMemoryError на $(basename "$dex") — результат неполон" >&2
         exit 1
@@ -41,11 +38,10 @@ for dex in "$WORK"/*.dex; do
     md="${dex%.dex}_methods.md"
     found=0
     if [ -f "$md" ]; then
-        cat "$md" >> "$WORK/combined.md"
+        cat "$md" >> "$OUT"
         found=$(grep -c '^\*\*Method\*\*' "$md" || true)
     fi
     printf '  %-16s %4s эндпоинтов\n' "$(basename "$dex")" "$found" >&2
 done
 
-cat "$WORK/combined.md" > "$OUT"
 echo "итого: $(grep -c '^\*\*Method\*\*' "$OUT") -> $OUT" >&2

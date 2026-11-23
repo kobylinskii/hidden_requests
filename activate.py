@@ -698,7 +698,7 @@ def _ensure_running(device, pkg, tries=3, non_interactive=False, report=None):
         return pid
     return None
 
-def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False, non_interactive=False):
+def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, paths=None, skip_dx=False, plans=None, recurse_args=False, attach=False, non_interactive=False, seed_path=None):
     """Возвращает namespace(run_key, preflight), замкнутый на пакет и Frida-сессию.
     dx_provider() лениво отдаёт androguard dx (загрузка 138MB APK ~130с) — зовётся
     только когда dx реально нужен (валидация overrides/fields, smali для openai-
@@ -707,6 +707,16 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
     import frida/trace здесь, а не на верху модуля — offline-пути должны работать
     без установленного frida."""
     import frida, time, trace, signal
+    # Карта параметров из шага сбора (trace.py --params): листья name/val/url.
+    # Сеется в pool агента ОДИН раз после загрузки (дополняет пассивный harvest).
+    seed_items = []
+    if seed_path and Path(seed_path).exists():
+        for line in Path(seed_path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try: seed_items.append(json.loads(line))
+                except Exception: pass
+        print(f"[seed] карта параметров: {len(seed_items)} записей из {seed_path}", file=sys.stderr)
     _me = {}
     def me(cls, kind, name, sig):
         if skip_dx:                              # без DEX-валидации (кривой член упадёт на устройстве)
@@ -716,6 +726,10 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         return _me["f"](cls, kind, name, sig)
     device = trace.pick_device(None)
     import threading, types
+    # _SETTLE даёт Retrofit построить прокси ДО arm (иначе call_retrofit не найдёт
+    # инстанс) и служит ОКНОМ HARVEST (б2b): залогиненное приложение на старте
+    # рефрешит токен, грузит профиль/устройства — реальные значения попадают в
+    # harvest-пул агента ещё до форс-вызова, и patchForced наполняет ими поля. §4.8.
     _SETTLE = 4.0
 
     def _plan_for(rec, stage):
@@ -765,6 +779,12 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         if on_message:
             agent.on("message", on_message)
         agent.load()
+        if seed_items:
+            try:
+                n = agent.exports_sync.seed_pool(seed_items)
+                print(f"[seed] засеяно в pool: {n}", file=sys.stderr)
+            except Exception as e:
+                print(f"[seed] seedPool не удался: {e}", file=sys.stderr)
         if not attach:
             device.resume(pid)
         time.sleep(_SETTLE)   # иначе okhttp/build-хук не успевает встать (проверено)
@@ -817,7 +837,8 @@ def activate_on_device(dx_provider, pkg, backend, wait_t, manual_path=None, path
         session = pid = agent = None
         seen = {"hit": False, "req": None, "resp": None}
         # protobuf/gRPC: тело — сырой okhttp3.RequestBody (бинарный блоб), а не JSON-
-        # DTO. При краше процесс для такого запроса повторно не открываем.
+        # DTO. JSON-наполнение (заглушки/harvest) неприменимо; форс детерминированно
+        # крашит процесс → НЕ ретраим реопеном (пустая трата: max_open=1).
         pb = any("okhttp3/RequestBody" in t for t in (rec.get("arg_types") or []))
         max_open = 1 if pb else 3
 
@@ -1016,6 +1037,8 @@ def _params_real(plan, snap, rec=None):
     нет args)."""
     if not snap or not snap.get("url") or not snap.get("matched"):
         return False
+    # Заглушка УЦЕЛЕЛА в запросе (не затёрта harvest) → тир (в), НЕ app-built.
+    # Смотрим на факт снимка, а не на план: harvest-наполненное поле = реальное.
     if _has_stub_marker(snap.get("url", ""), snap.get("body", "")):
         return False
     data_cost = (rec or {}).get("data_cost")
@@ -1049,7 +1072,8 @@ def _check_params_real():
     assert not _params_real({"args": []}, {"url": "", "matched": True}, none_rec)
     # _has_real_data: вложенность, пустые листья
     assert _has_real_data("/x", '{"a":{"b":"z"}}') and not _has_real_data("/x", '{"a":{"b":""}}')
-    # Классификация опирается на снимок запроса даже тогда, когда в плане есть $stub.
+    # РЕГРЕССИЯ: план нёс $stub, но harvest затёр его реальным → тело без "stub" = б1
+    # (раньше plan-stub ложно метил synth и прятал единственный harvest-win).
     assert _params_real({"args": [{"index": 0, "value": {"$stub": "Ljava/lang/String;"}}]},
                         {"url": "/x", "matched": True, "body": '{"code":"1111"}'}, obj_rec)
     # уцелевшая заглушка в теле → НЕ б1
@@ -1080,6 +1104,10 @@ def _honest_level(r):
     url, body = msnap.get("url", "") or "", msnap.get("body", "") or ""
     if not _has_real_data(url, body):
         return ("а", msnap, mstage)
+    # synth — ПО ФАКТУ запроса: уцелела ли наша заглушка. Поле, наполненное harvest
+    # из карты/стора (←traffic/←store), заглушку в запросе затирает → это РЕАЛЬНЫЕ
+    # данные (б1), а не synth, даже если план содержал $stub (иначе метрика прячет
+    # ровно то, ради чего harvest и делался).
     synth = _has_stub_marker(url, body)
     return ("в" if synth else "б1", msnap, mstage)
 
@@ -1087,7 +1115,9 @@ def _honest_level(r):
 def _has_stub_marker(url, body):
     """В ФАКТИЧЕСКОМ запросе уцелела наша $stub-заглушка: маркер "stub" в JSON-теле,
     или значение query-параметра == 'stub', или path-сегмент == 'stub' (GET с
-    path-параметром: /streams/stub, /pop-up/stub), или form-поле == 'stub'."""
+    path-параметром: /streams/stub, /pop-up/stub), или form-поле == 'stub'. Если
+    harvest заменил заглушку реальным значением — "stub" в запросе не останется, и
+    это уже не synthesized (ключевой признак тира: смотрим на провод, не на план)."""
     if body and '"stub"' in body:
         return True
     from urllib.parse import urlparse, parse_qsl
@@ -1119,6 +1149,11 @@ def report(results):
     def _matched(r):
         return any((s.get("request") or {}).get("matched") for s in r.get("stages", []))
     wire = sum(1 for r in results if _matched(r))
+    def _filled_any(r, mark):
+        return any(mark in f
+                   for s in r.get("stages", []) for f in ((s.get("request") or {}).get("filled") or []))
+    store_n = sum(1 for r in results if _filled_any(r, "←store:"))     # T3 сессия/uid/device
+    traffic_n = sum(1 for r in results if _filled_any(r, "←traffic:"))  # T4 карта трафика
     # protobuf/gRPC: тело — бинарный okhttp3.RequestBody, JSON-наполнение неприменимо.
     # Считаем отдельно, чтобы не путать с обычным пустым [а].
     pb_wire = sum(1 for r in results if r.get("protobuf") and _matched(r))
@@ -1167,8 +1202,11 @@ def report(results):
          f"  (б1) реальные данные на проводе:  {b1}/{wire}",
          f"  (в)  уцелела заглушка ($stub):    {synth}/{wire}",
          f"  (а)  тело пустое/бинарное:        {wire - b1 - synth}/{wire}",
-         f"       из них protobuf/gRPC (бинарный протокол): {pb_wire}"
+         f"       из них protobuf/gRPC (бинарный протокол, вне JSON-наполнения): {pb_wire}"
          f"  [всего protobuf-ключей: {pb_total}]",
+         "  источник реальных (наполнено ≥1 поле; T0–T2 без маркера — считаем остатком):",
+         f"       T4 harvest (карта трафика):  {traffic_n}",
+         f"       T3 стор (сессия/uid/device): {store_n}",
          "",
          f"ОТВЕТ СЕРВЕРА снят (сырая улика, толкует человек/агент): {len(resps)}/{wire}",
          "",
@@ -1633,6 +1671,9 @@ def main():
     ap.add_argument("--all-reached", action="store_true",
                     help="активировать ВСЕ достижимые скрытые ключи (сканер), а не только "
                          "activation_exact — ступень 0 зовёт метод напрямую, точный путь не нужен")
+    ap.add_argument("--seed", type=Path,
+                    help="карта параметров из trace.py (--params): листья трафика для "
+                         "наполнения скрытых запросов реальными значениями вместо $stub")
     ap.add_argument("--recurse-args", action="store_true",
                     help="stage0: аргументы рекурсивно из arg_sources, $stub на user-input листьях (тир synthesized)")
     ap.add_argument("--stages", default="0,1,2",
@@ -1697,7 +1738,7 @@ def main():
         plans = json.loads(args.plans_file.read_text(encoding="utf-8"))
     runner = activate_on_device(dx_provider, pkg, args.backend, args.wait, args.manual_plan,
                                 paths, args.skip_dx, plans, args.recurse_args, args.attach,
-                                args.non_interactive)
+                                args.non_interactive, args.seed)
     total = len(recs)
     print(f"[активация] ключей к вызову: {total}", file=sys.stderr)
     # Case-1: mech/stage-0 (call_retrofit) минтит прокси через retrofit2.Retrofit.

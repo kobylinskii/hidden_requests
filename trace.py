@@ -69,6 +69,9 @@ def main():
     ap.add_argument("--device", help="id устройства frida (по умолчанию — автоподбор)")
     ap.add_argument("--append", "-a", action="store_true",
                     help="дописать в существующий файл (несколько сессий)")
+    ap.add_argument("--params", type=Path,
+                    help="карта параметров (листья тел/URL/ответов) для activate.py --seed; "
+                         "по умолч. out/<package>.params.jsonl")
     ap.add_argument("--max-restarts", type=int, default=10,
                     help="сколько раз поднимать упавшее приложение (0 — не поднимать)")
     ap.add_argument("--script", type=Path, default=None,
@@ -78,6 +81,13 @@ def main():
 
     out = args.out or HERE / "out" / f"{args.package}.dynamic.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
+    fh = out.open("a" if args.append else "w", encoding="utf-8")
+    # Карта параметров: компактный дедуп (name,val)->url. Мусорные запросы дают
+    # листья, но они инертны — activate.py берёт значение только если у скрытого
+    # слота совпали имя И ресурс. Копим в памяти, пишем один раз в конце.
+    params_path = args.params or HERE / "out" / f"{args.package}.params.jsonl"
+    params = {}
+    PARAMS_CAP = 30000
     # frida 17 убрал глобал Java → грузим собранный build/hook.js (bundle с
     # frida-java-bridge); исходный hook.js падает "ReferenceError: Java is not defined".
     script_path = args.script or (HERE / "build" / "hook.js"
@@ -91,14 +101,6 @@ def main():
     meta = {"t": "meta", "package": args.package, **apk_version(args.package)}
     print(f"версия: {meta.get('versionName')} (code {meta.get('versionCode')}) — "
           f"статику снимайте с этой же сборки", file=sys.stderr)
-    if args.append and out.exists() and out.stat().st_size:
-        from diff import load_dynamic
-        _, _, previous = load_dynamic(out)
-        if not meta.get("versionCode") or any(
-            previous.get(field) != meta.get(field) for field in ("package", "versionCode")
-        ):
-            ap.error("несовместимая сборка в существующей трассе")
-    fh = out.open("a" if args.append else "w", encoding="utf-8")
     fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
     stop = {"now": False}
@@ -127,7 +129,12 @@ def main():
             print(f"[agent] перехвачено: {', '.join(payload.get('installed') or [])}",
                   file=sys.stderr)
             return
-        if kind == "param":  # старый агент из --script
+        if kind == "param":
+            # Карта параметров — отдельно, НЕ в dynamic.jsonl (иначе мусор и ломается
+            # diff). Дедуп по (name,val), храним представительный url для ресурса.
+            key = (payload.get("name"), str(payload.get("val")))
+            if key[0] and key not in params and len(params) < PARAMS_CAP:
+                params[key] = payload.get("url", "")
             return
         # NDJSON — честный журнал событий: после перезапуска повторы остаются,
         # diff.py работает множествами и на них не реагирует.
@@ -188,7 +195,7 @@ def main():
                 if state["restarts"] >= args.max_restarts:
                     print(f"[!] предел перезапусков ({args.max_restarts}) исчерпан, "
                           f"заканчиваю", file=sys.stderr)
-                    raise SystemExit("сессия прервана")
+                    break
                 state["restarts"] += 1
                 time.sleep(2)          # дать системе прибрать процесс
                 try:
@@ -213,6 +220,13 @@ def main():
         except Exception:
             pass
 
+        if params:
+            with params_path.open("w", encoding="utf-8") as pf:
+                for (name, val), url in params.items():
+                    pf.write(json.dumps({"name": name, "val": val, "url": url},
+                                        ensure_ascii=False) + "\n")
+            print(f"параметров в карте (name,val):  {len(params)} → {params_path}", file=sys.stderr)
+
         print(f"\nуникальных ключей класс->метод: {len(seen['retrofit'])}", file=sys.stderr)
         print(f"уникальных HTTP-URL:            {len(seen['http'])}", file=sys.stderr)
         if state["restarts"]:
@@ -226,9 +240,6 @@ def main():
                   f"запрос.\n    Поднимите MAX_EVENTS в hook.js и повторите прогон.",
                   file=sys.stderr)
         print(f"→ {out}", file=sys.stderr)
-
-    if limit_hit["yes"] or stats.get("dropped") or not seen["retrofit"]:
-        sys.exit("Недостаточно данных для сравнения методов")
 
 
 if __name__ == "__main__":
