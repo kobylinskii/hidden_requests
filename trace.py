@@ -18,10 +18,12 @@
 import argparse
 import json
 import re
+import shlex
 import signal
 import subprocess
 import sys
 import time
+from uuid import uuid4
 from pathlib import Path
 
 import frida
@@ -29,12 +31,12 @@ import frida
 HERE = Path(__file__).resolve().parent
 
 
-def apk_version(package):
+def apk_version(package, serial):
     """Версия установленного пакета. Статика и динамика обязаны быть сняты с
     одной сборки: после минификации имена методов у разных сборок разные, и
     сопоставление молча даёт 100% «скрытых» запросов."""
     try:
-        out = subprocess.run(["adb", "shell", "dumpsys", "package", package],
+        out = subprocess.run(["adb", "-s", serial, "shell", "dumpsys", "package", package],
                              capture_output=True, text=True, timeout=20).stdout
     except Exception:
         return {}
@@ -42,6 +44,21 @@ def apk_version(package):
     code = re.search(r"versionCode=(\d+)", out)
     return {"versionName": name.group(1) if name else None,
             "versionCode": code.group(1) if code else None}
+
+
+def installed_build(package, serial):
+    adb = ["adb", "-s", serial, "shell"]
+    try:
+        listing = subprocess.check_output([*adb, "pm", "path", package], text=True, timeout=20)
+        paths = [line.removeprefix("package:") for line in listing.splitlines()
+                 if line.startswith("package:")]
+        if len(paths) != 1:
+            return None
+        digest = subprocess.check_output([*adb, "sha256sum " + shlex.quote(paths[0])],
+                                         text=True, timeout=60).split()[0]
+        return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else None
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return None
 
 
 def pick_device(spec):
@@ -69,9 +86,6 @@ def main():
     ap.add_argument("--device", help="id устройства frida (по умолчанию — автоподбор)")
     ap.add_argument("--append", "-a", action="store_true",
                     help="дописать в существующий файл (несколько сессий)")
-    ap.add_argument("--params", type=Path,
-                    help="карта параметров (листья тел/URL/ответов) для activate.py --seed; "
-                         "по умолч. out/<package>.params.jsonl")
     ap.add_argument("--max-restarts", type=int, default=10,
                     help="сколько раз поднимать упавшее приложение (0 — не поднимать)")
     ap.add_argument("--script", type=Path, default=None,
@@ -81,27 +95,29 @@ def main():
 
     out = args.out or HERE / "out" / f"{args.package}.dynamic.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
-    fh = out.open("a" if args.append else "w", encoding="utf-8")
-    # Карта параметров: компактный дедуп (name,val)->url. Мусорные запросы дают
-    # листья, но они инертны — activate.py берёт значение только если у скрытого
-    # слота совпали имя И ресурс. Копим в памяти, пишем один раз в конце.
-    params_path = args.params or HERE / "out" / f"{args.package}.params.jsonl"
-    params = {}
-    PARAMS_CAP = 30000
     # frida 17 убрал глобал Java → грузим собранный build/hook.js (bundle с
     # frida-java-bridge); исходный hook.js падает "ReferenceError: Java is not defined".
     script_path = args.script or (HERE / "build" / "hook.js"
                                   if (HERE / "build" / "hook.js").exists() else HERE / "hook.js")
     script_src = script_path.read_text(encoding="utf-8")
-    print(f"агент: {script_path.relative_to(HERE)}", file=sys.stderr)
+    print(f"агент: {script_path}", file=sys.stderr)
 
     device = pick_device(args.device)
     print(f"устройство: {device.id} ({device.name})", file=sys.stderr)
 
-    meta = {"t": "meta", "package": args.package, **apk_version(args.package)}
-    print(f"версия: {meta.get('versionName')} (code {meta.get('versionCode')}) — "
-          f"статику снимайте с этой же сборки", file=sys.stderr)
+    build = installed_build(args.package, device.id)
+    session_id = uuid4().hex
+    meta = {"t": "meta", "package": args.package, "build": build, "session": session_id,
+            **apk_version(args.package, device.id)}
+    if args.append and out.exists() and out.stat().st_size:
+        from request_pipeline import read_trace
+        if not build or not read_trace(out, build)["complete"]:
+            ap.error("к существующей трассе можно дописать только сеанс той же подтверждённой сборки")
+    fh = out.open("a" if args.append else "w", encoding="utf-8", buffering=1)
     fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+    issues = set()
+    if build is None:
+        issues.add("installed_build_unverified")
 
     stop = {"now": False}
     state = {"session": None, "script": None, "restart": False, "restarts": 0}
@@ -115,12 +131,15 @@ def main():
 
     def on_message(message, data):
         if message["type"] == "error":
+            issues.add("agent_error")
             print(f"[agent error] {message.get('description')}", file=sys.stderr)
             return
         payload = message.get("payload") or {}
         kind = payload.get("t")
         if kind == "log":
             msg = payload.get("msg", "")
+            if msg.startswith(("invoke:", "newProxyInstance:", "не удалось открыть handler")):
+                issues.add("hook_error")
             if "MAX_EVENTS" in msg:
                 limit_hit["yes"] = True
             print(f"[agent] {msg}", file=sys.stderr)
@@ -129,12 +148,7 @@ def main():
             print(f"[agent] перехвачено: {', '.join(payload.get('installed') or [])}",
                   file=sys.stderr)
             return
-        if kind == "param":
-            # Карта параметров — отдельно, НЕ в dynamic.jsonl (иначе мусор и ломается
-            # diff). Дедуп по (name,val), храним представительный url для ресурса.
-            key = (payload.get("name"), str(payload.get("val")))
-            if key[0] and key not in params and len(params) < PARAMS_CAP:
-                params[key] = payload.get("url", "")
+        if kind == "param":  # старый агент из --script
             return
         # NDJSON — честный журнал событий: после перезапуска повторы остаются,
         # diff.py работает множествами и на них не реагирует.
@@ -159,21 +173,25 @@ def main():
         if stop["now"] or reason == "application-requested":
             return
         print(f"\n[!] сессия отвалилась: {reason}", file=sys.stderr)
+        issues.add("unexpected_detach")
         state["restart"] = True
 
     def start():
         # Только spawn: Retrofit создаёт прокси рано, и при подключении к уже
         # запущенному процессу хук на newProxyInstance не увидит ни одного.
         pid = device.spawn([args.package])
-        session = device.attach(pid)
+        try:
+            session = device.attach(pid)
+        except Exception:
+            device.kill(pid)
+            raise
+        state["session"], state["script"] = session, None
         session.on("detached", on_detached)
         script = session.create_script(script_src)
         script.on("message", on_message)
         script.load()
         device.resume(pid)
-        state["session"], state["script"] = session, script
-
-    start()
+        state["script"] = script
 
     print(f"\nпишу в {out}\nисследуйте приложение; Ctrl-C — закончить\n", file=sys.stderr)
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("now", True))
@@ -181,6 +199,7 @@ def main():
     SATURATED = 60      # «без новых» дольше этого — считаем насыщением
     last_beat = time.time()
     try:
+        start()
         while not stop["now"]:
             now = time.time()
             if now - last_beat >= HEARTBEAT:
@@ -195,7 +214,7 @@ def main():
                 if state["restarts"] >= args.max_restarts:
                     print(f"[!] предел перезапусков ({args.max_restarts}) исчерпан, "
                           f"заканчиваю", file=sys.stderr)
-                    break
+                    raise SystemExit("сессия прервана")
                 state["restarts"] += 1
                 time.sleep(2)          # дать системе прибрать процесс
                 try:
@@ -213,19 +232,24 @@ def main():
             stats = state["script"].exports_sync.stats()
         except Exception as e:
             print(f"\nстатистику агента забрать не удалось: {e}", file=sys.stderr)
+        finally:
+            try:
+                if state["session"]:
+                    state["session"].detach()
+            except Exception:
+                issues.add("detach_failed")
+        if not stop["now"]:
+            issues.add("session_interrupted")
+        if not stats:
+            issues.add("final_stats_unavailable")
+        if limit_hit["yes"] or stats.get("dropped"):
+            issues.add("events_dropped")
+        if build is not None and installed_build(args.package, device.id) != build:
+            issues.add("installed_build_changed")
+        fh.write(json.dumps({"t": "end", "session": session_id, "build": build,
+                             "status": "partial" if issues else "complete",
+                             "reasons": sorted(issues)}, ensure_ascii=False) + "\n")
         fh.close()
-        try:
-            if state["session"]:
-                state["session"].detach()
-        except Exception:
-            pass
-
-        if params:
-            with params_path.open("w", encoding="utf-8") as pf:
-                for (name, val), url in params.items():
-                    pf.write(json.dumps({"name": name, "val": val, "url": url},
-                                        ensure_ascii=False) + "\n")
-            print(f"параметров в карте (name,val):  {len(params)} → {params_path}", file=sys.stderr)
 
         print(f"\nуникальных ключей класс->метод: {len(seen['retrofit'])}", file=sys.stderr)
         print(f"уникальных HTTP-URL:            {len(seen['http'])}", file=sys.stderr)
@@ -240,6 +264,9 @@ def main():
                   f"запрос.\n    Поднимите MAX_EVENTS в hook.js и повторите прогон.",
                   file=sys.stderr)
         print(f"→ {out}", file=sys.stderr)
+
+    if issues:
+        sys.exit("Частичная трасса сохранена для диагностики")
 
 
 if __name__ == "__main__":

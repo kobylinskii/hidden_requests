@@ -13,3 +13,15 @@ BFScan/src/
 BFScan/assets/
 *.md
 !DOCKER.md
+.codex/
+.claude/
+.superpowers/
+.agents/
+.aws/
+.ruff_cache/
+traffic-backups/
+BACKUP
+BFScan/target/classes/
+BFScan/target/archive-tmp/
+BFScan/target/generated-sources/
+BFScan/target/maven-status/

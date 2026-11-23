@@ -49,34 +49,36 @@ function emit(obj) {
     send(obj);
 }
 
-// Параметры карты — ОТДЕЛЬНЫЙ канал: свой предел и дедуп в агенте, чтобы поток
-// листьев (тела+ответы) НЕ вытеснял http/retrofit (их ест только emit/sent →
-// diff не занижается). Дедуп по (name,val) схлопывает повторы/поллинг в агенте.
-var seenParam = {};
-var paramSent = 0;
-var PARAM_MAX = 50000;
-function emitParam(name, val, url) {
-    if (!name || /^\d+$/.test(name)) return;      // имя-индекс массива ("0","1") — не поле
-    // Отсев заведомо-не-параметров (иначе забивают карту: ivi blurhash/dominant_color/
-    // title/synopsis — 30%+). Слот берёт id/slug/токен: без пробелов, без спецсимволов,
-    // не URL, не цвет, короткий. Числа/булевы проходят как есть.
-    if (typeof val === 'string') {
-        var v = val;
-        if (!v.length || v.length > 96) return;             // длинный текст (описание/синопсис)
-        if (/[\s#{}\[\]<>~*|^]/.test(v)) return;             // пробел(текст)/#(цвет)/blurhash-символы
-        if (/^https?:\/\//i.test(v)) return;                 // абсолютный URL (постер/лого)
-    }
-    var k = name + '\u0000' + val;
-    if (seenParam[k]) return;
-    seenParam[k] = true;
-    if (paramSent >= PARAM_MAX) return;      // свой предел — не трогает MAX_EVENTS
-    paramSent++;
-    send({ t: 'param', name: name, val: val, url: url, ts: Date.now() });
-}
-
 function note(msg) { send({ t: 'log', msg: String(msg) }); }
 
 /* ---------- слой 1: динамические прокси (Retrofit/Ktorfit) ---------- */
+
+function dexType(type) {
+    var name = String(type.getName());
+    var primitives = {void: 'V', boolean: 'Z', byte: 'B', char: 'C', short: 'S',
+        int: 'I', long: 'J', float: 'F', double: 'D'};
+    return primitives[name] || (name[0] === '[' ? name : 'L' + name + ';').replace(/\./g, '/');
+}
+
+var coveredInterfaces = {};
+function recordMethod(method, handler) {
+    var cls = String(method.getDeclaringClass().getName());
+    var m = String(method.getName());
+    var args = method.getParameterTypes();
+    var descriptor = '(';
+    for (var i = 0; i < args.length; i++) descriptor += dexType(args[i]);
+    descriptor += ')' + dexType(method.getReturnType());
+    var key = cls + '->' + m + descriptor;
+    if (!seenProxy[key]) {
+        seenProxy[key] = true;
+        emit({ t: 'retrofit', observation: 'method_call', cls: cls, m: m,
+            descriptor: descriptor, handler: handler });
+    }
+    if (handler.indexOf('retrofit2.Retrofit$') === 0 && !coveredInterfaces[cls]) {
+        coveredInterfaces[cls] = true;
+        emit({ t: 'coverage', interface: cls });
+    }
+}
 
 function hookHandlerClass(name) {
     if (hookedHandlers[name]) return;
@@ -97,15 +99,7 @@ function hookHandlerClass(name) {
     overloads.forEach(function (ov) {
         ov.implementation = function (proxy, method, args) {
             try {
-                if (method !== null) {
-                    var cls = method.getDeclaringClass().getName();
-                    var m = method.getName();
-                    var key = cls + '->' + m;
-                    if (!seenProxy[key]) {
-                        seenProxy[key] = true;
-                        emit({ t: 'retrofit', cls: cls, m: m, handler: name });
-                    }
-                }
+                if (method !== null) recordMethod(method, name);
             } catch (e) {
                 if (!loggedInvokeError) { loggedInvokeError = true; note('invoke: ' + e); }
             }
@@ -149,7 +143,7 @@ function stackTrace() {
     } catch (e) { return ''; }
 }
 
-function recordHttp(verb, url) {
+function recordHttp(verb, url, observation) {
     if (!url) return;
     var path = String(url).split('?')[0];
     var key = verb + ' ' + path;
@@ -160,49 +154,38 @@ function recordHttp(verb, url) {
     // библиотеки. При полной минификации retrofit2 признак пропадает — тогда
     // вызов попадёт в список «вне Retrofit», что в отчёте помечено как оценка.
     var viaRetrofit = st.indexOf('retrofit') !== -1 || st.indexOf('$Proxy') !== -1;
-    emit({
-        t: 'http', verb: verb, url: String(url),
+    var rec = {
+        t: 'http', observation: observation, verb: verb, url: String(url),
         via_retrofit: viaRetrofit,
         stack: st.split('\n').slice(0, 12).join('\n')
-    });
+    };
+    emit(rec);
 }
 
-// КАРТА ПАРАМЕТРОВ (б2b): эмитим примитивные листья тел/URL/ответов как
-// {t:'param', name, val, url}. Хост (trace.py) дедуплицирует в param-файл,
-// которым activate.py сеет pool. Канонический сборщик/матчинг — в activate.js;
-// здесь только компактный эмиттер (resource/shape считает activate.js.seedPool).
-// ponytail: сырые тела НЕ шлём (мусорных запросов много) — только листья ≤256 симв.
-function emitLeaves(obj, url) {
-    if (obj === null || typeof obj !== 'object') return;
-    for (var k in obj) {
-        var v = obj[k];
-        if (v !== null && typeof v === 'object') { emitLeaves(v, url); continue; }
-        var ok = (typeof v === 'string' && v !== '' && v !== 'stub' && v.length <= 256) ||
-                 (typeof v === 'number' && v !== 0) || typeof v === 'boolean';
-        if (ok) emitParam(k, v, url);
+function hookOkHttpResponse() {
+    try {
+        var Builder = Java.use('okhttp3.Response$Builder');
+        var build = Builder.build.overload();
+        build.implementation = function () {
+            var response = build.call(this);
+            try {
+                var request = response.request();
+                var url = String(request.url().toString());
+                var verb = String(request.method());
+                var status = response.code();
+                var key = 'response ' + verb + ' ' + url.split('?')[0] + ' ' + status;
+                if (!seenHttp[key]) {
+                    seenHttp[key] = true;
+                    emit({ t: 'response', observation: 'response_created',
+                        verb: verb, url: url, status: status });
+                }
+            } catch (e) {}
+            return response;
+        };
+        installed.push('okhttp3.Response$Builder.build');
+    } catch (e) {
+        note('Перехват создания HTTP-ответа недоступен: ' + e);
     }
-}
-function reqBodyText(req) {
-    try {
-        var rb = req.body(); if (rb === null) return null;
-        var B = Java.use('okio.Buffer'), buf = B.$new(); rb.writeTo(buf); return buf.readUtf8();
-    } catch (e) { return null; }
-}
-function harvestReq(request, url) {
-    try {
-        var b = reqBodyText(request);
-        if (b && b.charAt(0) === '{') { try { emitLeaves(JSON.parse(b), url); } catch (e) {} }
-        var qs = String(url).split('?')[1];
-        if (qs) qs.split('&').forEach(function (p) {
-            var i = p.indexOf('='); if (i <= 0) return;
-            try { emitParam(decodeURIComponent(p.slice(0, i)), decodeURIComponent(p.slice(i + 1)), url); }
-            catch (e) {}
-        });
-        // id в пути (/streams/<num|hex>) — под частым именем слота 'id'
-        String(url).split('?')[0].split('/').forEach(function (seg) {
-            if (/^\d+$/.test(seg) || /^[0-9a-f]{16,}$/i.test(seg)) emitParam('id', seg, url);
-        });
-    } catch (e) {}
 }
 
 function hookOkHttp() {
@@ -211,30 +194,12 @@ function hookOkHttp() {
         Client.newCall.implementation = function (request) {
             try {
                 var u = request.url().toString();
-                recordHttp(request.method(), u);
-                harvestReq(request, u);
+                recordHttp(request.method(), u, 'request_created');
             } catch (e) {}
             return this.newCall(request);
         };
         installed.push('okhttp3.OkHttpClient.newCall');
-        // Ответы: id/slug реальных сущностей приходят В ОТВЕТЕ (напр. список
-        // устройств для disallow-device). peekBody НЕ потребляет оригинал.
-        try {
-            var RespB = Java.use('okhttp3.Response$Builder');
-            RespB.build.implementation = function () {
-                var resp = this.build();
-                try {
-                    var ct = resp.header('Content-Type', '') || '';
-                    if (ct.indexOf('json') !== -1) {
-                        var txt = resp.peekBody(131072).string();
-                        if (txt && (txt.charAt(0) === '{' || txt.charAt(0) === '['))
-                            emitLeaves(JSON.parse(txt), resp.request().url().toString());
-                    }
-                } catch (e) {}
-                return resp;
-            };
-            installed.push('okhttp3.Response$Builder.build');
-        } catch (e) {}
+        hookOkHttpResponse();
         return true;
     } catch (e) {
         return false;      // класс ещё не загружен либо переименован R8
@@ -262,7 +227,7 @@ function hookUrlConnection() {
         URL.openConnection.overload().implementation = function () {
             try {
                 var u = this.toString();
-                if (u.indexOf('http') === 0) recordHttp('GET?', u);
+                if (u.indexOf('http') === 0) recordHttp('GET?', u, 'connection_opened');
             } catch (e) {}
             return this.openConnection();
         };

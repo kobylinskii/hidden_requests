@@ -726,8 +726,7 @@ device/config. Вывод для ВКР: **техника переносима �
 поднять `/data/local/tmp/frida-server17`. Самовосстанавливающийся драйвер прогона (батчи, ревайв VM на
 offline, ретрай env/crash-потерь, preseed+merge) — `scratchpad/driver.py` (не в репо).
 
-Дизайн — `docs/superpowers/specs/2026-10-16-frida-forced-activation-design.md`,
-план реализации — `docs/superpowers/plans/2026-10-16-frida-forced-activation.md`.
+Дизайн — `docs/superpowers/specs/2026-10-16-frida-forced-activation-design.md`.
 
 ---
 

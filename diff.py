@@ -27,11 +27,37 @@ _METHOD = re.compile(r"^\*\*Method\*\*:\s*(.+?)->(.+?)\s*$")
 _REQUEST = re.compile(r"^([A-Z]+)\s+(\S+)\s+HTTP/1\.1\s*$")
 
 
+def reject_non_json_constant(value):
+    raise ValueError(f"Недопустимое значение JSON: {value}")
+
+
 def parse_bfscan(md_path: Path) -> list:
     """Разбирает вывод BFScan. Формат: `**Method**: fqcn->name`, затем блок с
     сырым HTTP-запросом, первая строка которого `VERB /path?query HTTP/1.1`."""
     out, cls, name, source = [], None, None, None
+    body_lines = None
+
+    def finish_body():
+        headers, separator, body = "\n".join(body_lines).partition("\n\n")
+        content_type = next((line.split(":", 1)[1].strip() for line in headers.splitlines()
+                             if line.lower().startswith("content-type:")), None)
+        example = {"content_type": content_type, "has_example": bool(separator and body.strip())}
+        if example["has_example"]:
+            example["body_text"] = body
+            try:
+                example["template"] = json.loads(body, parse_constant=reject_non_json_constant)
+            except ValueError:
+                example["template_text"] = body
+        out[-1]["bfscan"] = example
+
     for line in md_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if body_lines is not None:
+            if line.strip() == "```":
+                finish_body()
+                body_lines = None
+            else:
+                body_lines.append(line)
+            continue
         m = _METHOD.match(line)
         if m:
             cls, name, source = m.group(1), m.group(2), None
@@ -43,6 +69,7 @@ def parse_bfscan(md_path: Path) -> list:
         if r and cls:
             path, _, query = r.group(2).partition("?")
             out.append({
+                "declaration_id": len(out) + 1,
                 "key": f"{cls}->{name}",
                 "cls": cls,
                 "method": name,
@@ -51,6 +78,7 @@ def parse_bfscan(md_path: Path) -> list:
                 "query": query,
                 "source": source,
             })
+            body_lines = [line]
     return out
 
 
@@ -64,14 +92,17 @@ def load_dynamic(path: Path):
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
-            print(f"warn: {path}:{n} не JSON, пропущено", file=sys.stderr)
-            continue
+            raise ValueError(f"{path}:{n}: повреждённая запись JSON") from None
         t = ev.get("t")
         if t == "retrofit":
             called.add(f"{ev['cls']}->{ev['m']}")
         elif t == "http":
             http.append(ev)
         elif t == "meta":
+            if meta and (not ev.get("versionCode") or
+                         ev.get("package") != meta.get("package") or
+                         str(ev["versionCode"]) != str(meta.get("versionCode"))):
+                raise ValueError(f"{path}:{n}: несовместимые метаданные сессий")
             meta = ev
     return called, http, meta
 
@@ -84,7 +115,8 @@ def report(static, called, http, meta=None, verbose=False):
         by_key[s["key"]].append(s)
 
     hidden_keys = sorted(k for k in by_key if k not in called)
-    found_keys = sorted(k for k in by_key if k in called)
+    found_keys = sorted(k for k in by_key if k in called and len(by_key[k]) == 1)
+    ambiguous = sorted(k for k in by_key if k in called and len(by_key[k]) > 1)
     # Метод вызван, класс BFScan знает, а самой записи в статике нет.
     static_classes = {s["cls"] for s in static}
     missed_by_bfscan = sorted(k for k in called - set(by_key)
@@ -100,6 +132,7 @@ def report(static, called, http, meta=None, verbose=False):
           f"versionName={meta.get('versionName')} versionCode={meta.get('versionCode')}")
     w(f"Статических эндпоинтов (записей BFScan): {len(static)}")
     w(f"Уникальных ключей класс->метод:          {len(by_key)}")
+    w(f"Вызов с неоднозначным объявлением: {len(ambiguous)}")
     w(f"Вызвано в рантайме:                      {len(found_keys)}")
     pct = f" ({len(hidden_keys) / len(by_key) * 100:.1f}%)" if by_key else ""
     w(f"СКРЫТО (ни разу не вызвано):             {len(hidden_keys)}{pct}")
@@ -155,7 +188,7 @@ def report(static, called, http, meta=None, verbose=False):
     if verbose and found_keys:
         w("")
         w("-" * 78)
-        w(f"НАЙДЕНО В ТРАФИКЕ ({len(found_keys)})")
+        w(f"НАБЛЮДАЛСЯ ВЫЗОВ МЕТОДА ({len(found_keys)})")
         w("-" * 78)
         for key in found_keys:
             for r in by_key[key]:
@@ -165,39 +198,44 @@ def report(static, called, http, meta=None, verbose=False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description="Сравнить каталог BFScan с трассой той же сборки")
+    ap.add_argument("--apk", type=Path, help="APK для проверки сборки и разрешения DEX-дескрипторов")
     ap.add_argument("--static", required=True, type=Path, help="BFScan *_methods.md")
     ap.add_argument("--dynamic", required=True, type=Path, help="NDJSON от trace.py")
-    ap.add_argument("--out", type=Path, help="куда сохранить hidden.jsonl")
-    ap.add_argument("-v", "--verbose", action="store_true", help="печатать и FOUND")
+    ap.add_argument("--out", type=Path, help="куда сохранить сравнение в JSONL")
+    ap.add_argument("-v", "--verbose", action="store_true", help="показать все объявления")
     args = ap.parse_args()
 
-    static = parse_bfscan(args.static)
-    if not static:
-        sys.exit(f"error: в {args.static} не найдено ни одной записи BFScan")
-    called, http, meta = load_dynamic(args.dynamic)
+    from collections import Counter
+    from types import SimpleNamespace
+    from request_artifacts import sha256, write_rows
+    from request_pipeline import compare_artifacts, publish
 
-    text, hidden_keys, by_key, missed, non_retrofit = report(
-        static, called, http, meta, args.verbose)
-    print(text)
+    try:
+        if args.apk:
+            from slice import load_apk
+            build = sha256(args.apk)
+            _, dx = load_apk(args.apk)
+            rows, complete = compare_artifacts(
+                SimpleNamespace(catalog=args.static, trace=args.dynamic), build, dx)
+            if args.out:
+                publish(args.out, ({"build": build, **row} for row in rows), build, complete)
+        else:
+            # Old catalogs are still readable for diagnostics. They have no
+            # verified relation to the observed Android build or DEX methods.
+            rows = [{**row, "status": "insufficient_data", "reason": "apk_required_for_comparison"}
+                    for row in parse_bfscan(args.static)]
+            if args.out:
+                write_rows(args.out, rows)
+    except (OSError, ValueError) as error:
+        ap.error(str(error))
 
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        with args.out.open("w", encoding="utf-8") as f:
-            if meta:  # версия сборки — slice.py сверит её с APK
-                f.write(json.dumps({**meta, "status": "meta"}, ensure_ascii=False) + "\n")
-            for key in hidden_keys:
-                for r in by_key[key]:
-                    f.write(json.dumps({**r, "status": "hidden"},
-                                       ensure_ascii=False) + "\n")
-            for key in missed:
-                f.write(json.dumps({"key": key, "status": "not_in_static"},
-                                   ensure_ascii=False) + "\n")
-            for e in non_retrofit:
-                f.write(json.dumps({**e, "status": "non_retrofit"},
-                                   ensure_ascii=False) + "\n")
-        print(f"\n→ {args.out}", file=sys.stderr)
+    counts = Counter(row["status"] for row in rows)
+    print("Сравнение: " + ", ".join(f"{status}={counts[status]}" for status in
+                                    ("observed", "not_observed", "insufficient_data")))
+    if args.verbose:
+        for row in rows:
+            print(f"{row['status']:18} {row['key']} {row['verb']} {row['path']}")
 
 
 def _selfcheck():

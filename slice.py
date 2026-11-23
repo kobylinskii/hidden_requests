@@ -1167,6 +1167,51 @@ def arg_sources_of_call(fr, offset, cls, method, depth=3):
             for i, r in enumerate(regs)]
 
 
+def _is_concrete_source(s):
+    """Источник несёт конкретное значение/продюсера (не голый вход метода).
+    Подъём через $default-мост заменяет param только на такой — иначе
+    типизированный $stub лучше null из `const null`-дефолта вызывающего."""
+    k = s.get("k")
+    if k in ("new", "invoke", "field"):
+        return True
+    if k == "const":
+        return s.get("value") not in (None, 0, "0")
+    if k == "phi":
+        return any(_is_concrete_source(a) for a in s.get("alts", []))
+    return False
+
+
+def _climb_default_bridge(dx, bridge_ma, srcs):
+    """Kotlin `name$default`-мост форвардит СВОИ параметры в скрытый вызов →
+    каждый проброшенный аргумент вырождается в {k:param}. Реальные литералы —
+    у вызывающего МОСТ (кладёт их в invoke name$default перед mask+marker).
+    Один хоп вверх к первому НЕ-синтетическому вызывающему: param-источник
+    заменяем источником соответствующего фактического аргумента $default, если
+    тот конкретен (монотонно — только апгрейд param→значение). $default
+    статический: факт.арг[0]=owner, семантический форвард-индекс i ↔ i+1.
+    ponytail: один хоп, первый вызывающий — не points-to; глубже уводит в
+    shared-interface routing (см. _DEPTH_LIMIT)."""
+    bcls = _fqcn(bridge_ma.class_name)
+    sites = [s for s in resolve_call_sites(dx, bcls, bridge_ma.name)
+             if not s["caller"].split("->")[-1].endswith("$default")]
+    if not sites:
+        return srcs
+    cfr = frame_of(sites[0]["caller_ma"])
+    if cfr is None:
+        return srcs
+    by_idx = {c["index"]: c["source"]
+              for c in arg_sources_of_call(cfr, sites[0]["offset"], bcls, bridge_ma.name)}
+    out = []
+    for s in srcs:
+        src = s["source"]
+        if src.get("k") == "param":
+            up = by_idx.get(s["index"] + 1)   # +1: факт.арг[0] моста = owner
+            if up and _is_concrete_source(up):
+                src = up
+        out.append({"index": s["index"], "source": src})
+    return out
+
+
 def _ctor_args_of(fr, block, use_pos, dto_reg, dto_type):
     """Провенанс фактических ctor-аргументов инлайн-DTO (статический продюсер
     полей тела запроса). Ищет invoke-direct <dto_type>-><init> на регистре
@@ -1459,7 +1504,13 @@ def slice_key(dx, key):
     fr0 = frame_of(first["caller_ma"])
     if fr0 is not None:
         rec["args"] = args_of_call(fr0, first["offset"], cls, method)
-        rec["arg_sources"] = arg_sources_of_call(fr0, first["offset"], cls, method)
+        asrc = arg_sources_of_call(fr0, first["offset"], cls, method)
+        # $default-мост форвардит свои параметры → проброшенные аргументы = param;
+        # один хоп вверх к реальному вызывающему моста поднимает литералы (§5.7).
+        if first["caller_ma"].name.endswith("$default") and any(
+                s["source"].get("k") == "param" for s in asrc):
+            asrc = _climb_default_bridge(dx, first["caller_ma"], asrc)
+        rec["arg_sources"] = asrc
     if w["depth_capped"]:
         rec["notes"].append("depth_cap")
     if w["dead_ends"]:
@@ -1516,7 +1567,7 @@ def _check_slice_key(dx):
 
 def load_hidden(path):
     """out/<pkg>.hidden.jsonl (формат diff.py) -> список уникальных ключей со
-    status=hidden, порядок первого появления. Дубли — перегрузки одного и
+    status=hidden или not_observed, порядок первого появления. Дубли — перегрузки одного и
     того же класс->метод (diff.py схлопывает их по ключу на выходе, но не
     дедупит внутри файла), в срезе достаточно одной записи на ключ."""
     keys, seen = [], set()
@@ -1524,7 +1575,7 @@ def load_hidden(path):
         if not line.strip():
             continue
         r = json.loads(line)
-        if r.get("status") == "hidden" and r["key"] not in seen:
+        if r.get("status") in {"hidden", "not_observed"} and r["key"] not in seen:
             seen.add(r["key"])
             keys.append(r["key"])
     return keys

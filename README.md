@@ -1,4 +1,37 @@
-# Поиск скрытых HTTP-запросов: сопоставление, срез, принудительная активация
+# Сканер скрытых HTTP-запросов Android
+
+Сканер сопоставляет объявления HTTP-запросов в APK с вызовами, которые Frida
+зафиксировала за сеанс. Для каждого объявления со статусом `not_observed`
+он печатает тело из каталога BFScan и сохраняет обратный DEX-срез аргументов.
+
+| Результат | Что внутри |
+|---|---|
+| `<pkg>.hidden.jsonl` | Все объявления со статусами `observed`, `not_observed` или `insufficient_data` |
+| `<pkg>.bodies.jsonl` | По одной записи на скрытое объявление. Поле `body` содержит текст примера BFScan. Если примера нет, `body` равно `null` |
+| `<pkg>.request-slice.jsonl` | Места прямого вызова, типы аргументов и графы происхождения значений. Для объявления без прямого вызова указан `no_direct_call_sites` |
+
+Ключ для связи отчётов — пара `build` (SHA-256 APK) и `declaration_id`.
+Статус `not_observed` относится к исследованной сессии. При недостаточном
+покрытии объявление получает статус `insufficient_data`.
+
+## Запуск
+
+Для нового сбора нужны APK, Android-устройство с Frida и собранный образ.
+Пути к готовым артефактам позволяют повторить анализ без устройства.
+[Сборка образа, запуск с эмулятором и переменные окружения](DOCKER.md)
+
+При наличии локального Python-окружения с зависимостями сканера можно заново
+построить отчёты по сохранённому сравнению той же сборки. Поместите рядом с
+файлом сравнения его `.meta.json`.
+
+```bash
+OUT_DIR=out HIDDEN_IN=out/demo.local.notes.hidden.jsonl bash scan.sh apk/demo.apk
+```
+
+## Исследовательские материалы
+
+<details>
+<summary>Предыдущие эксперименты, отдельные CLI и результаты пилотов</summary>
 
 Скрытый запрос — эндпоинт, который есть в коде APK, но ни разу не выполнился при
 исследовании приложения. Репозиторий даёт инструменты для всех трёх этапов:
@@ -26,8 +59,7 @@ APK ──trace.py+hook.js──> *.dynamic.jsonl ─┘            │  стр�
 
 Контекст задачи, разбор статей-оснований и позиционирование диплома — `CONTEXT.md`.
 Дизайн `slice.py` — `docs/superpowers/specs/2026-09-28-static-backward-slice-design.md`,
-дизайн активации — `docs/superpowers/specs/2026-10-16-frida-forced-activation-design.md`,
-планы реализации — `docs/superpowers/plans/`.
+дизайн активации — `docs/superpowers/specs/2026-10-16-frida-forced-activation-design.md`.
 
 ---
 
@@ -113,7 +145,7 @@ adb shell monkey -p gpm.tnt_premier --throttle 500 --pct-syskeys 0 -v 380
 4. Свести и получить отчёт:
 
 ```bash
-python3 diff.py --static apk/gpm.tnt_premier_methods.md \
+python3 diff.py --apk apk/gpm.tnt_premier.apk --static apk/gpm.tnt_premier_methods.md \
                  --dynamic out/gpm.tnt_premier.dynamic.jsonl \
                  --out out/gpm.tnt_premier.hidden.jsonl
 ```
@@ -427,4 +459,5 @@ Retrofit-метода; 1 — ближайший вызывающий + форс 
 | `apk/` | APK, снятый с устройства, и вывод BFScan по нему |
 | `out/` | `*.dynamic.jsonl`, `*.hidden.jsonl`, `*.slice.jsonl`, `*.activation.jsonl`, `*.report.txt` |
 | `docs/superpowers/specs/` | дизайн-документы (срез, принудительная активация) |
-| `docs/superpowers/plans/` | планы реализации |
+
+</details>
