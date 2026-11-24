@@ -112,8 +112,9 @@ def control_deps(cfg, criterion, exit_node):
     return _control_closure(_direct_control_deps(cfg, exit_node), criterion)
 
 
-def min_path_guards(weight, children, tops, frontier, sink, *, uncertain_callers=(), missing_frames=()):
-    """Return (modeled lower bound, exact, best verified complete-path cost).
+def min_path_guards(weight, children, tops, frontier, sink, *,
+                    cha_uncertain=frozenset(), allocation_uncertain=frozenset(), missing_frames=()):
+    """Return lower bound, strict exact flag, strict cost, and allocation-tolerant cost.
 
     A stopped suffix can omit nonnegative weights upstream. A complete path
     additionally requires a recognized callback, resolved frames and direct
@@ -126,16 +127,16 @@ def min_path_guards(weight, children, tops, frontier, sink, *, uncertain_callers
         for target in targets:
             parents.setdefault(target, []).append(parent)
 
-    def distances(verified):
+    def distances(blocked=None):
         dist = {sink: 0}
         queue = [(0, 0, sink)]
         order = 0
         while queue:
             cost, _, node = heapq.heappop(queue)
-            if cost != dist[node] or (verified and node in uncertain_callers):
+            if cost != dist[node] or (blocked is not None and node in blocked):
                 continue
             for parent in parents.get(node, ()):
-                if verified and parent in missing_frames:
+                if blocked is not None and parent in missing_frames:
                     continue
                 candidate = cost + weight.get(parent, 0)
                 if candidate < dist.get(parent, float("inf")):
@@ -144,12 +145,14 @@ def min_path_guards(weight, children, tops, frontier, sink, *, uncertain_callers
                     heapq.heappush(queue, (candidate, order, parent))
         return dist
 
-    optimistic = distances(False)
+    optimistic = distances()
     lower = min((optimistic[n] for n in tops if n in optimistic), default=None)
-    verified = distances(True) if uncertain_callers or missing_frames else optimistic
+    modulo = distances(cha_uncertain) if cha_uncertain or missing_frames else optimistic
+    verified = distances(cha_uncertain | allocation_uncertain) if allocation_uncertain else modulo
     complete = min((verified[n] for n in frontier if n in verified), default=None)
+    complete_modulo = min((modulo[n] for n in frontier if n in modulo), default=None)
     exact = complete is not None and complete == lower
-    return lower, exact, complete
+    return lower, exact, complete, complete_modulo
 
 
 def _check_cha():
@@ -222,22 +225,28 @@ def _check_min_path():
     # дешёвый путь E-B-C-H = 0+0+1 = 1 страж.
     weight = {"E": 0, "A": 2, "B": 0, "C": 1, sink: 0}
     children = {"E": {"A", "B"}, "A": {"C"}, "B": {"C"}, "C": {sink}}
-    assert min_path_guards(weight, children, {"E"}, {"E"}, sink) == (1, True, 1)
+    assert min_path_guards(weight, children, {"E"}, {"E"}, sink) == (1, True, 1, 1)
 
     # оборванный путь дешевле фронтира: frontier F (1 страж) -> C(1) -> H,
     # dead_end D (0) -> C(1) -> H. Настоящий UI-путь = 2, но через D может быть 1
     # -> нижняя граница 1, лучший завершённый путь 2.
     weight = {"F": 1, "D": 0, "C": 1, sink: 0}
     children = {"F": {"C"}, "D": {"C"}, "C": {sink}}
-    assert min_path_guards(weight, children, {"F", "D"}, {"F"}, sink) == (1, False, 2)
+    assert min_path_guards(weight, children, {"F", "D"}, {"F"}, sink) == (1, False, 2, 2)
 
     # ни один фронтир не дотянулся: только dead_end D(2)->C(1)->H -> нижняя оценка 3
     assert min_path_guards({"D": 2, "C": 1, sink: 0},
-                           {"D": {"C"}, "C": {sink}}, {"D"}, set(), sink) == (3, False, None)
+                           {"D": {"C"}, "C": {sink}}, {"D"}, set(), sink) == (3, False, None, None)
 
     # цикл в графе вызовов не зацикливает и не удешевляет: A<->B, A->H, оба по 1
     assert min_path_guards({"A": 1, "B": 1, sink: 0},
-                           {"A": {"B", sink}, "B": {"A"}}, {"B"}, {"B"}, sink) == (2, True, 2)
+                           {"A": {"B", sink}, "B": {"A"}}, {"B"}, {"B"}, sink) == (2, True, 2, 2)
+    weights = {"F": 0, "A": 1, "B": 0}
+    edges = {"F": {"A"}, "A": {"B"}, "B": {sink}}
+    opts = (weights, edges, {"F", "A"}, {"F"}, sink)
+    assert min_path_guards(*opts, allocation_uncertain={"A"}) == (1, False, None, 1)
+    assert min_path_guards(*opts, cha_uncertain={"B"}) == (1, False, None, None)
+    assert min_path_guards(*opts, cha_uncertain={"B"}, allocation_uncertain={"A"}) == (1, False, None, None)
     print("  min_path ok")
 
 
@@ -859,7 +868,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
         return {"reached": False, "call_sites": [], "frames": [],
                 "frontier": None, "depth": 0, "plumbing_skipped": [],
                 "depth_capped": False, "dead_ends": [], "edges": [], "cha_used": False,
-                "budget_hit": False, "uncertain_callers": set(), "unexamined_dispatch": set(),
+                "budget_hit": False, "uncertain_callers": set(), "cha_uncertain": set(), "allocation_uncertain": set(),
+                "unexamined_dispatch": set(),
                 "allocation_used": False,
                 "frontier_nodes": set(), "dead_end_nodes": set(),
                 "capped_nodes": set(), "plumbing_nodes": set(), "stop_reasons": {}}
@@ -869,7 +879,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     frontier_nodes, dead_end_nodes, capped_nodes, plumbing_nodes = set(), set(), set(), set()
     visited = set()
     cha_used = False
-    uncertain_callers = set()
+    cha_uncertain, allocation_uncertain = set(), set()
     unexamined_dispatch = set()
     allocation_used = False
     budget_hit = False
@@ -917,7 +927,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
         ups, used, reason = cha_caller_sites(dx, caller_ma)
         cha_used = cha_used or used
         if used:
-            uncertain_callers.add(node)
+            cha_uncertain.add(node)
         elif reason == "unexamined_dispatch":
             unexamined_dispatch.add(node)
         if not ups and caller_ma.name in _COROUTINE_FRAME_METHODS:
@@ -931,7 +941,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             ca = dx.classes.get(caller_ma.class_name)
             ups = list(ca.get_xref_new_instance()) if ca else []
             if ups:
-                uncertain_callers.add(node)
+                allocation_uncertain.add(node)
                 allocation_used = True
         if not ups:
             stop_reasons[node] = reason
@@ -944,7 +954,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             "frontier": frontier, "depth": max_depth,
             "plumbing_skipped": skipped, "depth_capped": depth_capped,
             "dead_ends": dead_ends, "edges": edges, "cha_used": cha_used,
-            "uncertain_callers": uncertain_callers, "unexamined_dispatch": unexamined_dispatch,
+            "uncertain_callers": cha_uncertain | allocation_uncertain, "unexamined_dispatch": unexamined_dispatch,
+            "cha_uncertain": cha_uncertain, "allocation_uncertain": allocation_uncertain,
             "allocation_used": allocation_used,
             "budget_hit": budget_hit,
             "frontier_nodes": frontier_nodes, "dead_end_nodes": dead_end_nodes,
@@ -1488,6 +1499,7 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True):
            "guards": [], "guard_count": 0, "guard_count_coroutine": 0,
            "guard_count_framework": 0, "activation_cost": None,
            "activation_exact": False, "best_known_complete_cost": None, "args": [],
+           "activation_cost_modulo_allocation": None, "activation_exact_modulo_allocation": False,
            "frontier": w["frontier"], "depth": w["depth"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "arg_types": [], "suspend": False, "data_cost": "none",
@@ -1557,8 +1569,13 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True):
     if w["budget_hit"]:
         # An unprocessed initial site may have no guards at all.
         tops.add(SINK)
-    cost, exact, complete = min_path_guards(weight, children, tops, w["frontier_nodes"], SINK,
-                                           uncertain_callers=w["uncertain_callers"], missing_frames=missing_frames)
+    cost, exact, complete, modulo = min_path_guards(
+        weight, children, tops, w["frontier_nodes"], SINK, cha_uncertain=w["cha_uncertain"],
+        allocation_uncertain=w["allocation_uncertain"], missing_frames=missing_frames)
+    rec["activation_cost_modulo_allocation"] = modulo
+    rec["activation_exact_modulo_allocation"] = modulo is not None and modulo == cost and not w["budget_hit"]
+    if rec["activation_exact_modulo_allocation"] and not exact:
+        rec["notes"].append("allocation_certified")
     rec["activation_cost"], rec["activation_exact"] = cost, exact and not w["budget_hit"]
     rec["best_known_complete_cost"] = complete
     if missing_frames:
@@ -1703,8 +1720,9 @@ def report(records, meta=None):
     # §7.1: минимум по путям — стоимость активации. Таблица IV строится ТОЛЬКО по
     # ключам с activation_exact (путь дошёл до UI-входа); остальные — нижняя оценка.
     exact = [r for r in records if r["reached"] and r.get("activation_exact")]
+    modulo = [r for r in records if r.get("activation_exact_modulo_allocation") and not r.get("activation_exact")]
     lower = [r for r in records if r["reached"] and not r.get("activation_exact")
-             and r.get("activation_cost") is not None]
+             and not r.get("activation_exact_modulo_allocation") and r.get("activation_cost") is not None]
     adist = Counter(min(r["activation_cost"], 4) for r in exact)
     w(f"Точный минимум по статической модели до колбэка: {len(exact)} записей")
     for k in range(5):
@@ -1734,6 +1752,7 @@ def report(records, meta=None):
     w("")
     sections = [
         ("Точная оценка (exact)", exact),
+        ("Точная оценка с точностью до создания лямбды (exact_modulo_allocation)", modulo),
         ("Нижняя оценка (lower)", lower),
         ("Неопределённая стоимость (undet)", undet),
     ]
@@ -1748,7 +1767,9 @@ def report(records, meta=None):
             declaration = f"declaration_id={r['declaration_id']} " if "declaration_id" in r else ""
             best = r.get("best_known_complete_cost")
             best_text = str(best) if best is not None else "?"
-            w(f"[{tag}] {name}  {declaration}activation_cost={acs} best_known_complete_cost={best_text} "
+            alloc_cost = r.get("activation_cost_modulo_allocation")
+            alloc_text = f" activation_cost_modulo_allocation={alloc_cost}" if alloc_cost is not None else ""
+            w(f"[{tag}] {name}  {declaration}activation_cost={acs} best_known_complete_cost={best_text}{alloc_text} "
               f"guard_count(union)={r['guard_count']} "
               f"{frontier}notes={r['notes']}")
             for g in r.get("guards", ()):
@@ -1810,7 +1831,7 @@ def _check_report():
     assert "Всего ключей: 2" in grouped
     assert all(f"dead_end:{r}: 1 уникальных ключей" in grouped for r in ("fanin_capped", "no_callers"))
     assert grouped.count("[HIDDEN] a->x") == 2
-    assert grouped.index("(exact)") < grouped.index("(lower)") < grouped.index("(undet)")
+    assert grouped.index("(exact)") < grouped.index("(exact_modulo_allocation)") < grouped.index("(lower)") < grouped.index("(undet)")
     print("  report ok")
 
 

@@ -262,8 +262,9 @@ def print_statistics(compared, bodies):
 
 
 GUARD_COUNTS = ("guard_count", "guard_count_coroutine", "guard_count_framework", "depth")
-GUARD_FLAGS = ("reached", "activation_exact", "inconclusive")
-GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, "activation_cost", "best_known_complete_cost", "notes")
+GUARD_FLAGS = ("reached", "activation_exact", "activation_exact_modulo_allocation", "inconclusive")
+GUARD_COSTS = ("activation_cost", "best_known_complete_cost", "activation_cost_modulo_allocation")
+GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, *GUARD_COSTS, "notes")
 
 
 def read_guard_metrics(path, build, hidden):
@@ -279,16 +280,20 @@ def read_guard_metrics(path, build, hidden):
             raise ValueError(f"{path}: отсутствуют поля отчёта о стражах")
         entry = {k: row[k] for k in (*GUARD_FIELDS, "call_site_count")}
         counts = [entry[k] for k in (*GUARD_COUNTS, "call_site_count")]
-        counts.extend(entry[k] for k in ("activation_cost", "best_known_complete_cost") if entry[k] is not None)
+        counts.extend(entry[k] for k in GUARD_COSTS if entry[k] is not None)
         valid_counts = all(type(n) is int and n >= 0 for n in counts)
         valid_flags = all(type(entry[k]) is bool for k in GUARD_FLAGS)
         notes = entry["notes"]
         valid_notes = isinstance(notes, list) and all(isinstance(t, str) for t in notes)
         if not (valid_counts and valid_flags and valid_notes):
             raise ValueError(f"{path}: неверные значения метрик стражей объявления {identity[0]}")
-        lower, best = entry["activation_cost"], entry["best_known_complete_cost"]
+        lower, best, modulo = (entry[k] for k in GUARD_COSTS)
         if (entry["reached"] != bool(entry["call_site_count"])
                 or (best is not None and (lower is None or lower > best))
+                or (modulo is not None and (lower is None or lower > modulo))
+                or (best is not None and (modulo is None or modulo > best))
+                or (entry["activation_exact_modulo_allocation"] and (lower is None or lower != modulo))
+                or (entry["activation_exact"] and not entry["activation_exact_modulo_allocation"])
                 or (not entry["reached"] and lower is not None)
                 or (entry["activation_exact"] and (lower is None or lower != best))):
             raise ValueError(f"{path}: противоречивые метрики стражей объявления {identity[0]}")

@@ -174,3 +174,13 @@ class GuardEngineTest(unittest.TestCase):
         report = sl.report(rows)
         for value in ("(I)V", "(J)V", "(exact) — 1", "(undet) — 1"):
             self.assertIn(value, report)
+
+    def test_allocation_only_certification_distinguishes_cha(self):
+        edges = {"entry": {"allocation"}, "allocation": {"cha"}, "cha": {"call"}}
+        args = ({"allocation": 1}, edges, {"entry", "allocation"}, {"entry"}, "call")
+        self.assertEqual(sl.min_path_guards(*args, allocation_uncertain={"allocation"}),
+                         (1, False, None, 1))
+        self.assertEqual(sl.min_path_guards(*args, cha_uncertain={"cha"}),
+                         (1, False, None, None))
+        self.assertEqual(sl.min_path_guards(*args, cha_uncertain={"cha"},
+                                           allocation_uncertain={"allocation"}), (1, False, None, None))
