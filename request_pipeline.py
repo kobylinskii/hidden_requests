@@ -277,7 +277,8 @@ def print_statistics(compared, bodies):
           file=sys.stderr, flush=True)
 
 
-GUARD_COUNTS = ("guard_count", "guard_count_coroutine", "guard_count_framework", "guard_count_third_party_sdk", "depth")
+GUARD_COUNTS = ("guard_count", "guard_count_coroutine", "guard_count_framework", "guard_count_third_party_sdk", "depth",
+                "coroutine_resume_edges", "coroutine_launch_edges")
 GUARD_FLAGS = ("reached", "activation_exact", "activation_exact_modulo_allocation", "inconclusive")
 GUARD_COSTS = ("activation_cost", "best_known_complete_cost", "activation_cost_modulo_allocation")
 GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, *GUARD_COSTS, "first_uncertain_hop", "entry_evidence", "notes")

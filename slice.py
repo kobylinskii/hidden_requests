@@ -599,9 +599,9 @@ def _site_order(site):
 
 
 @lru_cache(maxsize=4096)
-def _caller_evidence(dx, method):
+def _caller_evidence(dx, method, excluded_caller=None):
     """Find resolved callers first. Retain the existing bound on speculative CHA."""
-    direct = sorted(set(_xref_sites(method)), key=_site_order)
+    direct = sorted({site for site in _xref_sites(method) if site[0] is not excluded_caller}, key=_site_order)
     certain, possible = [], []
     final_method = "final" in method.get_access_flags_string().split()
     for site in direct:
@@ -618,7 +618,7 @@ def _caller_evidence(dx, method):
         if parent is None:
             continue
         for site in sorted(_xref_sites(parent), key=_site_order):
-            if site in seen:
+            if site in seen or site[0] is excluded_caller:
                 continue
             if len(seen) - len(direct) >= _FRAME_BUDGET:
                 truncated = True
@@ -1171,6 +1171,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     fan-in терялся бы. frontier_nodes / dead_end_nodes / capped_nodes —
     максимальные кадры (входы обхода); plumbing_nodes — узлы-плумбинг
     (вес 0 в минимуме по путям)."""
+    from coroutine_paths import launched_lambda_sites, resumed_method
+
     sites = resolve_call_sites(dx, cls, method, descriptor)
     if not sites:
         return {"reached": False, "call_sites": [], "frames": [],
@@ -1178,7 +1180,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
                 "depth_capped": False, "dead_ends": [], "edges": [], "cha_used": False,
                 "budget_hit": False, "uncertain_callers": set(), "cha_uncertain": set(), "allocation_uncertain": set(),
                 "unexamined_dispatch": set(),
-                "allocation_used": False,
+                "allocation_used": False, "coroutine_resume_edges": 0, "coroutine_launch_edges": 0,
                 "frontier_nodes": set(), "entry_nodes": {}, "dead_end_nodes": set(),
                 "capped_nodes": set(), "plumbing_nodes": set(), "stop_reasons": {},
                 "first_uncertain_depth": {}, "viewmodel_candidate": False, "compose_dead_end": False}
@@ -1193,6 +1195,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     cha_uncertain, allocation_uncertain = set(), set()
     unexamined_dispatch = set()
     allocation_used = False
+    resume_edges, launch_edges = set(), set()
     viewmodel_candidate = compose_dead_end = False
     budget_hit = False
     max_depth = 0
@@ -1220,7 +1223,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             break
         hop = depth
         viewmodel_candidate |= _is_viewmodel_candidate(dx, caller_ma)
-        plumbing = is_plumbing(ckey, caller_ma)
+        resumed = resumed_method(dx, caller_ma, off)
+        plumbing = resumed is not None or is_plumbing(ckey, caller_ma)
         if plumbing:
             skipped.append(ckey)
             plumbing_nodes.add(node)
@@ -1239,14 +1243,25 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
                 depth_capped = True
                 capped_nodes.add(node)
                 continue  # этот путь упёрся в лимит глубины
-        # шаг вверх: кто вызывает именно этот метод (с CHA — §7.2)
-        ups, used, reason = cha_caller_sites(dx, caller_ma)
+        if resumed is not None:
+            ups, used, reason = _caller_evidence(dx, resumed, caller_ma)
+            resume_edges.update((nid(ma, offset), node) for ma, offset in ups)
+        else:
+            ups, used, reason = cha_caller_sites(dx, caller_ma)
+        launches, incomplete = launched_lambda_sites(dx, caller_ma, off)
+        if launches:
+            launch_edges.update((nid(ma, offset), node) for ma, offset in launches)
+            if incomplete or used or reason in ("fanin_capped", "unexamined_dispatch"):
+                unexamined_dispatch.add(node)
+            known = [] if used else ups
+            ups = sorted(set(known) | set(launches), key=_site_order)
+            used = False
         cha_used = cha_used or used
         if used:
             cha_uncertain.add(node)
         elif reason == "unexamined_dispatch":
             unexamined_dispatch.add(node)
-        if not ups and caller_ma.name in _COROUTINE_FRAME_METHODS:
+        if not ups and resumed is None and caller_ma.name in _COROUTINE_FRAME_METHODS:
             # invoke/invokeSuspend/create лямбды зовёт рантайм через интерфейс
             # (Function*/Continuation) — XREF пуст. Точка активации лямбды — место
             # её создания (new-instance): ViewModel/фрагмент, где вызван launch {}.
@@ -1272,6 +1287,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             "uncertain_callers": cha_uncertain | allocation_uncertain, "unexamined_dispatch": unexamined_dispatch,
             "cha_uncertain": cha_uncertain, "allocation_uncertain": allocation_uncertain,
             "allocation_used": allocation_used,
+            "coroutine_resume_edges": len(resume_edges), "coroutine_launch_edges": len(launch_edges),
             "budget_hit": budget_hit,
             "frontier_nodes": frontier_nodes, "entry_nodes": entry_nodes, "dead_end_nodes": dead_end_nodes,
             "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes, "stop_reasons": stop_reasons,
@@ -1824,6 +1840,7 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
            "first_uncertain_hop": min(w["first_uncertain_depth"].values(), default=None),
            "frontier": w["frontier"], "depth": w["depth"],
            "entry_evidence": {"ui": "not_found", "background": "not_found"},
+           "coroutine_resume_edges": w["coroutine_resume_edges"], "coroutine_launch_edges": w["coroutine_launch_edges"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "arg_types": [], "suspend": False, "data_cost": "none",
            "arg_recipes": {}, "notes": []}
@@ -2065,6 +2082,11 @@ def report(records, meta=None):
             summary = ", ".join(f"{state}={states[state]}"
                                 for state in ("resolved", "modulo_allocation", "possible", "not_found"))
             w(f"{label}: {summary}")
+    if any("coroutine_resume_edges" in r for r in records):
+        resumed = sum(r.get("coroutine_resume_edges", 0) > 0 for r in records)
+        launched = sum(r.get("coroutine_launch_edges", 0) > 0 for r in records)
+        w(f"Объявления со связью через возобновление suspend-функции: {resumed}")
+        w(f"Объявления с локально установленным запуском корутины: {launched}")
     if unresolved:
         w(f"DEX-дескриптор не разрешён: {unresolved}")
     w(f"Обход оборван не на фронтире (dead_end, стражи выше пути не видны): {dead}")

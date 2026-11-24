@@ -117,6 +117,8 @@ class GuardPipelineTest(unittest.TestCase):
             self.assertIsNone(records[1]["activation_cost"])
             self.assertTrue(records[0]["reached"])
             self.assertTrue(records[0]["declaration_has_call_sites"])
+            self.assertEqual(records[0]["coroutine_launch_edges"], 0)
+            self.assertEqual(records[4]["coroutine_resume_edges"], 0)
             self.assertEqual(records[0]["entry_evidence"], {"ui": "not_found", "background": "not_found"})
             self.assertFalse(records[1]["declaration_has_call_sites"])
             self.assertEqual(records[0]["guard_count"], 1)
