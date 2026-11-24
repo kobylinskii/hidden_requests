@@ -678,7 +678,7 @@ def _params(m):
     return result
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=4096)
 def frame_of(ma):
     """MethodAnalysis -> {cfg, params, block_at}. None, если у метода нет
     кода (интерфейс/внешний объявление — ExternalMethod без get_code вовсе,
