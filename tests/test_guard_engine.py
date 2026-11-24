@@ -184,3 +184,15 @@ class GuardEngineTest(unittest.TestCase):
                          (1, False, None, None))
         self.assertEqual(sl.min_path_guards(*args, cha_uncertain={"cha"},
                                            allocation_uncertain={"allocation"}), (1, False, None, None))
+
+    def test_first_uncertain_hop_counts_semantic_frames_before_current(self):
+        first = Method("LImpl;", "read")
+        above = Method("LImpl;", "load")
+        first.callers = [(above, 2)]
+        base = Method("LBase;", "load", callers=[(self.callback, 2)])
+        self.dx.classes.update({"LImpl;": Class(first, above, parent="LBase;"), "LBase;": Class(base)})
+        self.api.callers = [(first, 2)]
+        with patch.object(sl, "frame_of", return_value=frame()):
+            result = self.analyze()
+        self.assertEqual(result["first_uncertain_hop"], 1)
+        self.assertEqual(sl.backward_frames(self.dx, "Api", "record")["first_uncertain_depth"], {(id(above), 2): 1})

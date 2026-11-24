@@ -872,8 +872,10 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
                 "unexamined_dispatch": set(),
                 "allocation_used": False,
                 "frontier_nodes": set(), "dead_end_nodes": set(),
-                "capped_nodes": set(), "plumbing_nodes": set(), "stop_reasons": {}}
+                "capped_nodes": set(), "plumbing_nodes": set(), "stop_reasons": {},
+                "first_uncertain_depth": {}}
     stop_reasons = {}
+    first_uncertain_depth = {}
     frames, skipped, frontier, dead_ends = [], [], None, []
     edges = []
     frontier_nodes, dead_end_nodes, capped_nodes, plumbing_nodes = set(), set(), set(), set()
@@ -906,6 +908,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             # должен виснуть — обрываем, ключ честно помечается budget_hit
             budget_hit = True
             break
+        hop = depth
         plumbing = is_plumbing(ckey, caller_ma)
         if plumbing:
             skipped.append(ckey)
@@ -947,6 +950,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             stop_reasons[node] = reason
             dead_ends.append(ckey)  # путь оборван не на фронтире: стражи выше не видны
             dead_end_nodes.add(node)
+        if used or node in allocation_uncertain or not ups:
+            first_uncertain_depth[node] = hop
         push = queue.appendleft if plumbing else queue.append  # плумбинг: та же глубина
         for ma, o in ups:
             push((node, ma, o, depth))  # node — потомок (вниз к скрытому вызову) для вызывающего
@@ -959,7 +964,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             "allocation_used": allocation_used,
             "budget_hit": budget_hit,
             "frontier_nodes": frontier_nodes, "dead_end_nodes": dead_end_nodes,
-            "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes, "stop_reasons": stop_reasons}
+            "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes, "stop_reasons": stop_reasons,
+            "first_uncertain_depth": first_uncertain_depth}
 
 
 def _check_walk_predicates():
@@ -1500,6 +1506,7 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True):
            "guard_count_framework": 0, "activation_cost": None,
            "activation_exact": False, "best_known_complete_cost": None, "args": [],
            "activation_cost_modulo_allocation": None, "activation_exact_modulo_allocation": False,
+           "first_uncertain_hop": min(w["first_uncertain_depth"].values(), default=None),
            "frontier": w["frontier"], "depth": w["depth"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "arg_types": [], "suspend": False, "data_cost": "none",
@@ -1712,6 +1719,10 @@ def report(records, meta=None):
     w("Подгруппы dead_end могут пересекаться и не суммируются.")
     w(f"Стражи state-machine корутин (флагованы, исключены из guard_count и топа источников): {coroutine_total}")
     w(f"Стражи фреймворка/компилятора (флагованы, исключены из guard_count и топа источников): {framework_total}")
+    hops = Counter(r["first_uncertain_hop"] for r in records if r.get("first_uncertain_hop") is not None)
+    w("Распределение глубины первой неопределённости пути:")
+    for hop, count in sorted(hops.items()):
+        w(f"  {hop}: {count}")
     dist = Counter(min(r["guard_count"], 4) for r in records if r["reached"])
     w("Распределение guard_count — объединение стражей на исследованных путях:")
     for k in range(5):

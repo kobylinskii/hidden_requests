@@ -264,7 +264,7 @@ def print_statistics(compared, bodies):
 GUARD_COUNTS = ("guard_count", "guard_count_coroutine", "guard_count_framework", "depth")
 GUARD_FLAGS = ("reached", "activation_exact", "activation_exact_modulo_allocation", "inconclusive")
 GUARD_COSTS = ("activation_cost", "best_known_complete_cost", "activation_cost_modulo_allocation")
-GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, *GUARD_COSTS, "notes")
+GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, *GUARD_COSTS, "first_uncertain_hop", "notes")
 
 
 def read_guard_metrics(path, build, hidden):
@@ -280,7 +280,7 @@ def read_guard_metrics(path, build, hidden):
             raise ValueError(f"{path}: отсутствуют поля отчёта о стражах")
         entry = {k: row[k] for k in (*GUARD_FIELDS, "call_site_count")}
         counts = [entry[k] for k in (*GUARD_COUNTS, "call_site_count")]
-        counts.extend(entry[k] for k in GUARD_COSTS if entry[k] is not None)
+        counts.extend(entry[k] for k in (*GUARD_COSTS, "first_uncertain_hop") if entry[k] is not None)
         valid_counts = all(type(n) is int and n >= 0 for n in counts)
         valid_flags = all(type(entry[k]) is bool for k in GUARD_FLAGS)
         notes = entry["notes"]
