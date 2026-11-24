@@ -1,4 +1,6 @@
 """Small DEX graph fixtures for the passive guard metrics."""
+from contextlib import redirect_stderr
+from io import StringIO
 import unittest
 from unittest.mock import patch
 
@@ -104,11 +106,21 @@ class GuardEngineTest(unittest.TestCase):
 
     def test_missing_frame_and_missing_offset_never_certify_a_complete_path(self):
         for missing in (None, {"cfg": nx.DiGraph(), "params": {}, "block_at": lambda offset: None}):
-            with self.subTest(frame=missing), patch.object(sl, "frame_of", return_value=missing):
+            with (self.subTest(frame=missing), patch.object(sl, "frame_of", return_value=missing),
+                  redirect_stderr(StringIO()) as log):
                 result = self.analyze()
                 self.assertTrue(result["inconclusive"])
                 self.assertFalse(result["activation_exact"])
                 self.assertIsNone(result["best_known_complete_cost"])
+                if missing is None:
+                    self.assertIn("missing_frame", result["notes"])
+                    self.assertNotIn("unexpected_offset_miss", result["notes"])
+                    self.assertEqual(log.getvalue(), "")
+                else:
+                    self.assertIn("unexpected_offset_miss", result["notes"])
+                    self.assertNotIn("missing_frame", result["notes"])
+                    self.assertIn("Api->record", log.getvalue())
+                    self.assertIn("offset=1", log.getvalue())
 
     def test_cha_and_allocation_edges_cannot_certify_a_complete_path(self):
         for name in ("save", "invoke"):

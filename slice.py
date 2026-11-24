@@ -1716,12 +1716,16 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
         rec["notes"].append("no_caller" if known else "key_not_in_dex")
         return rec
     all_guards, seen, weight = [], set(), {}
-    missing_frames = set()
+    missing_frames, offset_misses = set(), set()
     for f in w["frames"]:
         fr = frame_of(f["ma"])
-        if fr is None or fr["block_at"](f["offset"]) is None:
-            rec["inconclusive"] = True
+        if fr is None:
             missing_frames.add(f["node"])
+            continue
+        if fr["block_at"](f["offset"]) is None:
+            offset_misses.add(f["node"])
+            print(f"[предупреждение] {key}: unexpected_offset_miss; {f['key']} offset={f['offset']}",
+                  file=sys.stderr)
             continue
         node_real = 0
         for g in guards_of_frame(fr, f["offset"]):
@@ -1751,6 +1755,8 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
                 seen.add(sig)
                 all_guards.append(g)
         weight[f["node"]] = node_real
+    unverified_frames = missing_frames | offset_misses
+    rec["inconclusive"] = bool(unverified_frames)
     rec["guards"] = all_guards
     # Ruling-H: union guard_count — ВЕРХНЯЯ оценка (все стражи всех путей);
     # headline-метрика стоимости активации — activation_cost (минимум по путям).
@@ -1763,13 +1769,13 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
     for parent, child in w["edges"]:
         children.setdefault(parent, set()).add(child)
     tops = (w["frontier_nodes"] | w["dead_end_nodes"] | w["capped_nodes"]
-            | w["uncertain_callers"] | w["unexamined_dispatch"] | missing_frames)
+            | w["uncertain_callers"] | w["unexamined_dispatch"] | unverified_frames)
     if w["budget_hit"]:
         # An unprocessed initial site may have no guards at all.
         tops.add(SINK)
     cost, exact, complete, modulo = min_path_guards(
         weight, children, tops, w["frontier_nodes"], SINK, cha_uncertain=w["cha_uncertain"],
-        allocation_uncertain=w["allocation_uncertain"], missing_frames=missing_frames)
+        allocation_uncertain=w["allocation_uncertain"], missing_frames=unverified_frames)
     rec["activation_cost_modulo_allocation"] = modulo
     rec["activation_exact_modulo_allocation"] = modulo is not None and modulo == cost and not w["budget_hit"]
     if rec["activation_exact_modulo_allocation"] and not exact:
@@ -1778,6 +1784,8 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
     rec["best_known_complete_cost"] = complete
     if missing_frames:
         rec["notes"].append("missing_frame")
+    if offset_misses:
+        rec["notes"].append("unexpected_offset_miss")
     if cost is None:
         # ни один top (фронтир/dead_end/depth_cap) не дотянулся до скрытого вызова:
         # все пути обрываются на плумбинге — стоимость активации не определена
@@ -1828,6 +1836,7 @@ def run(dx, keys):
 
 def _check_slice_key(dx):
     rec = slice_key(dx, "gpm.tnt_premier.features.downloads.impl.data.network.DownloadsApi->disallowDeviceDownload")
+    assert "unexpected_offset_miss" not in rec["notes"], rec["notes"]
     assert rec["reached"] is True
     assert rec["cls"].endswith("DownloadsApi") and rec["method"] == "disallowDeviceDownload"
     assert isinstance(rec["guards"], list)
