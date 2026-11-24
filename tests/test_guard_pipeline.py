@@ -71,7 +71,7 @@ def demo_inputs(directory, build):
     catalog.write_text("".join(
         f"**Method**: {OWNER}->{name}\n* Retrofit/Ktorfit Method\n```\nPOST /{path} HTTP/1.1\n\n```\n"
         for name, path in (("save", "text"), ("save", "number"), ("seen", "seen"),
-                           ("unused", "unused"), ("draft", "draft"), ("unknown", "unknown"))))
+                           ("unused", "unused"), ("draft", "draft"), ("save", "unknown"))))
     write_rows(catalog_metadata(catalog), [{"build": build, "catalog_sha256": sha256(catalog), "status": "complete"}])
     trace = directory / (PACKAGE + ".dynamic.jsonl")
     write_rows(trace, [{"t": "meta", "session": "fixture", "build": build},
@@ -106,7 +106,7 @@ class GuardPipelineTest(unittest.TestCase):
             self.assertNotIn("[предупреждение]", log.getvalue())
             comparison, _ = read_checked_rows(hidden, build)
             self.assertEqual([r["status"] for r in comparison],
-                             ["not_observed", "not_observed", "observed", "not_observed", "not_observed", "insufficient_data"])
+                             ["not_observed", "not_observed", "observed", "not_observed", "not_observed", "not_observed"])
             records, complete = read_checked_rows(reasons, build)
             self.assertTrue(complete)
             self.assertEqual([(r["declaration_id"], r["key"], r["descriptor"]) for r in records],
@@ -117,18 +117,29 @@ class GuardPipelineTest(unittest.TestCase):
             self.assertIsNone(records[1]["activation_cost"])
             self.assertTrue(records[0]["reached"])
             self.assertTrue(records[0]["declaration_has_call_sites"])
+            self.assertEqual(records[0]["entry_evidence"], {"ui": "not_found", "background": "not_found"})
             self.assertFalse(records[1]["declaration_has_call_sites"])
             self.assertEqual(records[0]["guard_count"], 1)
             self.assertEqual(records[0]["activation_cost"], 1)
             self.assertFalse(records[2]["reached"])
             self.assertIn("no_caller", records[2]["notes"])
             self.assertIn("dead_end:no_callers", records[3]["notes"])
+            self.assertEqual(comparison[5]["confidence_caveats"],
+                             ["dex_identity_unresolved", "method_coverage_unverified"])
             self.assertFalse(records[3]["activation_exact"])
+            self.assertIsNone(records[4]["descriptor"])
+            self.assertEqual(records[4]["analysis_scope"], "unresolved")
+            self.assertIn("dex_identity_unresolved", records[4]["notes"])
+            self.assertIsNone(records[4]["activation_cost"])
+            self.assertEqual(records[4]["call_site_count"], 0)
             for path in (reasons, catalog_metadata(reasons), report):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o644)
             summary = report.read_text()
             self.assertIn("versionName=1.0 versionCode=1", summary)
-            for section in ("(exact) — 0", "(lower) — 2", "(undet) — 2"):
+            self.assertIn("[UNRESOLVED]", summary)
+            self.assertIn("Точки входа UI:", summary)
+            self.assertIn("DEX-дескриптор не разрешён: 1", summary)
+            for section in ("(exact) — 0", "(lower) — 2", "(undet) — 3"):
                 self.assertIn(section, summary)
             cached_args = args + ["--comparison-in", str(hidden), "--reasons-in", str(reasons)]
             with patch.object(sys, "argv", cached_args), patch("slice.slice_key", side_effect=AssertionError):

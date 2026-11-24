@@ -3,15 +3,12 @@
 """
 Скрытые HTTP-запросы = статика (BFScan .md) − динамика (Frida).
 
-Сопоставление точное, по ключу `класс->метод`. BFScan извлекает эндпоинты из
-аннотаций Retrofit/Ktorfit, а Frida перехватывает вызов того же интерфейсного
-метода через динамический прокси Retrofit и отдаёт объект Method. Никаких
-эвристик по путям — в отличие от ~/hidden_requests/compare.py.
+Сопоставление использует ключ `класс->метод` и DEX-дескриптор перегрузки.
+Точное совпадение с подтверждённым вызовом из трассы даёт статус observed.
+Остальные объявления получают not_observed с оговорками о качестве данных.
 
-Рассчитано на приложения без обфускации: имя метода в DEX совпадает с тем, что
-печатает BFScan, и этого достаточно для ключа.
-
-    python3 diff.py --static apk/gpm.tnt_premier_methods.md \
+    python3 diff.py --apk apk/gpm.tnt_premier.apk \
+                    --static apk/gpm.tnt_premier_methods.md \
                     --dynamic out/gpm.tnt_premier.dynamic.jsonl \
                     --out out/gpm.tnt_premier.hidden.jsonl
 """
@@ -206,10 +203,9 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true", help="показать все объявления")
     args = ap.parse_args()
 
-    from collections import Counter
     from types import SimpleNamespace
     from request_artifacts import sha256, write_rows
-    from request_pipeline import compare_artifacts, publish
+    from request_pipeline import bfscan_body_rows, compare, compare_artifacts, print_statistics, publish
 
     try:
         if args.apk:
@@ -219,20 +215,16 @@ def main():
             rows, complete = compare_artifacts(
                 SimpleNamespace(catalog=args.static, trace=args.dynamic), build, dx)
             if args.out:
-                publish(args.out, ({"build": build, **row} for row in rows), build, complete)
+                publish(args.out, ({"build": build, **row} for row in rows), build, complete, artifact_type="hidden")
         else:
-            # Old catalogs are still readable for diagnostics. They have no
-            # verified relation to the observed Android build or DEX methods.
-            rows = [{**row, "status": "insufficient_data", "reason": "apk_required_for_comparison"}
-                    for row in parse_bfscan(args.static)]
+            trace = {"complete": False, "methods": set(), "legacy_keys": set(), "interfaces": set()}
+            rows = compare(parse_bfscan(args.static), trace, False)
             if args.out:
                 write_rows(args.out, rows)
     except (OSError, ValueError) as error:
         ap.error(str(error))
 
-    counts = Counter(row["status"] for row in rows)
-    print("Сравнение: " + ", ".join(f"{status}={counts[status]}" for status in
-                                    ("observed", "not_observed", "insufficient_data")))
+    print_statistics(rows, list(bfscan_body_rows(rows)))
     if args.verbose:
         for row in rows:
             print(f"{row['status']:18} {row['key']} {row['verb']} {row['path']}")

@@ -4,7 +4,7 @@ def slice_bodies(compared, dx, build, serializer):
     from archivive.body_data import body_variants
 
     for row in compared:
-        if row["status"] != "not_observed":
+        if row["status"] != "not_observed" or row.get("confidence_caveats") or not row.get("descriptor"):
             continue
         identity = {k: row[k] for k in ("declaration_id", "key", "descriptor", "verb", "path")}
         yield {**identity, "build": build, "serializer": serializer, "bfscan": row.get("bfscan"),
@@ -66,7 +66,7 @@ def run(args, build, parser):
             parser.error("передайте --catalog и --trace либо артефакт предыдущего этапа")
         _, dx = load_apk(args.apk)
         if args.comparison_in:
-            compared, complete = read_checked_rows(args.comparison_in, build)
+            compared, complete = read_checked_rows(args.comparison_in, build, "hidden")
         else:
             compared, complete = compare_artifacts(args, build, dx)
         publish(args.comparison, ({"build": build, **row} for row in compared), build, complete)
@@ -74,7 +74,7 @@ def run(args, build, parser):
         data_slices = list(slice_bodies(compared, dx, build, serializer))
         counts = Counter(row["status"] for row in compared)
         print("Сравнение: " + ", ".join(f"{status}={counts[status]}" for status in
-                                        ("observed", "not_observed", "insufficient_data")))
+                                        ("observed", "not_observed")))
 
     publish(args.data_slice, data_slices, build, complete)
     publish(args.out, body_rows(data_slices), build, complete)

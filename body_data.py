@@ -120,7 +120,7 @@ def bind_declaration(dx, row):
 
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=4096)
 def raw_blocks(method):
     return {offset: instruction for offset, instruction in method.get_method().get_instructions_idx()}
 

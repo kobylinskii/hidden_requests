@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--truth", type=Path, help="ручная разметка truth.json")
     ap.add_argument("--hidden", type=Path, help="hidden.jsonl (формат diff.py) для --pick")
     ap.add_argument("--pick", action="store_true", help="напечатать выборку ключей для разметки")
+    ap.add_argument("--include-caveats", action="store_true",
+                    help="включить в --pick записи с оговорками или без поля confidence_caveats")
     ap.add_argument("--selfcheck", action="store_true")
     a = ap.parse_args()
     if a.selfcheck:
@@ -76,8 +78,10 @@ def main():
         print("selfcheck ok")
         return
     if a.pick:
+        if not a.hidden:
+            ap.error("--pick требует --hidden")
         import slice as sl  # соседний модуль, запуск из корня репозитория
-        for k in pick_sample(sl.load_hidden(a.hidden)):
+        for k in pick_sample(sl.load_hidden(a.hidden, include_caveats=a.include_caveats)):
             print(k)
         return
     pred = {}

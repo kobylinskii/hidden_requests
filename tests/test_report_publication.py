@@ -47,9 +47,19 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual({p: p.read_bytes() for p in before}, before)
 
     def test_reject_wrong_artifact_even_with_valid_hash_and_build(self):
-        publish(self.source, [dict(self.row, status="no_bfscan_example")], self.build, True)
+        publish(self.source, [dict(self.row, status="no_bfscan_example")], self.build, True, artifact_type="bodies")
         with self.assertRaises(SystemExit):
             self.run_report()
+
+    def test_old_unknown_status_is_skipped_with_warning(self):
+        from request_pipeline import read_checked_rows
+        publish(self.source, [self.row, dict(self.row, declaration_id=2, status="insufficient_data")],
+                self.build, True, artifact_type="hidden")
+        with redirect_stderr(StringIO()) as log:
+            rows, complete = read_checked_rows(self.source, self.build, "hidden")
+        self.assertTrue(complete)
+        self.assertEqual([r["status"] for r in rows], ["observed"])
+        self.assertIn("insufficient_data", log.getvalue())
 
     def test_metadata_identifies_kind_and_single_run(self):
         self.run_report()

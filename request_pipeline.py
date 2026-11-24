@@ -130,19 +130,20 @@ def compare(declarations, trace, catalog_complete):
     rows = []
     for entry in declarations:
         key, descriptor = entry["key"], entry.get("descriptor")
-        retrofit = entry.get("framework") == "retrofit"
-        if retrofit and descriptor and (key, descriptor) in trace["methods"]:
-            status, reason = "observed", None
-        elif not descriptor:
-            status, reason = "insufficient_data", "dex_identity_unresolved"
-        elif not catalog_complete or not trace["complete"]:
-            status, reason = "insufficient_data", "artifact_incomplete_or_unverified"
-        elif (not retrofit or entry["cls"] not in trace["interfaces"] or key in trace["legacy_keys"]
-              or (key, descriptor) in trace.get("ambiguous_methods", ())):
-            status, reason = "insufficient_data", "method_coverage_unverified"
-        else:
-            status, reason = "not_observed", None
-        rows.append({**entry, "status": status, "reason": reason})
+        observed = bool(descriptor) and (key, descriptor) in trace["methods"]
+        caveats = []
+        if not observed:
+            if not descriptor:
+                caveats.append("dex_identity_unresolved")
+            if not catalog_complete or not trace["complete"]:
+                caveats.append("artifact_incomplete_or_unverified")
+            if (entry.get("framework") != "retrofit" or entry["cls"] not in trace["interfaces"]
+                    or key in trace["legacy_keys"] or (key, descriptor) in trace.get("ambiguous_methods", ())):
+                caveats.append("method_coverage_unverified")
+        row = {**entry, "status": "observed" if observed else "not_observed",
+               "confidence_caveats": caveats}
+        row.pop("reason", None)
+        rows.append(row)
     return rows
 
 
@@ -184,14 +185,28 @@ def read_checked_rows(path, build, expected_type=None):
         raise ValueError(f"{path}: тип пустого артефакта не подтверждён")
     if expected_type == "hidden":
         ids = set()
+        accepted = []
         for row in rows:
-            if (row.get("status") not in ("observed", "not_observed", "insufficient_data")
-                    or type(row.get("declaration_id")) is not int or row["declaration_id"] in ids
+            status = row.get("status")
+            if status not in ("observed", "not_observed"):
+                print(f"[предупреждение] {path}: пропущен неизвестный статус {status!r} "
+                      f"объявления {row.get('declaration_id')!r}", file=sys.stderr)
+                continue
+            descriptor = row.get("descriptor")
+            caveats = row.get("confidence_caveats", [])
+            if (type(row.get("declaration_id")) is not int or row["declaration_id"] in ids
                     or not all(isinstance(row.get(k), str) for k in ("cls", "method", "key", "verb", "path"))
                     or row["key"] != row["cls"] + "->" + row["method"]
-                    or (row["status"] != "insufficient_data" and not isinstance(row.get("descriptor"), str))):
+                    or (descriptor is not None and not isinstance(descriptor, str))
+                    or (status == "observed" and (not descriptor or caveats))
+                    or not isinstance(caveats, list) or not all(isinstance(c, str) for c in caveats)):
                 raise ValueError(f"{path}: некорректное объявление в списке сравнения")
             ids.add(row["declaration_id"])
+            row.pop("reason", None)
+            row["descriptor"] = descriptor or None
+            row["confidence_caveats"] = caveats
+            accepted.append(row)
+        rows = accepted
     return rows, meta.get("status") == "complete"
 
 
@@ -218,12 +233,7 @@ def compare_artifacts(args, build, dx):
     declarations = [bind_declaration(dx, row) for row in parse_bfscan(args.catalog)]
     trace = (read_trace(args.trace, build) if args.trace.is_file() else
              {"complete": False, "methods": set(), "legacy_keys": set(), "interfaces": set()})
-    if static:
-        compared = compare(declarations, trace, catalog_complete)
-    else:
-        compared = [{**row, "status": "insufficient_data", "reason": "catalog_identity_unverified"}
-                    for row in declarations]
-    return compared, catalog_complete and trace["complete"]
+    return compare(declarations, trace, catalog_complete), catalog_complete and trace["complete"]
 
 
 
@@ -238,6 +248,7 @@ def bfscan_body_rows(compared):
             body = json.dumps(example["template"], ensure_ascii=False)
         yield {**{k: row.get(k) for k in ("build", "declaration_id", "key", "descriptor",
                                           "verb", "path", "query")},
+               "confidence_caveats": row.get("confidence_caveats", []),
                "source": "bfscan", "content_type": example.get("content_type"),
                "status": "example" if body is not None else "no_bfscan_example", "body": body}
 
@@ -247,11 +258,16 @@ def print_statistics(compared, bodies):
     total = len(compared)
     print(f"[статистика] Статических HTTP-объявлений: {total}; "
           f"уникальных класс->метод: {len({row['key'] for row in compared})}", file=sys.stderr, flush=True)
-    for status, title in (("observed", "Наблюдались"), ("not_observed", "Скрытые в этой сессии"),
-                          ("insufficient_data", "Недостаточно данных")):
+    for status, title in (("observed", "Наблюдались"), ("not_observed", "Скрытые в этой сессии")):
         amount = counts[status]
         percent = amount / total * 100 if total else 0
         print(f"[статистика] {title}: {amount} ({percent:.1f}%)", file=sys.stderr, flush=True)
+    caveat_counts = Counter(c for row in bodies for c in set(row["confidence_caveats"]))
+    clean = sum(not row["confidence_caveats"] for row in bodies)
+    details = ", ".join(f"{c}={n}" for c, n in sorted(caveat_counts.items()))
+    print(f"[статистика] Из {len(bodies)} скрытых без оговорок: {clean}; "
+          f"с оговорками: {len(bodies) - clean}" + (f" ({details}; категории пересекаются)" if details else ""),
+          file=sys.stderr, flush=True)
     with_body = sum(row["body"] is not None for row in bodies)
     print(f"[статистика] Скрытые с телом BFScan: {with_body}; "
           f"без примера тела: {len(bodies) - with_body}", file=sys.stderr, flush=True)
@@ -264,7 +280,7 @@ def print_statistics(compared, bodies):
 GUARD_COUNTS = ("guard_count", "guard_count_coroutine", "guard_count_framework", "guard_count_third_party_sdk", "depth")
 GUARD_FLAGS = ("reached", "activation_exact", "activation_exact_modulo_allocation", "inconclusive")
 GUARD_COSTS = ("activation_cost", "best_known_complete_cost", "activation_cost_modulo_allocation")
-GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, *GUARD_COSTS, "first_uncertain_hop", "notes")
+GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, *GUARD_COSTS, "first_uncertain_hop", "entry_evidence", "notes")
 
 
 def read_guard_metrics(path, build, hidden):
@@ -276,8 +292,9 @@ def read_guard_metrics(path, build, hidden):
         if identity not in remaining:
             raise ValueError(f"{path}: состав скрытых объявлений отличается")
         remaining.remove(identity)
-        if row.get("analysis_scope") != "dex_descriptor" or not all(k in row for k in (*GUARD_FIELDS, "call_site_count")):
-            raise ValueError(f"{path}: отсутствуют поля отчёта о стражах")
+        scope = "dex_descriptor" if row.get("descriptor") else "unresolved"
+        if row.get("analysis_scope") != scope or not all(k in row for k in (*GUARD_FIELDS, "call_site_count")):
+            raise ValueError(f"{path}: несовместимый отчёт о стражах. Повторите анализ без REASONS_IN")
         entry = {k: row[k] for k in (*GUARD_FIELDS, "call_site_count")}
         counts = [entry[k] for k in (*GUARD_COUNTS, "call_site_count")]
         counts.extend(entry[k] for k in (*GUARD_COSTS, "first_uncertain_hop") if entry[k] is not None)
@@ -285,7 +302,11 @@ def read_guard_metrics(path, build, hidden):
         valid_flags = all(type(entry[k]) is bool for k in GUARD_FLAGS)
         notes = entry["notes"]
         valid_notes = isinstance(notes, list) and all(isinstance(t, str) for t in notes)
-        if not (valid_counts and valid_flags and valid_notes):
+        evidence = entry["entry_evidence"]
+        valid_evidence = (isinstance(evidence, dict) and evidence.keys() == {"ui", "background"}
+                          and all(v in ("not_found", "possible", "modulo_allocation", "resolved")
+                                  for v in evidence.values()))
+        if not (valid_counts and valid_flags and valid_notes and valid_evidence):
             raise ValueError(f"{path}: неверные значения метрик стражей объявления {identity[0]}")
         lower, best, modulo = (entry[k] for k in GUARD_COSTS)
         if (entry["reached"] != bool(entry["call_site_count"])
@@ -310,22 +331,27 @@ def analyze_guards(args, build, complete, hidden, direct_sites, apk_obj, dx):
     from slice import report, slice_key
 
     metrics = {}
+    unresolved = {**dict.fromkeys(GUARD_COUNTS, 0), **dict.fromkeys(GUARD_FLAGS, False),
+                  "inconclusive": True, **dict.fromkeys((*GUARD_COSTS, "first_uncertain_hop")),
+                  "notes": ["dex_identity_unresolved"], "call_site_count": 0,
+                  "entry_evidence": {"ui": "not_found", "background": "not_found"}}
     if args.reasons_in:
         metrics, cache_complete = read_guard_metrics(args.reasons_in, build, hidden)
         complete = complete and cache_complete
 
     package = apk_obj.get_package()
     records = []
-    key_count = len({(r["key"], r["descriptor"]) for r in hidden})
+    key_count = len({(r["key"], r["descriptor"]) for r in hidden if r["descriptor"]})
     for row in hidden:
         key = row["key"]
         signature = (key, row["descriptor"])
-        if signature not in metrics:
+        if row["descriptor"] and signature not in metrics:
             print(f"[стражи {len(metrics) + 1}/{key_count}] {key}", file=sys.stderr, flush=True)
             analysis = slice_key(dx, key, descriptor=row["descriptor"], include_arguments=False, package=package)
             metrics[signature] = {k: analysis[k] for k in GUARD_FIELDS}
             metrics[signature]["call_site_count"] = len(analysis["call_sites"])
-        entry = metrics[signature]
+        entry = metrics[signature] if row["descriptor"] else unresolved
+        scope = "dex_descriptor" if row["descriptor"] else "unresolved"
         provenance = direct_sites[row["declaration_id"]]
         if provenance is not None and provenance != entry["reached"]:
             print(f"[предупреждение] {key} {row['descriptor']} (объявление {row['declaration_id']}): "
@@ -333,7 +359,7 @@ def analyze_guards(args, build, complete, hidden, direct_sites, apk_obj, dx):
                   "Ветви анализа расходятся по одному DEX-дескриптору.",
                   file=sys.stderr, flush=True)
         records.append({**{k: row[k] for k in ("build", "declaration_id", "key", "descriptor")},
-                        "analysis_scope": "dex_descriptor", "declaration_has_call_sites": provenance, **entry})
+                        "analysis_scope": scope, "declaration_has_call_sites": provenance, **entry})
 
     meta = {"package": package, "versionName": apk_obj.get_androidversion_name(),
             "versionCode": apk_obj.get_androidversion_code(), "build": build,

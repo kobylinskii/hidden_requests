@@ -28,22 +28,24 @@ def classify(events, *descriptors):
         trace = read_trace(path, "sha")
     rows = [{"key": OWNER + "->send", "cls": OWNER, "framework": "retrofit",
              "descriptor": descriptor} for descriptor in descriptors]
-    return [row["status"] for row in compare(rows, trace, True)]
+    return [(row["status"], row["confidence_caveats"]) for row in compare(rows, trace, True)]
 
 
 class TraceEvidenceTests(unittest.TestCase):
+    uncovered = ("not_observed", ["method_coverage_unverified"])
+
     def test_legacy_stub_could_have_suppressed_later_genuine_call(self):
         method = {"t": "retrofit", "cls": OWNER, "m": "send"}
         events = [{**method, "handler": "demo.Stub", "descriptor": "(I)V"},
                   {**method, "handler": HANDLER, "descriptor": "(Z)V"},
                   {"t": "coverage", "interface": OWNER}]
         self.assertEqual(classify(events, "(I)V", "(Z)V", "()V"),
-                         ["insufficient_data", "observed", "not_observed"])
+                         [self.uncovered, ("observed", []), ("not_observed", [])])
 
     def test_unattributed_legacy_event_and_coverage(self):
         events = [{"t": "retrofit", "cls": OWNER, "m": "send", "descriptor": "(I)V"},
                   {"t": "coverage", "interface": OWNER}]
-        self.assertEqual(classify(events, "(I)V", "(Z)V"), ["insufficient_data"] * 2)
+        self.assertEqual(classify(events, "(I)V", "(Z)V"), [self.uncovered] * 2)
 
     def test_only_method_call_attributes_declaration(self):
         events = [{"t": "coverage", "interface": OWNER, "handler": HANDLER},
@@ -51,12 +53,12 @@ class TraceEvidenceTests(unittest.TestCase):
                   {"t": "response", "observation": "response_created", "url": "/send", "status": 200},
                   {"t": "retrofit", "cls": OWNER, "m": "send", "descriptor": "(I)V",
                    "handler": HANDLER, "observation": "response_created"}]
-        self.assertNotIn("observed", classify(events, "(I)V"))
+        self.assertEqual(classify(events, "(I)V"), [self.uncovered])
 
     def test_coverage_belongs_to_instrumented_retrofit_interface(self):
         events = [{"t": "coverage", "interface": OWNER, "handler": "demo.Stub"},
                   {"t": "coverage", "interface": "demo.Other", "handler": HANDLER}]
-        self.assertEqual(classify(events, "(I)V"), ["insufficient_data"])
+        self.assertEqual(classify(events, "(I)V"), [self.uncovered])
 
 
 @unittest.skipUnless(shutil.which("node"), "Node.js required for the passive agent fixture")
