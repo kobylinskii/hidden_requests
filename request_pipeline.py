@@ -261,7 +261,7 @@ def print_statistics(compared, bodies):
           file=sys.stderr, flush=True)
 
 
-GUARD_COUNTS = ("guard_count", "guard_count_coroutine", "guard_count_framework", "depth")
+GUARD_COUNTS = ("guard_count", "guard_count_coroutine", "guard_count_framework", "guard_count_third_party_sdk", "depth")
 GUARD_FLAGS = ("reached", "activation_exact", "activation_exact_modulo_allocation", "inconclusive")
 GUARD_COSTS = ("activation_cost", "best_known_complete_cost", "activation_cost_modulo_allocation")
 GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, *GUARD_COSTS, "first_uncertain_hop", "notes")
@@ -314,6 +314,7 @@ def analyze_guards(args, build, complete, hidden, direct_sites, apk_obj, dx):
         metrics, cache_complete = read_guard_metrics(args.reasons_in, build, hidden)
         complete = complete and cache_complete
 
+    package = apk_obj.get_package()
     records = []
     key_count = len({(r["key"], r["descriptor"]) for r in hidden})
     for row in hidden:
@@ -321,7 +322,7 @@ def analyze_guards(args, build, complete, hidden, direct_sites, apk_obj, dx):
         signature = (key, row["descriptor"])
         if signature not in metrics:
             print(f"[стражи {len(metrics) + 1}/{key_count}] {key}", file=sys.stderr, flush=True)
-            analysis = slice_key(dx, key, descriptor=row["descriptor"], include_arguments=False)
+            analysis = slice_key(dx, key, descriptor=row["descriptor"], include_arguments=False, package=package)
             metrics[signature] = {k: analysis[k] for k in GUARD_FIELDS}
             metrics[signature]["call_site_count"] = len(analysis["call_sites"])
         entry = metrics[signature]
@@ -334,7 +335,7 @@ def analyze_guards(args, build, complete, hidden, direct_sites, apk_obj, dx):
         records.append({**{k: row[k] for k in ("build", "declaration_id", "key", "descriptor")},
                         "analysis_scope": "dex_descriptor", "declaration_has_call_sites": provenance, **entry})
 
-    meta = {"package": apk_obj.get_package(), "versionName": apk_obj.get_androidversion_name(),
+    meta = {"package": package, "versionName": apk_obj.get_androidversion_name(),
             "versionCode": apk_obj.get_androidversion_code(), "build": build,
             "status": "complete" if complete else "partial"}
     summary = report(records, meta=meta)

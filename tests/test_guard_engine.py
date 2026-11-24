@@ -196,3 +196,14 @@ class GuardEngineTest(unittest.TestCase):
             result = self.analyze()
         self.assertEqual(result["first_uncertain_hop"], 1)
         self.assertEqual(sl.backward_frames(self.dx, "Api", "record")["first_uncertain_depth"], {(id(above), 2): 1})
+
+    def test_ktor_and_sdk_tags_preserve_sdk_weight(self):
+        with patch.object(sl, "frame_of", return_value=frame()):
+            result = sl.slice_key(self.dx, "Api->record", descriptor="(I)V",
+                                  include_arguments=False, package="demo")
+        self.assertEqual(result["guard_count_third_party_sdk"], 1)
+        self.assertEqual(result["guard_count"], 1)
+        self.assertEqual(result["activation_cost"], 1)
+        self.assertEqual(result["guards"][0]["notes"], ["third_party_sdk"])
+        ktor_guard = {"operand": {"source_kind": "instanceof", "detail": "Lio/ktor/http/OutgoingContent;"}}
+        self.assertTrue(sl._is_framework_guard(ktor_guard))

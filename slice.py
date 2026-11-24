@@ -1527,7 +1527,7 @@ def _reads_continuation(dx, guard):
 
 # ponytail: грубый, но консервативный список — точность валидируется в Task 7
 # §8 на ground truth; апгрейд — расширять по факту false negative/positive.
-_FRAMEWORK_OWNER_PREFIXES = ("android.", "androidx.", "java.", "kotlin.", "kotlinx.")
+_FRAMEWORK_OWNER_PREFIXES = ("android.", "androidx.", "java.", "kotlin.", "kotlinx.", "io.ktor.")
 _FRAMEWORK_MEMBER_NAMES = {"ordinal", "areEqual", "checkNotNull", "checkNotNullParameter"}
 
 
@@ -1640,7 +1640,11 @@ def _arg_recipes(dx, arg_types, depth=2):
     return recipes
 
 
-def slice_key(dx, key, *, descriptor=None, include_arguments=True):
+def _counts_as_guard(guard):
+    return not guard["notes"] or guard["notes"] == ["third_party_sdk"]
+
+
+def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None):
     """Полная запись среза для одного ключа (схема спеки §4): обход вверх
     (Task 4) до фронтира/лимита, на каждом семантическом кадре — стражи
     (guards_of_frame). Кадр без кода (frame_of -> None, напр. внешнее/
@@ -1653,7 +1657,7 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True):
            "reached": w["reached"],
            "call_sites": [{"caller": s["caller"], "offset": s["offset"]} for s in w["call_sites"]],
            "guards": [], "guard_count": 0, "guard_count_coroutine": 0,
-           "guard_count_framework": 0, "activation_cost": None,
+           "guard_count_framework": 0, "guard_count_third_party_sdk": 0, "activation_cost": None,
            "activation_exact": False, "best_known_complete_cost": None, "args": [],
            "activation_cost_modulo_allocation": None, "activation_exact_modulo_allocation": False,
            "first_uncertain_hop": min(w["first_uncertain_depth"].values(), default=None),
@@ -1699,8 +1703,11 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True):
                   # сгенерированная компилятором, а не гейт приложения (§7.3)
                   or any("$EnumSwitchMapping$" in str(d) for d in g.get("_block_refs", ()))):
                 g["notes"] = ["framework"]
+            elif package and not g["frame"].startswith(package + "."):
+                # Package boundaries also include first-party modules and relocated classes.
+                g["notes"] = ["third_party_sdk"]
             g.pop("_block_refs", None)  # служебное, не в выход
-            if not g["notes"]:
+            if _counts_as_guard(g):
                 node_real += 1  # вес кадра — его СОБСТВЕННЫЕ реальные стражи
             # для guards[]/union guard_count — межкадровый дедуп (одно условие на
             # нескольких call-site одного метода не задваивается); на вес кадра
@@ -1714,9 +1721,10 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True):
     rec["guards"] = all_guards
     # Ruling-H: union guard_count — ВЕРХНЯЯ оценка (все стражи всех путей);
     # headline-метрика стоимости активации — activation_cost (минимум по путям).
-    rec["guard_count"] = sum(1 for g in all_guards if not g["notes"])
+    rec["guard_count"] = sum(_counts_as_guard(g) for g in all_guards)
     rec["guard_count_coroutine"] = sum(1 for g in all_guards if "coroutine_state_machine" in g["notes"])
     rec["guard_count_framework"] = sum(1 for g in all_guards if "framework" in g["notes"])
+    rec["guard_count_third_party_sdk"] = sum("third_party_sdk" in g["notes"] for g in all_guards)
     # §7.1: минимум реальных стражей по путям UI-вход -> скрытый вызов.
     children = {}
     for parent, child in w["edges"]:
@@ -1869,6 +1877,8 @@ def report(records, meta=None):
     w("Подгруппы dead_end могут пересекаться и не суммируются.")
     w(f"Стражи state-machine корутин (флагованы, исключены из guard_count и топа источников): {coroutine_total}")
     w(f"Стражи фреймворка/компилятора (флагованы, исключены из guard_count и топа источников): {framework_total}")
+    sdk_total = sum(r.get("guard_count_third_party_sdk", 0) for r in records)
+    w(f"Стражи вне пакета приложения (third_party_sdk, учитываются в guard_count): {sdk_total}")
     hops = Counter(r["first_uncertain_hop"] for r in records if r.get("first_uncertain_hop") is not None)
     w("Распределение глубины первой неопределённости пути:")
     for hop, count in sorted(hops.items()):
@@ -1904,7 +1914,7 @@ def report(records, meta=None):
           f"primitive(только примитивы): {dc.get('primitive', 0)} | "
           f"object(есть объектные): {dc.get('object', 0)} | из них suspend: {susp}")
     src = Counter(g["operand"]["detail"] for r in records for g in r.get("guards", ())
-                  if not g["notes"] and g["operand"]["source_kind"] in ("invoke", "field", "instanceof")
+                  if _counts_as_guard(g) and g["operand"]["source_kind"] in ("invoke", "field", "instanceof")
                   and g["operand"]["detail"])
     if src:
         w("Топ источников стражей:")
@@ -2062,7 +2072,7 @@ def main():
     print(f"[срез] APK загружен, строю срез по {len(keys)} ключам...", file=sys.stderr)
     records = []
     for i, k in enumerate(keys, 1):
-        records.append(slice_key(dx, k))
+        records.append(slice_key(dx, k, package=meta["package"]))
         print(f"  [{i}/{len(keys)}] {k.split('->')[-1]}", file=sys.stderr)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
