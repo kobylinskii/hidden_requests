@@ -843,6 +843,160 @@ def manifest_entry_classes(apk):
 SINK = ("__sink__",)  # синтетический узел скрытого вызова в графе кадров (§7.1)
 
 
+def _integer_source(cfg, block, pos, register):
+    definition, reason, _ = _def_insn(cfg, block, pos, register)
+    if definition is None:
+        return "parameter" if reason == "no_pred" else "unknown", register
+    _, _, ins = definition
+    if ins.op in ("const/4", "const/16", "const", "const/high16") and type(ins.args[0]) is int:
+        return "literal", ins.args[0]
+    return "unknown", None
+
+
+def _allocation_selector(dx, method, offset):
+    """Find an immutable integer selector and an explicit arm reaching the criterion."""
+    from body_data import raw_blocks, registers
+    from parameter_slice import layout
+
+    layout_data = layout(method)
+    if not layout_data:
+        return None
+    cfg, params, offsets, positions = layout_data
+    located = positions.get(offset)
+    entry = next(iter(cfg), None)
+    if not located or entry is None:
+        return None
+    insns = cfg.nodes[entry]["insns"]
+    if not insns:
+        return None
+    pos = len(insns) - 1
+    branch = insns[pos]
+    branch_offset = offsets[entry, pos]
+    raw = raw_blocks(method)[branch_offset]
+    fallthrough = branch_offset + raw.get_length()
+    if branch.op.endswith("-switch"):
+        payload = raw_blocks(method).get(branch_offset + 2 * raw.get_ref_off())
+        if payload is None or not hasattr(payload, "get_targets"):
+            return None
+        labels = {value: branch_offset + 2 * target
+                  for value, target in zip(payload.get_values(), payload.get_targets())}
+        default = fallthrough
+        operands = [(branch.args[0], None)]
+    elif branch.op in ("if-eqz", "if-nez", "if-eq", "if-ne"):
+        destination = branch_offset + 2 * raw.get_ref_off()
+        equal_branch = branch.op.startswith("if-eq")
+        targets = (destination, fallthrough) if equal_branch else (fallthrough, destination)
+        operands = [(branch.args[0], None)] if branch.op.endswith("z") else [
+            (branch.args[0], branch.args[1]), (branch.args[1], branch.args[0])]
+    else:
+        return None
+
+    criterion = located[0]
+    can_reach = nx.ancestors(cfg, criterion) | {criterion}
+    successors = {cfg.nodes[n]["start"]: n for n in cfg.successors(entry)}
+    found = []
+    for reg, compared in operands:
+        definition, _, _ = _def_insn(cfg, entry, pos, reg)
+        if not definition or definition[0] != entry or definition[2].op != "iget":
+            continue
+        _, read_pos, read = definition
+        field = read.args[0]
+        field_owner, _, field_tail = field.partition("->")
+        name, _, typ = field_tail.partition(" ")
+        if field_owner != method.class_name or typ != "I" or name == "label":
+            continue
+        raw_read = raw_blocks(method)[offsets[entry, read_pos]]
+        _, receiver = registers(raw_read)
+        if params.get(receiver, (None,))[0] != -1 or _def_insn(cfg, entry, read_pos, receiver)[0]:
+            continue
+        owner = dx.classes[field_owner].get_vm_class()
+        if not any(f.get_name() == name and f.get_descriptor() == "I" and f.get_access_flags() & 0x10
+                   for f in owner.get_fields()):
+            continue
+        if not branch.op.endswith("-switch"):
+            kind, label = ("literal", 0) if compared is None else _integer_source(cfg, entry, pos, compared)
+            if kind != "literal":
+                continue
+            labels, default = {label: targets[0]}, targets[1]
+        if default not in successors or successors[default] in can_reach:
+            continue
+        if any(target not in successors for target in labels.values()):
+            continue
+        values = {value for value, target in labels.items() if successors[target] in can_reach}
+        if values:
+            found.append((field, values))
+    return found[0] if len(found) == 1 else None
+
+
+def _allocation_selector_value(dx, caller, offset, field):
+    from body_data import arguments, raw_blocks, registers
+    from parameter_slice import layout
+
+    layout_data = layout(caller)
+    instruction = raw_blocks(caller).get(offset)
+    if not layout_data or instruction is None or instruction.get_name() != "new-instance":
+        return None
+    cfg, _, _, positions = layout_data
+    if offset not in positions:
+        return None
+    block, pos = positions[offset]
+    insns = cfg.nodes[block]["insns"]
+    allocated = insns[pos].out
+    owner = field.partition("->")[0]
+    for at, inv in enumerate(insns[pos + 1:], pos + 1):
+        if inv.out == allocated:
+            return None
+        if (inv.op.startswith("invoke-direct") and len(inv.args) >= 2
+                and inv.args[1] == allocated and (inv.args[0] or "").startswith(owner + "-><init>(")):
+            break
+    else:
+        return None
+    desc = inv.args[0].partition("-><init>")[2]
+    ctor = next((m for m in dx.classes[owner].get_methods()
+                 if m.name == "<init>" and m.descriptor.replace(" ", "") == desc.replace(" ", "")), None)
+    ctor_data = layout(ctor) if ctor is not None else None
+    if not ctor_data:
+        return None
+    graph, parameters, offsets, _ = ctor_data
+    if len(graph) != 1:
+        return None
+    node = next(iter(graph))
+    code = graph.nodes[node]["insns"]
+    writes = [i for i, ins in enumerate(code) if ins.op == "iput" and ins.args == (field,)]
+    if len(writes) != 1:
+        return None
+    write, = writes
+    value, receiver = registers(raw_blocks(ctor)[offsets[node, write]])
+    if parameters.get(receiver, (None,))[0] != -1 or _def_insn(graph, node, write, receiver)[0]:
+        return None
+    kind, source = _integer_source(graph, node, write, value)
+    if kind == "literal":
+        return source
+    index, typ = parameters.get(source, (-1, None))
+    if kind != "parameter" or index < 0 or typ != "I":
+        return None
+    argument = list(arguments(inv.args[2:], _param_types(desc)))[index]
+    kind, value = _integer_source(cfg, block, at, argument)
+    return value if kind == "literal" else None
+
+
+def _allocation_callers(dx, method, offset):
+    cls = dx.classes.get(method.class_name)
+    sites = list(cls.get_xref_new_instance()) if cls else []
+    if len(sites) < 2:
+        return sites
+    selector = _allocation_selector(dx, method, offset)
+    if selector is None:
+        return sites
+    field, accepted = selector
+    narrowed = []
+    for caller, position in sites:
+        value = _allocation_selector_value(dx, caller, position, field)
+        if value is None or value in accepted:
+            narrowed.append((caller, position))
+    return narrowed or sites
+
+
 def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     """Обратный межпроцедурный обход от call-site'ов cls->method вверх по
     графу вызовов до известного UI/lifecycle-колбэка или лимита глубины.
@@ -937,12 +1091,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             # invoke/invokeSuspend/create лямбды зовёт рантайм через интерфейс
             # (Function*/Continuation) — XREF пуст. Точка активации лямбды — место
             # её создания (new-instance): ViewModel/фрагмент, где вызван launch {}.
-            # ponytail: по имени метода; `operator fun invoke` без XREF у не-лямбды
-            # тоже уйдёт к new-instance (обычно DI), а R8-слитый класс лямбд
-            # (один класс + switch по id) даёт fan-in на все места создания —
-            # апгрейд: проверять суперкласс и id слитой лямбды.
-            ca = dx.classes.get(caller_ma.class_name)
-            ups = list(ca.get_xref_new_instance()) if ca else []
+            # Для слитых классов исключаем только доказанно чужие ветки.
+            ups = _allocation_callers(dx, caller_ma, off)
             if ups:
                 allocation_uncertain.add(node)
                 allocation_used = True
