@@ -749,6 +749,8 @@ _ACTIVITY = "Landroid/app/Activity;"
 _FRAGMENTS = ("Landroid/app/Fragment;", "Landroidx/fragment/app/Fragment;")
 _SERVICE = "Landroid/app/Service;"
 _LIFECYCLE_OWNERS = (_ACTIVITY, *_FRAGMENTS)
+# TODO: Resolve Compose callback registration (LaunchedEffect and
+# rememberCoroutineScope) before treating these runtime edges as UI entries.
 _CALLBACK_OWNERS = {
     ("onCreate", "(Landroid/os/Bundle;)V"): _LIFECYCLE_OWNERS,
     ("onStart", "()V"): _LIFECYCLE_OWNERS,
@@ -768,6 +770,33 @@ _CALLBACK_OWNERS = {
     ("onHandleWork", "(Landroid/content/Intent;)V"): ("Landroidx/core/app/JobIntentService;",),
     ("doWork", "()Landroidx/work/ListenableWorker$Result;"): ("Landroidx/work/Worker;",),
 }
+
+
+_VIEWMODEL_CONSTRUCTORS = {
+    "()V": ("Landroidx/lifecycle/ViewModel;",),
+    "(Landroid/app/Application;)V": ("Landroidx/lifecycle/AndroidViewModel;",),
+}
+
+
+def _is_viewmodel_candidate(dx, method):
+    if method.name != "<init>":
+        return False
+    owners = _VIEWMODEL_CONSTRUCTORS.get(method.descriptor.replace(" ", ""), ())
+    return bool(owners and set(owners).intersection(_cha_supers(dx, method.class_name)))
+
+
+def _is_compose_candidate(dx, method):
+    class_name = method.class_name
+    leaf = class_name.rsplit("/", 1)[-1]
+    if "ComposableSingletons" in leaf:
+        return True
+    if "$lambda" not in leaf:
+        return False
+    from body_data import annotations, dex_class
+
+    owner = dex_class(dx, class_name.split("$lambda", 1)[0] + ";")
+    return owner is not None and any(
+        "Landroidx/compose/runtime/Composable;" in tags for tags in annotations(owner)[0].values())
 
 
 def is_plumbing(key, ma):
@@ -1027,7 +1056,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
                 "allocation_used": False,
                 "frontier_nodes": set(), "dead_end_nodes": set(),
                 "capped_nodes": set(), "plumbing_nodes": set(), "stop_reasons": {},
-                "first_uncertain_depth": {}}
+                "first_uncertain_depth": {}, "viewmodel_candidate": False, "compose_dead_end": False}
     stop_reasons = {}
     first_uncertain_depth = {}
     frames, skipped, frontier, dead_ends = [], [], None, []
@@ -1038,6 +1067,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     cha_uncertain, allocation_uncertain = set(), set()
     unexamined_dispatch = set()
     allocation_used = False
+    viewmodel_candidate = compose_dead_end = False
     budget_hit = False
     max_depth = 0
     depth_capped = False  # True, если ХОТЬ ОДИН путь упёрся в limit (OR по путям)
@@ -1063,6 +1093,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             budget_hit = True
             break
         hop = depth
+        viewmodel_candidate |= _is_viewmodel_candidate(dx, caller_ma)
         plumbing = is_plumbing(ckey, caller_ma)
         if plumbing:
             skipped.append(ckey)
@@ -1100,6 +1131,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             stop_reasons[node] = reason
             dead_ends.append(ckey)  # путь оборван не на фронтире: стражи выше не видны
             dead_end_nodes.add(node)
+            compose_dead_end |= _is_compose_candidate(dx, caller_ma)
         if used or node in allocation_uncertain or not ups:
             first_uncertain_depth[node] = hop
         push = queue.appendleft if plumbing else queue.append  # плумбинг: та же глубина
@@ -1115,7 +1147,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             "budget_hit": budget_hit,
             "frontier_nodes": frontier_nodes, "dead_end_nodes": dead_end_nodes,
             "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes, "stop_reasons": stop_reasons,
-            "first_uncertain_depth": first_uncertain_depth}
+            "first_uncertain_depth": first_uncertain_depth,
+            "viewmodel_candidate": viewmodel_candidate, "compose_dead_end": compose_dead_end}
 
 
 def _check_walk_predicates():
@@ -1775,6 +1808,10 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
         rec["notes"].append("cha")
     if w["allocation_used"]:
         rec["notes"].append("allocation_xref")
+    if w["viewmodel_candidate"]:
+        rec["notes"].append("viewmodel_constructor_candidate")
+    if w["compose_dead_end"]:
+        rec["notes"].append("possible_compose_dead_end")
     if w["unexamined_dispatch"]:
         rec["notes"].append("unexamined_dispatch")
     if w["budget_hit"]:
@@ -1871,6 +1908,11 @@ def report(records, meta=None):
     w(f"Всего ключей: {len({r['key'] for r in records})} | reached: {reached} | no_caller: {no_caller} | "
       f"key_not_in_dex: {not_in_dex} | inconclusive: {inconcl}")
     w(f"Обход оборван не на фронтире (dead_end, стражи выше пути не видны): {dead}")
+    compose_ends = sum("possible_compose_dead_end" in r["notes"] for r in records)
+    candidates = sum("viewmodel_constructor_candidate" in r["notes"] for r in records)
+    compose_fraction = compose_ends / dead if dead else 0
+    w(f"Тупики с возможным участием Compose: {compose_ends}/{dead} ({compose_fraction:.1%})")
+    w(f"Срезы с конструктором ViewModel на пути: {candidates}/{total}")
     for reason in ("fanin_capped", "no_callers"):
         keys = {r["key"] for r in records if "dead_end:" + reason in r["notes"]}
         w(f"  dead_end:{reason}: {len(keys)} уникальных ключей")

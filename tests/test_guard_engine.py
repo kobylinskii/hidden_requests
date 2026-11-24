@@ -207,3 +207,16 @@ class GuardEngineTest(unittest.TestCase):
         self.assertEqual(result["guards"][0]["notes"], ["third_party_sdk"])
         ktor_guard = {"operand": {"source_kind": "instanceof", "detail": "Lio/ktor/http/OutgoingContent;"}}
         self.assertTrue(sl._is_framework_guard(ktor_guard))
+
+    def test_viewmodel_candidate_keeps_searching_and_compose_dead_end_is_diagnostic(self):
+        ctor = Method("LDemoViewModel;", "<init>")
+        compose = Method("Ldemo/ComposableSingletons$ScreenKt;", "render")
+        ctor.callers = [(compose, 1)]
+        self.dx.classes[ctor.class_name] = Class(ctor, parent="Landroidx/lifecycle/ViewModel;")
+        self.api.callers = [(ctor, 2)]
+        with patch.object(sl, "frame_of", return_value=frame()):
+            result = self.analyze()
+        self.assertIn("viewmodel_constructor_candidate", result["notes"])
+        self.assertIn("possible_compose_dead_end", result["notes"])
+        self.assertFalse(result["activation_exact"])
+        self.assertEqual(result["first_uncertain_hop"], 1)
