@@ -18,6 +18,9 @@ REPORT="$OUT/${PKG}.bodies.jsonl"
 SLICE="$OUT/${PKG}.request-slice.jsonl"
 REASONS="$OUT/${PKG}.reasons.jsonl"
 ARGS=()
+if [ "${SCAN_ALL_PATHS:-0}" = 1 ]; then
+    ARGS+=(--all-paths)
+fi
 if [ -n "${REASONS_IN:-}" ]; then
     ARGS+=(--reasons-in "$REASONS_IN")
 fi

@@ -76,6 +76,53 @@ class GuardEngineTest(unittest.TestCase):
             self.assertEqual(self.analyze("(J)V")["notes"], ["no_caller"])
             self.assertEqual(self.analyze("(Z)V")["notes"], ["key_not_in_dex"])
 
+    def test_kotlin_adapter_retains_its_application_branch(self):
+        adapter = Method("LEntry$1;", "invokeSuspend", "(Ljava/lang/Object;)Ljava/lang/Object;",
+                         [(self.callback, 2)])
+        self.dx.classes[adapter.class_name] = Class(adapter)
+        self.api.callers = [(adapter, 1)]
+        adapter_frame = frame()
+        adapter_frame["cfg"].nodes[0]["insns"] = [
+            sl.Insn("const/4", "v1", (7,)), sl.Insn("move", "v2", ("v1",)),
+            sl.Insn("if-ne", None, ("v0", "v2")),
+        ]
+        with patch.object(sl, "frame_of", side_effect=lambda method: adapter_frame if method is adapter else frame()):
+            result = self.analyze()
+        self.assertEqual(result["entry_evidence"]["background"], "resolved")
+        self.assertEqual(result["best_known_complete_cost"], 1)
+        route = result["witnesses"]["background"]["frames"]
+        callback, invoke = [result["call_graph"]["frames"][i] for i in route]
+        self.assertEqual(callback["entry"], "background")
+        self.assertTrue(invoke["plumbing"])
+        self.assertEqual(invoke["guards"][0]["operands"], [
+            {"register": "v0", "source_kind": "param", "detail": 0},
+            {"register": "v2", "source_kind": "const", "detail": 7},
+        ])
+
+    def test_switch_alternatives_remain_visible_and_count_once(self):
+        cfg = nx.DiGraph([("switch", "first"), ("switch", "second"), ("switch", "exit"),
+                         ("first", "call"), ("second", "call"), ("call", "exit")])
+        nx.set_node_attributes(cfg, {block: [] for block in cfg}, "insns")
+        cfg.nodes["switch"]["insns"] = [sl.Insn("sparse-switch", None, ("v0",))]
+        cfg_frame = {"cfg": cfg, "params": {"v0": 0}, "block_at": lambda _: "call"}
+        with patch.object(sl, "frame_of", return_value=cfg_frame):
+            result = self.analyze()
+        self.assertEqual(result["activation_cost"], 1)
+        self.assertEqual(result["guard_count"], 1)
+        self.assertEqual({g["sense"] for g in result["call_graph"]["frames"][0]["guards"]},
+                         {"->first", "->second"})
+
+    def test_edge_budget_keeps_direct_calls_and_marks_omitted_alternatives(self):
+        caller = Method("LRoute;", "send", callers=[(self.callback, 1), (self.callback, 2)], flags="final")
+        self.api.callers = [(caller, 1), (caller, 2)]
+        with patch.object(sl, "_EDGE_BUDGET", 1), patch.object(sl, "frame_of", return_value=frame()):
+            result = self.analyze()
+        self.assertFalse(result["activation_exact"])
+        graph = result["call_graph"]
+        self.assertEqual(sum(edge["to"] is None for edge in graph["edges"]), 2)
+        self.assertEqual(sum(edge["to"] is not None for edge in graph["edges"]), 1)
+        self.assertTrue(all("budget_hit" in f["stops"] for f in graph["frames"] if f["method"] == "Route->send"))
+
     def test_frontier_requires_instance_signature_and_ancestor(self):
         bad = [Method("LEntry;", "route"), Method("LEntry;", "onReceive"),
                Method("LEntry;", "onReceive", self.callback.descriptor, flags="static public"),

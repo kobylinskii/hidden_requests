@@ -282,6 +282,81 @@ GUARD_COUNTS = ("guard_count", "guard_count_coroutine", "guard_count_framework",
 GUARD_FLAGS = ("reached", "activation_exact", "activation_exact_modulo_allocation", "inconclusive")
 GUARD_COSTS = ("activation_cost", "best_known_complete_cost", "activation_cost_modulo_allocation")
 GUARD_FIELDS = (*GUARD_COUNTS, *GUARD_FLAGS, *GUARD_COSTS, "first_uncertain_hop", "entry_evidence", "notes")
+PATH_FIELDS = ("call_graph", "witnesses")
+
+
+def _valid_path_evidence(entry):
+    from slice import CALL_EDGE_EVIDENCE, frame_guard_count
+
+    graph, witnesses = (entry[k] for k in PATH_FIELDS)
+    if not isinstance(graph, dict) or not isinstance(witnesses, dict):
+        return False
+    frames, edges = graph.get("frames"), graph.get("edges")
+    if not isinstance(frames, list) or not isinstance(edges, list):
+        return False
+    for frame in frames:
+        if (not isinstance(frame, dict)
+                or not all(isinstance(frame.get(k), str) for k in ("method", "descriptor"))
+                or type(frame.get("offset")) is not int or frame["offset"] < 0
+                or not isinstance(frame.get("stops"), list) or not all(isinstance(s, str) for s in frame["stops"])
+                or not isinstance(frame.get("guards"), list)):
+            return False
+        for guard in frame["guards"]:
+            if (not isinstance(guard, dict) or not isinstance(guard.get("branch_block"), (int, str))
+                    or not isinstance(guard.get("notes"), list)):
+                return False
+
+    def frame_id(index):
+        return type(index) is int and 0 <= index < len(frames)
+
+    pairs = {}
+    for edge in edges:
+        if not isinstance(edge, dict) or not frame_id(edge.get("from")) or "to" not in edge:
+            return False
+        target = edge["to"]
+        if target is not None and not frame_id(target):
+            return False
+        kinds = edge.get("evidence")
+        if (not isinstance(kinds, list) or not kinds
+                or not all(isinstance(kind, str) and kind in CALL_EDGE_EVIDENCE for kind in kinds)):
+            return False
+        if target is None and kinds != ["dex_xref"]:
+            return False
+        pairs[edge["from"], target] = set(kinds)
+    if len(pairs) != len(edges) or sum(target is None for _, target in pairs) != entry["call_site_count"]:
+        return False
+    expected = {kind: evidence for kind, evidence in entry["entry_evidence"].items() if evidence != "not_found"}
+    if any(frame["stops"] for frame in frames):
+        expected["partial"] = "partial"
+    if witnesses.keys() != expected.keys():
+        return False
+    for kind, evidence in expected.items():
+        witness = witnesses[kind]
+        if not isinstance(witness, dict) or witness.get("evidence") != evidence:
+            return False
+        path = witness.get("frames")
+        count = witness.get("guard_count")
+        if (not isinstance(path, list) or not path or not all(frame_id(i) for i in path)
+                or type(count) is not int or count < 0 or len(path) != len(set(path))
+                or (path[-1], None) not in pairs or any(edge not in pairs for edge in zip(path, path[1:]))):
+            return False
+        first = frames[path[0]]
+        if not (first.get("stops") if kind == "partial" else first.get("entry") == kind):
+            return False
+        lower = entry["activation_cost"]
+        if (count != sum(frame_guard_count(frames[i]["guards"]) for i in path)
+                or (lower is not None and count < lower)):
+            return False
+        if evidence in ("resolved", "modulo_allocation"):
+            unsupported = {"cha", "allocation_xref"} if evidence == "resolved" else {"cha"}
+            if any(pairs[edge] & unsupported for edge in zip(path, path[1:])):
+                return False
+            unverified = {"missing_frame", "unexpected_offset_miss", "unreachable_from_method_entry",
+                          "exception_flow_unresolved"}
+            if any(unverified.intersection(frames[i]["stops"]) for i in path):
+                return False
+    best = min((w["guard_count"] for w in witnesses.values() if w["evidence"] == "resolved"), default=None)
+    return best == entry["best_known_complete_cost"]
 
 
 def read_guard_metrics(path, build, hidden):
@@ -291,12 +366,12 @@ def read_guard_metrics(path, build, hidden):
     for row in cached:
         identity = (row.get("declaration_id"), row.get("key"), row.get("descriptor"))
         if identity not in remaining:
-            raise ValueError(f"{path}: состав скрытых объявлений отличается")
+            raise ValueError(f"{path}: состав анализируемых объявлений отличается")
         remaining.remove(identity)
         scope = "dex_descriptor" if row.get("descriptor") else "unresolved"
         if row.get("analysis_scope") != scope or not all(k in row for k in (*GUARD_FIELDS, "call_site_count")):
             raise ValueError(f"{path}: несовместимый отчёт о стражах. Повторите анализ без REASONS_IN")
-        entry = {k: row[k] for k in (*GUARD_FIELDS, "call_site_count")}
+        entry = {k: row[k] for k in (*GUARD_FIELDS, "call_site_count", *PATH_FIELDS) if k in row}
         counts = [entry[k] for k in (*GUARD_COUNTS, "call_site_count")]
         counts.extend(entry[k] for k in (*GUARD_COSTS, "first_uncertain_hop") if entry[k] is not None)
         valid_counts = all(type(n) is int and n >= 0 for n in counts)
@@ -309,6 +384,9 @@ def read_guard_metrics(path, build, hidden):
                                   for v in evidence.values()))
         if not (valid_counts and valid_flags and valid_notes and valid_evidence):
             raise ValueError(f"{path}: неверные значения метрик стражей объявления {identity[0]}")
+        if any(k in entry for k in PATH_FIELDS) and (
+                not all(k in entry for k in PATH_FIELDS) or not _valid_path_evidence(entry)):
+            raise ValueError(f"{path}: неверный граф вызовов объявления {identity[0]}")
         lower, best, modulo = (entry[k] for k in GUARD_COSTS)
         if (entry["reached"] != bool(entry["call_site_count"])
                 or (best is not None and (lower is None or lower > best))
@@ -324,42 +402,42 @@ def read_guard_metrics(path, build, hidden):
             raise ValueError(f"{path}: противоречащие оценки одного ключа")
         metrics[signature] = entry
     if remaining:
-        raise ValueError(f"{path}: в отчёте отсутствуют скрытые объявления")
+        raise ValueError(f"{path}: в отчёте отсутствуют анализируемые объявления")
     return metrics, complete
 
 
-def analyze_guards(args, build, complete, hidden, direct_sites, apk_obj, dx):
+def analyze_guards(args, build, complete, candidates, direct_sites, apk_obj, dx):
     from slice import report, slice_key
 
     metrics = {}
     unresolved = {**dict.fromkeys(GUARD_COUNTS, 0), **dict.fromkeys(GUARD_FLAGS, False),
                   "inconclusive": True, **dict.fromkeys((*GUARD_COSTS, "first_uncertain_hop")),
                   "notes": ["dex_identity_unresolved"], "call_site_count": 0,
+                  "call_graph": {"frames": [], "edges": []}, "witnesses": {},
                   "entry_evidence": {"ui": "not_found", "background": "not_found"}}
     if args.reasons_in:
-        metrics, cache_complete = read_guard_metrics(args.reasons_in, build, hidden)
+        metrics, cache_complete = read_guard_metrics(args.reasons_in, build, candidates)
         complete = complete and cache_complete
 
     package = apk_obj.get_package()
     records = []
-    key_count = len({(r["key"], r["descriptor"]) for r in hidden if r["descriptor"]})
-    for row in hidden:
+    for row in candidates:
         key = row["key"]
         signature = (key, row["descriptor"])
-        if row["descriptor"] and signature not in metrics:
-            print(f"[стражи {len(metrics) + 1}/{key_count}] {key}", file=sys.stderr, flush=True)
+        if row["descriptor"] and "call_graph" not in metrics.get(signature, {}):
+            print(f"[стражи {len(records) + 1}/{len(candidates)}] {key}", file=sys.stderr, flush=True)
             analysis = slice_key(dx, key, descriptor=row["descriptor"], include_arguments=False, package=package)
-            metrics[signature] = {k: analysis[k] for k in GUARD_FIELDS}
+            metrics[signature] = {k: analysis[k] for k in (*GUARD_FIELDS, *PATH_FIELDS)}
             metrics[signature]["call_site_count"] = len(analysis["call_sites"])
         entry = metrics[signature] if row["descriptor"] else unresolved
         scope = "dex_descriptor" if row["descriptor"] else "unresolved"
-        provenance = direct_sites[row["declaration_id"]]
+        provenance = direct_sites.get(row["declaration_id"])
         if provenance is not None and provenance != entry["reached"]:
             print(f"[предупреждение] {key} {row['descriptor']} (объявление {row['declaration_id']}): "
                   f"место вызова в срезе аргументов={provenance}, в анализе стражей={entry['reached']}. "
                   "Ветви анализа расходятся по одному DEX-дескриптору.",
                   file=sys.stderr, flush=True)
-        records.append({**{k: row[k] for k in ("build", "declaration_id", "key", "descriptor")},
+        records.append({**{k: row[k] for k in ("build", "declaration_id", "key", "descriptor", "status")},
                         "analysis_scope": scope, "declaration_has_call_sites": provenance, **entry})
 
     meta = {"package": package, "versionName": apk_obj.get_androidversion_name(),
@@ -402,7 +480,8 @@ def report_bfscan(args, build):
         from body_data import request_slice
 
         hidden = [row for row in compared if row["status"] == "not_observed"]
-        if hidden and dx is None:
+        guard_candidates = compared if args.all_paths else hidden
+        if guard_candidates and dx is None:
             with progress_stage("Загрузка APK, разбор DEX и построение связей методов"):
                 apk_obj, dx = load_apk(args.apk)
         direct_sites = {}
@@ -428,12 +507,11 @@ def report_bfscan(args, build):
 
         with progress_stage(f"Обратные срезы для {len(hidden)} скрытых объявлений"):
             publish(args.request_slice, slices(), build, complete, artifact_type="request-slice", run_id=args.run_id)
-        with progress_stage("Проверка готового отчёта о стражах" if args.reasons_in else
-                            f"Анализ стражей для {len(hidden)} скрытых объявлений"):
+        with progress_stage(f"Анализ путей и стражей для {len(guard_candidates)} объявлений"):
             if apk_obj is None:  # Пустой готовый список: для шапки достаточно манифеста.
                 from androguard.core.apk import APK
                 apk_obj = APK(str(args.apk))
-            analyze_guards(args, build, complete, hidden, direct_sites, apk_obj, dx)
+            analyze_guards(args, build, complete, guard_candidates, direct_sites, apk_obj, dx)
 
 
 def main():
@@ -444,9 +522,10 @@ def main():
                  "reasons", "reasons-in"):
         parser.add_argument("--" + name, type=Path)
     parser.add_argument("--serializer", choices=("auto", "gson"), default="auto")
+    parser.add_argument("--all-paths", action="store_true", help="анализировать пути всех объявлений BFScan")
     args = parser.parse_args()
-    if (args.reasons or args.reasons_in) and not args.request_slice:
-        parser.error("--reasons и --reasons-in требуют --request-slice")
+    if (args.reasons or args.reasons_in or args.all_paths) and not args.request_slice:
+        parser.error("--reasons, --reasons-in и --all-paths требуют --request-slice")
     if args.request_slice and not args.reasons:
         prefix = args.request_slice.stem.removesuffix(".request-slice")
         args.reasons = args.request_slice.with_name(prefix + ".reasons.jsonl")

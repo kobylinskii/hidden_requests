@@ -1,5 +1,6 @@
 """Integration of the offline pipeline with a locally compiled, network-free APK."""
 from contextlib import redirect_stderr, redirect_stdout
+from copy import deepcopy
 from io import StringIO
 import os
 from pathlib import Path
@@ -45,6 +46,16 @@ interface Api {
 class Entry extends android.content.BroadcastReceiver {
     public void onReceive(android.content.Context c, android.content.Intent i) {}
     void route(Api api, boolean selected) { if (selected) api.save("sample"); }
+    void choose(Api api, int selector) {
+        switch (selector) {
+            case 4: case 60: api.draft(); break;
+            case 98: api.seen(); break;
+        }
+    }
+    void catchOnly(Api api) {
+        try { throw new IllegalStateException(); }
+        catch (IllegalStateException ignored) { api.draft(); }
+    }
 }
 class Draft { void store(Api api) { api.draft(); } }
 """)
@@ -123,9 +134,25 @@ class GuardPipelineTest(unittest.TestCase):
             self.assertFalse(records[1]["declaration_has_call_sites"])
             self.assertEqual(records[0]["guard_count"], 1)
             self.assertEqual(records[0]["activation_cost"], 1)
+            graph = records[0]["call_graph"]
+            frame = graph["frames"][0]
+            self.assertEqual(frame["method"], PACKAGE + ".Entry->route")
+            self.assertEqual(frame["descriptor"], "(Ldemo/local/notes/Api;Z)V")
+            self.assertEqual(frame["stops"], ["no_callers"])
+            self.assertIsInstance(frame["offset"], int)
+            self.assertIsInstance(frame["guards"][0]["branch_offset"], int)
+            self.assertIn(frame["guards"][0]["outcomes"][0]["kind"], ("taken", "fallthrough"))
+            self.assertEqual(graph["edges"], [{"from": 0, "to": None, "evidence": ["dex_xref"]}])
+            self.assertEqual(records[0]["witnesses"]["partial"]["frames"], [0])
             self.assertFalse(records[2]["reached"])
             self.assertIn("no_caller", records[2]["notes"])
             self.assertIn("dead_end:no_callers", records[3]["notes"])
+            choose = next(f for f in records[3]["call_graph"]["frames"] if f["method"].endswith("->choose"))
+            guard = choose["guards"][0]
+            self.assertEqual(guard["opcode"], "sparse-switch")
+            self.assertEqual(guard["outcomes"], [{"kind": "case", "value": 4}, {"kind": "case", "value": 60}])
+            caught = next(f for f in records[3]["call_graph"]["frames"] if f["method"].endswith("->catchOnly"))
+            self.assertIn("unreachable_from_method_entry", caught["stops"])
             self.assertEqual(comparison[5]["confidence_caveats"],
                              ["dex_identity_unresolved", "method_coverage_unverified"])
             self.assertFalse(records[3]["activation_exact"])
@@ -134,6 +161,7 @@ class GuardPipelineTest(unittest.TestCase):
             self.assertIn("dex_identity_unresolved", records[4]["notes"])
             self.assertIsNone(records[4]["activation_cost"])
             self.assertEqual(records[4]["call_site_count"], 0)
+            self.assertEqual(records[4]["call_graph"], {"frames": [], "edges": []})
             for path in (reasons, catalog_metadata(reasons), report):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o644)
             summary = report.read_text()
@@ -148,9 +176,28 @@ class GuardPipelineTest(unittest.TestCase):
                 main()
             self.assertEqual(read_checked_rows(reasons, build), (records, True))
             self.assertEqual(report.read_text(), summary)
+            corrupt = deepcopy(records)
+            corrupt[0]["witnesses"]["partial"]["guard_count"] += 1
+            publish(reasons, corrupt, build, True)
+            with patch.object(sys, "argv", cached_args), self.assertRaises(SystemExit):
+                main()
+            old_records = [{k: v for k, v in row.items() if k not in ("call_graph", "witnesses")}
+                           for row in records]
+            publish(reasons, old_records, build, True)
+            with patch.object(sys, "argv", cached_args), patch("slice.slice_key", wraps=slice_key) as analyze:
+                main()
+            self.assertEqual(analyze.call_count, 4)
+            self.assertEqual(read_checked_rows(reasons, build), (records, True))
             publish(reasons, records[:-1], build, True)
             with patch.object(sys, "argv", cached_args), self.assertRaises(SystemExit):
                 main()
+
+            with patch.object(sys, "argv", args + ["--comparison-in", str(hidden), "--all-paths"]):
+                main()
+            all_records, _ = read_checked_rows(reasons, build)
+            self.assertEqual([r["declaration_id"] for r in all_records],
+                             [r["declaration_id"] for r in comparison])
+            self.assertEqual(all_records[2]["status"], "observed")
 
     def test_partial_comparison_with_no_candidates_needs_no_dex(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(StringIO()), redirect_stderr(StringIO()):

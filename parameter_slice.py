@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from slice import _def_insn, _param_types, frame_of
+from slice import _def_insn, _param_types
 
 
 def signature(method):
@@ -17,6 +17,7 @@ def signature(method):
 @lru_cache(maxsize=128)
 def layout(method):
     from body_data import arguments, raw_blocks
+    from slice import frame_of
 
     frame = frame_of(method)
     if frame is None:

@@ -23,6 +23,8 @@ from androguard.misc import AnalyzeAPK
 from androguard.core.dex.dex_types import Operand
 
 Insn = namedtuple("Insn", "op out args")
+CALL_EDGE_EVIDENCE = frozenset({"dex_xref", "resolved_dispatch", "cha", "coroutine_resume",
+                                "coroutine_launch", "allocation_xref"})
 
 
 def _kind_of(ins):
@@ -44,24 +46,20 @@ def _kind_of(ins):
 
 
 def classify_operand(cfg, block, use_pos, reg, params):
-    """Обратный def-use по reg от use_pos внутри block, затем в единственного
-    предшественника. >=2 предшественников без локального def -> unknown, кроме
-    параметров (они доминируют все блоки). ponytail: глубина один хоп."""
-    b, start, seen = block, use_pos - 1, set()
-    while True:
-        insns = cfg.nodes[b]["insns"]
-        for i in range(min(start, len(insns) - 1), -1, -1):
-            if insns[i].out == reg:
-                return _kind_of(insns[i])
-        if b in seen:
-            return ("param", params[reg]) if reg in params else ("unknown", None)
-        seen.add(b)
-        preds = list(cfg.predecessors(b))
-        if len(preds) == 1:
-            b = preds[0]
-            start = len(cfg.nodes[b]["insns"]) - 1
-            continue
-        return ("param", params[reg]) if reg in params else ("unknown", None)
+    """Trace register moves and unambiguous definitions back from a use."""
+    seen = set()
+    while (block, use_pos, reg) not in seen:
+        seen.add((block, use_pos, reg))
+        definition, reason, _ = _def_insn(cfg, block, use_pos, reg)
+        if definition is None:
+            if reason == "no_pred" and reg in params:
+                return "param", params[reg]
+            break
+        block, use_pos, ins = definition
+        if ins.op.startswith(("move-result", "move-exception")) or not ins.op.startswith("move") or not ins.args:
+            return _kind_of(ins)
+        reg = ins.args[0]
+    return "unknown", None
 
 
 def post_idom(cfg, exit_node):
@@ -113,7 +111,7 @@ def control_deps(cfg, criterion, exit_node):
 
 
 def _guard_distances(weight, children, sink, *,
-                    cha_uncertain=frozenset(), allocation_uncertain=frozenset(), missing_frames=()):
+                    cha_uncertain=frozenset(), allocation_uncertain=frozenset(), missing_frames=(), routes=None):
     """Compute distances under the optimistic, allocation-tolerant and strict models.
 
     A stopped suffix can omit nonnegative weights upstream. A complete path
@@ -129,6 +127,7 @@ def _guard_distances(weight, children, sink, *,
 
     def distances(blocked=None):
         dist = {sink: 0}
+        next_frame = {}
         queue = [(0, 0, sink)]
         order = 0
         while queue:
@@ -141,14 +140,18 @@ def _guard_distances(weight, children, sink, *,
                 candidate = cost + weight.get(parent, 0)
                 if candidate < dist.get(parent, float("inf")):
                     dist[parent] = candidate
+                    next_frame[parent] = node
                     order += 1
                     heapq.heappush(queue, (candidate, order, parent))
-        return dist
+        return dist, next_frame
 
     optimistic = distances()
     modulo = distances(cha_uncertain) if cha_uncertain or missing_frames else optimistic
     verified = distances(cha_uncertain | allocation_uncertain) if allocation_uncertain else modulo
-    return optimistic, modulo, verified
+    models = optimistic, modulo, verified
+    if routes is not None:
+        routes.extend(next_frame for _, next_frame in models)
+    return tuple(dist for dist, _ in models)
 
 
 def _guard_costs(distances, tops, frontier):
@@ -479,11 +482,12 @@ def resolve_call_sites(dx, cls, method, descriptor=None):
             caller_ma, off = xf[1], xf[-1]
             sites.append({"caller": method_key(caller_ma),
                           "caller_ma": caller_ma, "offset": off})
-    return sites
+    return sorted(sites, key=lambda s: _site_order((s["caller_ma"], s["offset"])))
 
 
 _CHA_FANIN_CAP = 16      # больше вызывающих у полиморфного метода -> общий интерфейс, не граница
 _FRAME_BUDGET = 4000     # потолок кадров на ключ: гарантия завершения при взрывном fan-in
+_EDGE_BUDGET = 4 * _FRAME_BUDGET  # прямые ссылки на запрос сохраняются отдельно
 # Лимит глубины пути. Проверено на TNT: углубление НЕ помогает покрытию. При
 # limit=12 точных ключей стало меньше (29->27), шум стражей вырос в 5-13x, а
 # dead_end 100->115 — глубже обход лишь проходит больше промежуточных кадров и
@@ -676,10 +680,8 @@ def _norm(instructions):
       goto/return/throw -> out=None.
       иначе (move-object, check-cast, instance-of, арифметика,
       move-exception, new-instance, aget, ...) -> общий случай: out = первый
-      регистр-операнд (приёмник), args = остальные регистры. ponytail:
-      check-cast/move-object не трактуются как алиас исходного значения —
-      после них classify_operand видит "unknown" вместо исходного источника;
-      апгрейд — алиас-таблица в classify_operand, если понадобится точность.
+      регистр-операнд (приёмник), args = остальные регистры. Приведение типа
+      использует исходный регистр, а move сохраняет регистр-источник.
     """
     out = []
     prev_invoke_sig = None
@@ -779,9 +781,27 @@ def frame_of(ma):
         return None
     cfg = nx.DiGraph()
     bbs = list(ma.get_basic_blocks().get())
+    handlers = set()
     for bb in bbs:
-        cfg.add_node(bb.get_name(), insns=_norm(list(bb.get_instructions())),
-                     start=bb.get_start(), end=bb.get_end())
+        raw = list(bb.get_instructions())
+        start, end = bb.get_start(), bb.get_end()
+        cfg.add_node(bb.get_name(), insns=_norm(raw), start=start, end=end)
+        exception = bb.get_exception_analysis()
+        if exception is not None:
+            handlers.update(handler.get_name() for _, _, handler in exception.exceptions if handler is not None)
+        if raw and (raw[-1].get_name().startswith("if-") or raw[-1].get_name().endswith("-switch")):
+            cond = raw[-1]
+            offset = end - cond.get_length()
+            outcomes = {end: [{"kind": "fallthrough"}]}
+            if cond.get_name().startswith("if-"):
+                outcomes.setdefault(offset + 2 * cond.get_ref_off(), []).append({"kind": "taken"})
+            else:
+                outcomes[end] = [{"kind": "default"}]
+                payload = bb.get_special_ins(offset)
+                if payload is not None:
+                    for key, target in zip(payload.get_keys(), payload.get_targets()):
+                        outcomes.setdefault(offset + 2 * target, []).append({"kind": "case", "value": key})
+            cfg.nodes[bb.get_name()].update(branch_offset=offset, outcomes=outcomes)
     for bb in bbs:
         end = bb.get_end()
         for (_last_idx, _tgt_idx, tbb) in bb.childs:
@@ -799,7 +819,10 @@ def frame_of(ma):
             return blocks[idx]
         return None
 
-    return {"cfg": cfg, "params": params, "block_at": block_at}
+    normal_blocks = nx.descendants(cfg, blocks[0]) | {blocks[0]} if blocks else set()
+    handler_blocks = handlers.union(*(nx.descendants(cfg, handler) for handler in handlers))
+    return {"cfg": cfg, "params": params, "block_at": block_at, "normal_blocks": normal_blocks,
+            "handler_blocks": handler_blocks}
 
 
 def _check_androguard(dx):
@@ -1155,8 +1178,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     """Обратный межпроцедурный обход от call-site'ов cls->method вверх по
     графу вызовов до известного UI/lifecycle-колбэка или лимита глубины.
     Плумбинг (is_plumbing) проходится насквозь — не попадает в frames и не
-    тратит бюджет глубины (вверх от него идём с ТЕМ ЖЕ depth), но обход через
-    его вызывающих продолжается. Циклы (рекурсия, coroutine resume через себя
+    тратит бюджет глубины (вверх от него идём с ТЕМ ЖЕ depth), но его узел
+    сохраняется в графе. Циклы (рекурсия, coroutine resume через себя
     же) гасятся visited-множеством по (метод, offset) — один и тот же
     call-site не обрабатывается дважды, что гарантирует терминацию на
     конечном графе вызовов.
@@ -1170,7 +1193,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     потомок — SINK. Рёбра пишутся в момент ОБНАРУЖЕНИЯ (push), до дедупа, иначе
     fan-in терялся бы. frontier_nodes / dead_end_nodes / capped_nodes —
     максимальные кадры (входы обхода); plumbing_nodes — узлы-плумбинг
-    (вес 0 в минимуме по путям)."""
+    (семантические стражи в них учитываются наравне с другими кадрами)."""
     from coroutine_paths import launched_lambda_sites, resumed_method
 
     sites = resolve_call_sites(dx, cls, method, descriptor)
@@ -1178,6 +1201,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
         return {"reached": False, "call_sites": [], "frames": [],
                 "frontier": None, "depth": 0, "plumbing_skipped": [],
                 "depth_capped": False, "dead_ends": [], "edges": [], "cha_used": False,
+                "sites_by_node": {}, "edge_kinds": {}, "budget_nodes": set(), "dispatch_capped": set(),
                 "budget_hit": False, "uncertain_callers": set(), "cha_uncertain": set(), "allocation_uncertain": set(),
                 "unexamined_dispatch": set(),
                 "allocation_used": False, "coroutine_resume_edges": 0, "coroutine_launch_edges": 0,
@@ -1195,20 +1219,25 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     cha_uncertain, allocation_uncertain = set(), set()
     unexamined_dispatch = set()
     allocation_used = False
-    resume_edges, launch_edges = set(), set()
     viewmodel_candidate = compose_dead_end = False
     budget_hit = False
     max_depth = 0
     depth_capped = False  # True, если ХОТЬ ОДИН путь упёрся в limit (OR по путям)
     nid = lambda ma, o: (id(ma), o)
-    # очередь: (child_node, caller_ma, offset, depth) — depth путевой (per-path);
+    sites_by_node = {nid(s["caller_ma"], s["offset"]): s["caller_ma"] for s in sites}
+    edge_kinds = {(node, SINK): {"dex_xref"} for node in sites_by_node}
+    budget_nodes, dispatch_capped = set(), set()
+    scheduled_edges = 0
+    # Очередь: (child_node, caller_ma, offset, depth, evidence). Depth путевой.
     # child_node — узел, который этот кадр вызывает ВНИЗ к скрытому вызову.
     # 0-1 BFS (спека §5.2), не DFS: при visited-дедупе DFS мог впервые прийти в
     # кадр по длинному пути, упереться в limit и отбросить короткий путь к нему.
-    queue = deque((SINK, s["caller_ma"], s["offset"], 0) for s in sites)
+    queue = deque((SINK, s["caller_ma"], s["offset"], 0, ("dex_xref",)) for s in sites)
     while queue:
-        child_node, caller_ma, off, depth = queue.popleft()
+        child_node, caller_ma, off, depth, evidence = queue.popleft()
         node = nid(caller_ma, off)
+        sites_by_node[node] = caller_ma
+        edge_kinds.setdefault((node, child_node), set()).update(evidence)
         ckey = method_key(caller_ma)
         edges.append((node, child_node))  # ребро вниз к скрытому вызову (до дедупа)
         # дедуп по самому методу, не по имени: у R8 перегрузки a(I)/a(J) — разные
@@ -1220,6 +1249,15 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             # взрывной fan-in (общий интерфейс проскочил потолок): обход не
             # должен виснуть — обрываем, ключ честно помечается budget_hit
             budget_hit = True
+            budget_nodes.add(node)
+            for pending_child, ma, offset, _, kinds in queue:
+                pending = nid(ma, offset)
+                if pending_child == SINK or pending in sites_by_node:
+                    edge_kinds.setdefault((pending, pending_child), set()).update(kinds)
+                else:
+                    # The caller was discovered, but its frame did not fit the budget.
+                    budget_nodes.add(pending_child)
+            budget_nodes.update(n for n, ma in sites_by_node.items() if (ma, n[1]) not in visited)
             break
         hop = depth
         viewmodel_candidate |= _is_viewmodel_candidate(dx, caller_ma)
@@ -1245,12 +1283,22 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
                 continue  # этот путь упёрся в лимит глубины
         if resumed is not None:
             ups, used, reason = _caller_evidence(dx, resumed, caller_ma)
-            resume_edges.update((nid(ma, offset), node) for ma, offset in ups)
         else:
             ups, used, reason = cha_caller_sites(dx, caller_ma)
+        if reason == "fanin_capped":
+            dispatch_capped.add(node)
         launches, incomplete = launched_lambda_sites(dx, caller_ma, off)
+        caller_kinds = {}
+        if not (used and launches):
+            for ma, offset in ups:
+                virtual, _ = _call_site_dispatch(dx, ma, offset)
+                kinds = ["cha" if used else "resolved_dispatch" if virtual else "dex_xref"]
+                if resumed is not None:
+                    kinds.append("coroutine_resume")
+                caller_kinds[ma, offset] = kinds
         if launches:
-            launch_edges.update((nid(ma, offset), node) for ma, offset in launches)
+            for site in launches:
+                caller_kinds.setdefault(site, []).append("coroutine_launch")
             if incomplete or used or reason in ("fanin_capped", "unexamined_dispatch"):
                 unexamined_dispatch.add(node)
             known = [] if used else ups
@@ -1270,6 +1318,8 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
             if ups:
                 allocation_uncertain.add(node)
                 allocation_used = True
+                ups = sorted(set(ups), key=_site_order)
+                caller_kinds = {site: ["allocation_xref"] for site in ups}
         if not ups:
             stop_reasons[node] = reason
             dead_ends.append(ckey)  # путь оборван не на фронтире: стражи выше не видны
@@ -1278,16 +1328,24 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
         if used or node in allocation_uncertain or not ups:
             first_uncertain_depth[node] = hop
         push = queue.appendleft if plumbing else queue.append  # плумбинг: та же глубина
-        for ma, o in ups:
-            push((node, ma, o, depth))  # node — потомок (вниз к скрытому вызову) для вызывающего
+        remaining_edges = _EDGE_BUDGET - scheduled_edges
+        if len(ups) > remaining_edges:
+            budget_hit = True
+            budget_nodes.add(node)
+        for ma, o in ups[:remaining_edges]:
+            push((node, ma, o, depth, caller_kinds[ma, o]))
+            scheduled_edges += 1
     return {"reached": True, "call_sites": sites, "frames": frames,
             "frontier": frontier, "depth": max_depth,
             "plumbing_skipped": skipped, "depth_capped": depth_capped,
             "dead_ends": dead_ends, "edges": edges, "cha_used": cha_used,
+            "sites_by_node": sites_by_node, "edge_kinds": edge_kinds, "budget_nodes": budget_nodes,
+            "dispatch_capped": dispatch_capped,
             "uncertain_callers": cha_uncertain | allocation_uncertain, "unexamined_dispatch": unexamined_dispatch,
             "cha_uncertain": cha_uncertain, "allocation_uncertain": allocation_uncertain,
             "allocation_used": allocation_used,
-            "coroutine_resume_edges": len(resume_edges), "coroutine_launch_edges": len(launch_edges),
+            "coroutine_resume_edges": sum("coroutine_resume" in kinds for kinds in edge_kinds.values()),
+            "coroutine_launch_edges": sum("coroutine_launch" in kinds for kinds in edge_kinds.values()),
             "budget_hit": budget_hit,
             "frontier_nodes": frontier_nodes, "entry_nodes": entry_nodes, "dead_end_nodes": dead_end_nodes,
             "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes, "stop_reasons": stop_reasons,
@@ -1332,8 +1390,9 @@ def guards_of_frame(fr, criterion_offset):
         g.add_edges_from((n, exit_node) for n in cfg if cfg.out_degree(n) == 0)
         fr["control_deps"] = _direct_control_deps(g, exit_node)
     guards = []
-    for (branch, taken) in _control_closure(fr["control_deps"], crit):
-        insns = cfg.nodes[branch]["insns"]
+    for branch, taken in sorted(_control_closure(fr["control_deps"], crit)):
+        branch_data = cfg.nodes[branch]
+        insns = branch_data["insns"]
         cond = next((i for i in reversed(insns)
                      if i.op.startswith("if") or i.op.endswith("-switch")), None)
         opcode = cond.op if cond else "branch"
@@ -1345,6 +1404,10 @@ def guards_of_frame(fr, criterion_offset):
         kind, detail = next((c for c in cands if c[0] not in ("const", "unknown")),
                             cands[0] if cands else ("unknown", None))
         operand = {"source_kind": kind, "detail": detail}
+        operands = [{"register": reg, "source_kind": source, "detail": value}
+                    for reg, (source, value) in zip(cond.args if cond else (), cands)]
+        if opcode.startswith("if-") and opcode.endswith("z"):
+            operands.append({"source_kind": "const", "detail": 0})
         # дескрипторы полей/типов, читаемых в самом блоке ветвления: нужны для
         # распознавания метки корутины `if ((label & MIN_INT) != 0)`, где
         # операнд — результат and-int (unknown), а само поле-метку читает iget.
@@ -1352,7 +1415,10 @@ def guards_of_frame(fr, criterion_offset):
                       if i.op.startswith(("iget", "sget", "instance-of"))
                       and i.args and i.args[0]]
         guards.append({"frame": None, "opcode": opcode, "sense": f"->{taken}",
-                       "operand": operand, "notes": [], "_block_refs": block_refs})
+                       "branch_block": branch, "branch_offset": branch_data.get("branch_offset"),
+                       "target_offset": cfg.nodes[taken].get("start"),
+                       "outcomes": branch_data.get("outcomes", {}).get(cfg.nodes[taken].get("start"), []),
+                       "operand": operand, "operands": operands, "notes": [], "_block_refs": block_refs})
     return guards
 
 
@@ -1821,6 +1887,36 @@ def _counts_as_guard(guard):
     return not guard["notes"] or guard["notes"] == ["third_party_sdk"]
 
 
+def frame_guard_count(guards):
+    return len({guard["branch_block"] for guard in guards if _counts_as_guard(guard)})
+
+
+def _call_graph(walk, node_ids, guards, stops, frame_notes):
+    frames = []
+    for node in node_ids:
+        method = walk["sites_by_node"][node]
+        frames.append({"method": method_key(method), "descriptor": method.descriptor.replace(" ", ""),
+                       "offset": node[1], "entry": walk["entry_nodes"].get(node),
+                       "plumbing": node in walk["plumbing_nodes"], "stops": sorted(stops.get(node, ())),
+                       "notes": frame_notes.get(node, []), "guards": guards.get(node, [])})
+    edges = [{"from": node_ids[parent], "to": None if child == SINK else node_ids[child], "evidence": sorted(kinds)}
+             for (parent, child), kinds in walk["edge_kinds"].items()]
+    edges.sort(key=lambda edge: (edge["from"], -1 if edge["to"] is None else edge["to"]))
+    return {"frames": frames, "edges": edges}
+
+
+def _path_witness(candidates, distances, routes, node_ids, evidence):
+    start = min((node for node in candidates if node in distances),
+                key=lambda node: (distances[node], node_ids[node]), default=None)
+    if start is None:
+        return None
+    frames, node = [], start
+    while node != SINK:
+        frames.append(node_ids[node])
+        node = routes[node]
+    return {"evidence": evidence, "frames": frames, "guard_count": distances[start]}
+
+
 def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None):
     """Полная запись среза для одного ключа (схема спеки §4): обход вверх
     (Task 4) до фронтира/лимита, на каждом семантическом кадре — стражи
@@ -1833,6 +1929,7 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
     rec = {"key": key, "cls": cls, "method": method,
            "reached": w["reached"],
            "call_sites": [{"caller": s["caller"], "offset": s["offset"]} for s in w["call_sites"]],
+           "call_graph": {"frames": [], "edges": []}, "witnesses": {},
            "guards": [], "guard_count": 0, "guard_count_coroutine": 0,
            "guard_count_framework": 0, "guard_count_third_party_sdk": 0, "activation_cost": None,
            "activation_exact": False, "best_known_complete_cost": None, "args": [],
@@ -1861,21 +1958,39 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
         known = bool(_declarations(dx, cls, method, descriptor))
         rec["notes"].append("no_caller" if known else "key_not_in_dex")
         return rec
-    all_guards, seen, weight = [], set(), {}
-    missing_frames, offset_misses = set(), set()
-    for f in w["frames"]:
-        fr = frame_of(f["ma"])
-        if fr is None:
-            missing_frames.add(f["node"])
+    all_guards, seen, guard_instructions, weight = [], set(), {}, {}
+    frame_guards, frame_notes = {}, {}
+    missing_frames, offset_misses, disconnected_frames, exception_frames = set(), set(), set(), set()
+    analyzed_nodes = {f["node"] for f in w["frames"]} | w["plumbing_nodes"]
+    node_ids = {node: index for index, node in enumerate(sorted(
+        w["sites_by_node"], key=lambda node: _site_order((w["sites_by_node"][node], node[1]))))}
+    for node in node_ids:
+        if node not in analyzed_nodes:
             continue
-        if fr["block_at"](f["offset"]) is None:
-            offset_misses.add(f["node"])
-            print(f"[предупреждение] {key}: unexpected_offset_miss; {f['key']} offset={f['offset']}",
+        ma = w["sites_by_node"][node]
+        frame_key = method_key(ma)
+        fr = frame_of(ma)
+        if fr is None:
+            missing_frames.add(node)
+            continue
+        block = fr["block_at"](node[1])
+        if block is None:
+            offset_misses.add(node)
+            print(f"[предупреждение] {key}: unexpected_offset_miss; {frame_key} offset={node[1]}",
                   file=sys.stderr)
             continue
-        node_real = 0
-        for g in guards_of_frame(fr, f["offset"]):
-            g["frame"] = f["key"]
+        handler_blocks = fr.get("handler_blocks", ())
+        if handler_blocks:
+            frame_notes[node] = ["exception_handlers_unmodeled"]
+        if "normal_blocks" in fr and block not in fr["normal_blocks"]:
+            disconnected_frames.add(node)
+            continue
+        if block in handler_blocks:
+            exception_frames.add(node)
+            continue
+        frame_guards[node] = guards_of_frame(fr, node[1])
+        for g in frame_guards[node]:
+            g["frame"] = frame_key
             # флаги coroutine/framework взаимоисключающи (elif) — одним проходом,
             # чтобы вес кадра для минимума по путям (§7.1) считался по уже
             # очищенным стражам.
@@ -1890,43 +2005,63 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
                 # Package boundaries also include first-party modules and relocated classes.
                 g["notes"] = ["third_party_sdk"]
             g.pop("_block_refs", None)  # служебное, не в выход
-            if _counts_as_guard(g):
-                node_real += 1  # вес кадра — его СОБСТВЕННЫЕ реальные стражи
-            # для guards[]/union guard_count — межкадровый дедуп (одно условие на
-            # нескольких call-site одного метода не задваивается); на вес кадра
-            # (минимум по путям) дедуп НЕ влияет — там каждый узел считает своё.
-            sig = (id(f["ma"]), g["opcode"], g["sense"], g["operand"]["source_kind"],
-                   str(g["operand"]["detail"]))
+            instruction = (node[0], g["branch_block"])
+            guard_instructions.setdefault(instruction, g)
+            sig = (*instruction, g["sense"])
             if sig not in seen:
                 seen.add(sig)
                 all_guards.append(g)
-        weight[f["node"]] = node_real
-    unverified_frames = missing_frames | offset_misses
+        weight[node] = frame_guard_count(frame_guards[node])
+    unverified_frames = missing_frames | offset_misses | disconnected_frames | exception_frames
     rec["inconclusive"] = bool(unverified_frames)
     rec["guards"] = all_guards
     # Ruling-H: union guard_count — ВЕРХНЯЯ оценка (все стражи всех путей);
     # headline-метрика стоимости активации — activation_cost (минимум по путям).
-    rec["guard_count"] = sum(_counts_as_guard(g) for g in all_guards)
-    rec["guard_count_coroutine"] = sum(1 for g in all_guards if "coroutine_state_machine" in g["notes"])
-    rec["guard_count_framework"] = sum(1 for g in all_guards if "framework" in g["notes"])
-    rec["guard_count_third_party_sdk"] = sum("third_party_sdk" in g["notes"] for g in all_guards)
+    unique_guards = guard_instructions.values()
+    rec["guard_count"] = sum(_counts_as_guard(g) for g in unique_guards)
+    rec["guard_count_coroutine"] = sum("coroutine_state_machine" in g["notes"] for g in unique_guards)
+    rec["guard_count_framework"] = sum("framework" in g["notes"] for g in unique_guards)
+    rec["guard_count_third_party_sdk"] = sum("third_party_sdk" in g["notes"] for g in unique_guards)
     # §7.1: минимум реальных стражей по путям UI-вход -> скрытый вызов.
     children = {}
-    for parent, child in w["edges"]:
+    for parent, child in sorted(w["edge_kinds"], key=lambda edge: node_ids[edge[0]]):
         children.setdefault(parent, set()).add(child)
     tops = (w["frontier_nodes"] | w["dead_end_nodes"] | w["capped_nodes"]
             | w["uncertain_callers"] | w["unexamined_dispatch"] | unverified_frames)
     if w["budget_hit"]:
         # An unprocessed initial site may have no guards at all.
         tops.add(SINK)
+    routes = []
     distances = _guard_distances(
         weight, children, SINK, cha_uncertain=w["cha_uncertain"],
-        allocation_uncertain=w["allocation_uncertain"], missing_frames=unverified_frames)
+        allocation_uncertain=w["allocation_uncertain"], missing_frames=unverified_frames, routes=routes)
     cost, exact, complete, modulo = _guard_costs(distances, tops, w["frontier_nodes"])
     for reachable, evidence in zip(distances, ("possible", "modulo_allocation", "resolved")):
         for node, kind in w["entry_nodes"].items():
             if node in reachable:
                 rec["entry_evidence"][kind] = evidence
+    stops = {node: {reason} for node, reason in w["stop_reasons"].items()}
+    for nodes, reason in ((w["capped_nodes"], "depth_cap"), (w["budget_nodes"], "budget_hit"),
+                          (w["dispatch_capped"], "fanin_capped"),
+                          (w["unexamined_dispatch"], "unexamined_dispatch"),
+                          (missing_frames, "missing_frame"), (offset_misses, "unexpected_offset_miss"),
+                          (disconnected_frames, "unreachable_from_method_entry"),
+                          (exception_frames, "exception_flow_unresolved")):
+        for node in nodes:
+            stops.setdefault(node, set()).add(reason)
+    if not stops and not w["entry_nodes"]:
+        for node in children:
+            if SINK in children[node]:
+                stops[node] = {"no_entry_in_graph"}
+    rec["call_graph"] = _call_graph(w, node_ids, frame_guards, stops, frame_notes)
+    for reachable, path, evidence in zip(distances, routes, ("possible", "modulo_allocation", "resolved")):
+        for kind, status in rec["entry_evidence"].items():
+            if status == evidence:
+                candidates = (node for node, entry_kind in w["entry_nodes"].items() if entry_kind == kind)
+                rec["witnesses"][kind] = _path_witness(candidates, reachable, path, node_ids, evidence)
+    partial = _path_witness(stops, distances[0], routes[0], node_ids, "partial")
+    if partial is not None:
+        rec["witnesses"]["partial"] = partial
     rec["activation_cost_modulo_allocation"] = modulo
     rec["activation_exact_modulo_allocation"] = modulo is not None and modulo == cost and not w["budget_hit"]
     if rec["activation_exact_modulo_allocation"] and not exact:
@@ -1937,6 +2072,10 @@ def slice_key(dx, key, *, descriptor=None, include_arguments=True, package=None)
         rec["notes"].append("missing_frame")
     if offset_misses:
         rec["notes"].append("unexpected_offset_miss")
+    if disconnected_frames:
+        rec["notes"].append("unreachable_from_method_entry")
+    if exception_frames:
+        rec["notes"].append("exception_flow_unresolved")
     if cost is None:
         # ни один top (фронтир/dead_end/depth_cap) не дотянулся до скрытого вызова:
         # все пути обрываются на плумбинге — стоимость активации не определена
@@ -1992,7 +2131,7 @@ def _check_slice_key(dx):
     assert rec["cls"].endswith("DownloadsApi") and rec["method"] == "disallowDeviceDownload"
     assert isinstance(rec["guards"], list)
     assert (rec["guard_count"] + rec["guard_count_coroutine"] + rec["guard_count_framework"]
-            == len(rec["guards"]))
+            <= len(rec["guards"]))
     assert set(("reached", "call_sites", "guards", "args", "frontier", "inconclusive",
                 "guard_count_coroutine", "guard_count_framework",
                 "activation_cost", "activation_exact")) <= set(rec)
@@ -2155,6 +2294,8 @@ def report(records, meta=None):
         w(f"{title} — {len(group)}")
         for r in group:
             tag = "HIDDEN" if r["reached"] else "NO-CALLER"
+            if r.get("status") == "observed":
+                tag = "OBSERVED"
             if r.get("analysis_scope") == "unresolved":
                 tag = "UNRESOLVED"
             ac = r.get("activation_cost")
@@ -2171,6 +2312,11 @@ def report(records, meta=None):
             w(f"[{tag}] {name}  {declaration}activation_cost={acs} best_known_complete_cost={best_text}{alloc_text} "
               f"guard_count(union)={r['guard_count']} "
               f"{frontier}notes={r['notes']}{entry_text}")
+            for kind, witness in r.get("witnesses", {}).items():
+                frames = [r["call_graph"]["frames"][i] for i in witness["frames"]]
+                route = " → ".join(f"{f['method']}{f['descriptor']}@{f['offset']}" for f in frames)
+                stop = f" stop={','.join(frames[0]['stops'])}" if kind == "partial" else ""
+                w(f"    {kind} ({witness['evidence']}, стражей {witness['guard_count']}{stop}) {route} → {name}")
             for g in r.get("guards", ()):
                 o = g["operand"]
                 flag = f" [{','.join(g['notes'])}]" if g["notes"] else ""
