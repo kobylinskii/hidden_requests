@@ -37,7 +37,8 @@ class RequestPipelineTests(unittest.TestCase):
         with TemporaryDirectory() as work:
             path = Path(work) / "trace"
             path.write_text('{"t":"meta","build":"sha","session":"id"}\n'
-                            '{"t":"retrofit","cls":"demo.Api","m":"send","descriptor":"(I)V"}\n'
+                            '{"t":"retrofit","cls":"demo.Api","m":"send","descriptor":"(I)V",'
+                            '"handler":"retrofit2.Retrofit$1"}\n'
                             '{"t":')
             trace = read_trace(path, "sha")
         self.assertFalse(trace["complete"])

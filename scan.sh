@@ -16,7 +16,11 @@ DYN=${DYNAMIC_IN:-"$OUT/${PKG}.dynamic.jsonl"}
 HIDDEN="$OUT/${PKG}.hidden.jsonl"
 REPORT="$OUT/${PKG}.bodies.jsonl"
 SLICE="$OUT/${PKG}.request-slice.jsonl"
+REASONS="$OUT/${PKG}.reasons.jsonl"
 ARGS=()
+if [ -n "${REASONS_IN:-}" ]; then
+    ARGS+=(--reasons-in "$REASONS_IN")
+fi
 
 if [ -n "${SLICE_IN:-}" ]; then
     echo "Для отчёта BFScan используйте HIDDEN_IN вместо SLICE_IN." >&2
@@ -40,18 +44,23 @@ else
         APPEND=()
         if [ "${TRACE_APPEND:-0}" = 1 ]; then
             APPEND+=(--append)
-        else
-            : > "$DYN"
         fi
-        if ! "$PY" "$HERE/trace.py" --package "$PKG" --out "$DYN" --device "$DEV" "${APPEND[@]}" >&2; then
-            printf '%s\n' '{"t":"collector_error"}' >> "$DYN"
+        "$PY" "$HERE/trace.py" --package "$PKG" --out "$DYN" --device "$DEV" "${APPEND[@]}" >&2 || {
+            code=$?
+            # trace.py returns 3 only after a new partial session has been closed.
+            if [ "$code" -ne 3 ]; then
+                echo "Сборщик не подтвердил запись нового сеанса. Сканирование прервано." >&2
+                exit "$code"
+            fi
             echo "Трасса завершена с неполными данными; причины указаны выше и в записи end" >&2
-        fi
+        }
     fi
     ARGS+=(--catalog "$STATIC" --trace "$DYN")
 fi
 
 "$PY" "$HERE/request_pipeline.py" --apk "$APK" --comparison "$HIDDEN" \
-    --out "$REPORT" --request-slice "$SLICE" "${ARGS[@]}"
+    --out "$REPORT" --request-slice "$SLICE" --reasons "$REASONS" "${ARGS[@]}"
 echo "JSON-отчёт: $REPORT" >&2
 echo "Обратные срезы: $SLICE" >&2
+echo "Стражи: $REASONS" >&2
+echo "Сводка по стражам: ${REASONS%.jsonl}.report.txt" >&2

@@ -1,7 +1,8 @@
 """DEX binding and bounded data slicing for statically declared HTTP bodies."""
 
+from collections import Counter
 from functools import lru_cache
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from slice import _param_types, _reg
 
@@ -100,10 +101,14 @@ def bind_declaration(dx, row):
     cls = "L" + row["cls"].replace(".", "/") + ";"
     routes = annotated_routes(dx, cls, row["method"])
     path = normalized_route(row["path"])[0]
-    matches = [r for r in routes if r["verb"] == row["verb"]
-               and normalized_route(r["target"])[0] == path
-               and (not normalized_route(r["target"])[1]
-                    or normalized_route(r["target"])[1] == row["query"])]
+    example = Counter(parse_qsl(row["query"], keep_blank_values=True))
+    matches = []
+    for route in routes:
+        route_path, fixed_query = normalized_route(route["target"])
+        if route["verb"] == row["verb"] and route_path == path:
+            fixed = Counter(parse_qsl(fixed_query, keep_blank_values=True))
+            if fixed <= example:
+                matches.append(route)
     if len(matches) != 1:
         return {**row, "descriptor": None,
                 "descriptor_candidates": sorted({r["method"].get_method().get_descriptor().replace(" ", "")

@@ -53,6 +53,17 @@ def trace_body(dx, method, offset, register):
     visited = {}
     limit_hit = False
 
+    def invoke_registers(ins, *, include_receiver):
+        target, *words = ins.args
+        if not ins.op.startswith("invoke-static"):
+            if include_receiver:
+                yield from words[:1]
+            words = words[1:]
+        if target and "(" in target:
+            yield from arguments(words, _param_types(target))
+        else:
+            yield from words
+
     def visit(ma, block, pos, reg):
         nonlocal limit_hit
         key = (ma, block, pos, reg)
@@ -73,6 +84,9 @@ def trace_body(dx, method, offset, register):
         return idx
 
     def inspect(node, ma, block, pos, reg):
+        if reg is None:
+            node.update(kind="unknown", reason="unresolved_register")
+            return
         cfg, params, offsets, _ = layout(ma)
         definition, reason, merge = _def_insn(cfg, block, pos, reg)
         if definition is None:
@@ -108,12 +122,12 @@ def trace_body(dx, method, offset, register):
             node.update(
                 kind="producer",
                 target=inv.args[0],
-                inputs=[visit(ma, b, i - 1, r) for r in inv.args[1:]],
+                inputs=[visit(ma, b, i - 1, r) for r in invoke_registers(inv, include_receiver=True)],
             )
             # A static, zero-argument body factory has no caller bindings.
             # Walk each return separately so a JSON and a binary branch survive.
             target = inv.args[0]
-            if inv.op.startswith("invoke-static") and target.endswith(
+            if inv.op.startswith("invoke-static") and target and target.endswith(
                 "()Lokhttp3/RequestBody;"
             ):
                 owner = target.partition("->")[0]
@@ -299,7 +313,8 @@ def trace_body(dx, method, offset, register):
                                 "target": use.args[0],
                                 "offset": at,
                                 "inputs": [
-                                    visit(ma, segment, p, r) for r in use.args[2:]
+                                    visit(ma, segment, p, r)
+                                    for r in invoke_registers(use, include_receiver=False)
                                 ],
                             }
                         )

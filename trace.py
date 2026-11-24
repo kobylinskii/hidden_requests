@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Запускает приложение под Frida с hook.js и пишет NDJSON реально выполненных
-сетевых вызовов. Работает до Ctrl-C — всё это время исследуйте приложение
+Запускает приложение под Frida с hook.js и пишет NDJSON наблюдений за методами
+Retrofit и HTTP-клиентом. Работает до Ctrl-C — всё это время исследуйте приложение
 руками или GUI-роботом.
 
 Если приложение падает или его убивает система, сессия перезапускается сама и
@@ -32,6 +32,7 @@ from pathlib import Path
 import frida
 
 HERE = Path(__file__).resolve().parent
+PARTIAL_SESSION_EXIT = 3  # scan.sh may consume the newly finalized partial session.
 
 
 def apk_version(package, serial):
@@ -135,11 +136,14 @@ def main():
     session_id = uuid4().hex
     meta = {"t": "meta", "package": args.package, "build": build, "session": session_id,
             "installed_apks": installed_apks, **apk_version(args.package, device.id)}
-    if args.append and out.exists() and out.stat().st_size:
+    appending = args.append and out.exists() and out.stat().st_size > 0
+    if appending:
         from request_pipeline import read_trace
         if not build or not read_trace(out, build)["complete"]:
             ap.error("к существующей трассе можно дописать только сеанс той же подтверждённой сборки")
     fh = out.open("a" if args.append else "w", encoding="utf-8", buffering=1)
+    if appending:
+        fh.write("\n")  # An existing valid end record may lack its final newline.
     fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
     issues = set()
     if build is None:
@@ -180,7 +184,9 @@ def main():
         # diff.py работает множествами и на них не реагирует.
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
         fh.flush()
-        if kind == "retrofit":
+        if (kind == "retrofit" and isinstance(payload.get("handler"), str)
+                and payload["handler"].startswith("retrofit2.Retrofit$")
+                and payload.get("observation", "method_call") == "method_call"):
             key = f"{payload['cls']}->{payload['m']}"
             if key not in seen["retrofit"]:
                 seen["retrofit"].add(key)
@@ -240,7 +246,7 @@ def main():
                 if state["restarts"] >= args.max_restarts:
                     print(f"[!] предел перезапусков ({args.max_restarts}) исчерпан, "
                           f"заканчиваю", file=sys.stderr)
-                    raise SystemExit("сессия прервана")
+                    break
                 state["restarts"] += 1
                 time.sleep(2)          # дать системе прибрать процесс
                 try:
@@ -252,6 +258,9 @@ def main():
                     state["restart"] = True
                     time.sleep(3)
             time.sleep(0.3)
+    except Exception as error:
+        issues.add("collection_failed")
+        print(f"[!] Ошибка сбора: {error}", file=sys.stderr)
     finally:
         stats = {}
         try:
@@ -293,7 +302,7 @@ def main():
 
     if issues:
         print("Причины частичной трассы: " + ", ".join(sorted(issues)), file=sys.stderr)
-        sys.exit("Частичная трасса сохранена для диагностики")
+        sys.exit(PARTIAL_SESSION_EXIT)
 
 
 if __name__ == "__main__":

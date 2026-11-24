@@ -11,6 +11,7 @@ import argparse
 import json
 import re
 import sys
+from bisect import bisect_right
 from collections import Counter, deque, namedtuple
 from functools import lru_cache
 from pathlib import Path
@@ -68,42 +69,37 @@ def post_idom(cfg, exit_node):
     Узлы, не достигающие exit (бесконечные циклы), сначала соединяются с ним —
     иначе immediate_dominators их не покроет. ponytail: fallback-ребро, не полный
     разбор неприводимых циклов."""
-    g = cfg.copy()
-    reach = nx.ancestors(g, exit_node) | {exit_node}
-    for n in list(g.nodes):
-        if n not in reach:
-            g.add_edge(n, exit_node)
-    return nx.immediate_dominators(g.reverse(copy=True), exit_node)
+    g = cfg
+    reach = nx.ancestors(cfg, exit_node) | {exit_node}
+    if len(reach) != len(cfg):
+        g = cfg.copy()
+        g.add_edges_from((n, exit_node) for n in cfg if n not in reach)
+    return nx.immediate_dominators(g.reverse(copy=False), exit_node)
 
 
-def control_deps(cfg, criterion, exit_node):
-    """Транзитивный набор (ветвление, ведущий-преемник), от которых criterion
-    управляемо зависим (Ferrante-Ottenstein-Warren, замкнуто транзитивно)."""
+def _direct_control_deps(cfg, exit_node):
+    """Index direct dependencies once for all call sites in the method."""
     ipdom = post_idom(cfg, exit_node)
+    direct = {}
+    for a in cfg:
+        if cfg.out_degree(a) < 2:
+            continue
+        for b in cfg.successors(a):
+            n = b
+            while n != ipdom[a] and n != exit_node:
+                direct.setdefault(n, []).append((a, b))
+                n = ipdom[n]
+    return direct
 
-    def direct(node):
-        out = []
-        for a in cfg.nodes:
-            succ = list(cfg.successors(a))
-            if len(succ) < 2:
-                continue
-            stop = ipdom.get(a)
-            for b in succ:
-                n, seen = b, []
-                while n is not None and n != stop:
-                    seen.append(n)
-                    n = ipdom.get(n)
-                if node in seen:
-                    out.append((a, b))
-        return out
 
+def _control_closure(direct, criterion):
     # result — set из (branch, taken), не dict по branch: узел может быть
     # зависим сразу от НЕСКОЛЬКИХ рёбер одного switch/when-ветвления (3+
     # successors) — это разные прямые зависимости, а не альтернативы друг друга.
     result, work, seen_branches = set(), [criterion], set()
     while work:
         cur = work.pop()
-        for a, b in direct(cur):
+        for a, b in direct.get(cur, ()):
             result.add((a, b))
             if a not in seen_branches:
                 seen_branches.add(a)
@@ -111,53 +107,49 @@ def control_deps(cfg, criterion, exit_node):
     return list(result)
 
 
-def min_path_guards(weight, children, tops, frontier, sink):
-    """Минимум реальных стражей на пути UI-вход -> скрытый вызов (открытый
-    вопрос §7.1: стоимость активации = минимум по путям, а не объединение).
+def control_deps(cfg, criterion, exit_node):
+    """Transitive control dependencies for a CFG with an explicit exit."""
+    return _control_closure(_direct_control_deps(cfg, exit_node), criterion)
 
-    weight:   node_id -> число реальных (не-флагованных) стражей кадра; у плумбинга 0.
-    children: node_id -> множество node_id, которые кадр вызывает ВНИЗ к sink
-              (у call-site'ов среди children есть sink; у sink детей нет).
-    tops:     node_id максимальных кадров обхода (фронтир | dead_end | depth_cap).
-    frontier: подмножество tops — настоящие UI/lifecycle/exported-входы.
-    sink:     синтетический узел скрытого вызова, weight[sink] = 0.
 
-    dist(n) = weight(n) + min(dist(c) for c in children(n)); dist(sink)=0.
-    Веса неотрицательны -> задача шортест-пат: Дейкстра от sink по обратным
-    рёбрам (итеративно, без рекурсии — граф кадров с CHA бывает глубже лимита
-    стека Python; циклы Дейкстра обрабатывает естественно, не удешевляя путь).
+def min_path_guards(weight, children, tops, frontier, sink, *, uncertain_callers=(), missing_frames=()):
+    """Return (modeled lower bound, exact, best verified complete-path cost).
 
-    Возвращает (cost, exact):
-      cost  — минимум по frontier-входам, дотянувшимся до sink; если таких нет —
-              нижняя оценка по всем tops (путь оборван, выше могли быть ещё
-              стражи); None, если ни один top не достигает sink.
-      exact — True, если cost достигнут настоящим UI-входом И ни один оборванный
-              top не дешевле (т.е. истинная стоимость не может быть ниже)."""
+    A stopped suffix can omit nonnegative weights upstream. A complete path
+    additionally requires a recognized callback, resolved frames and direct
+    caller edges all the way to the sink.
+    """
     import heapq
-    INF = float("inf")
-    parents = {}  # обратные рёбра: child -> множество его родителей (вызывающих)
-    for p, cs in children.items():
-        for c in cs:
-            parents.setdefault(c, set()).add(p)
-    dist = {sink: 0}
-    pq, cnt = [(0, 0, sink)], 1  # cnt — тай-брейк, чтобы heap не сравнивал узлы
-    while pq:
-        d, _, n = heapq.heappop(pq)
-        if d > dist.get(n, INF):
-            continue
-        for p in parents.get(n, ()):
-            nd = weight.get(p, 0) + d
-            if nd < dist.get(p, INF):
-                dist[p] = nd
-                heapq.heappush(pq, (nd, cnt, p)); cnt += 1
 
-    fcost = min((dist.get(f, INF) for f in frontier), default=INF)
-    tcost = min((dist.get(t, INF) for t in tops), default=INF)
-    if fcost == INF:
-        return (None if tcost == INF else tcost), False
-    # fcost конечен: истинная стоимость через UI = fcost. exact, только если ни
-    # один оборванный top не дешевле (иначе настоящий путь может быть короче).
-    return fcost, (fcost <= tcost)
+    parents = {}
+    for parent, targets in children.items():
+        for target in targets:
+            parents.setdefault(target, []).append(parent)
+
+    def distances(verified):
+        dist = {sink: 0}
+        queue = [(0, 0, sink)]
+        order = 0
+        while queue:
+            cost, _, node = heapq.heappop(queue)
+            if cost != dist[node] or (verified and node in uncertain_callers):
+                continue
+            for parent in parents.get(node, ()):
+                if verified and parent in missing_frames:
+                    continue
+                candidate = cost + weight.get(parent, 0)
+                if candidate < dist.get(parent, float("inf")):
+                    dist[parent] = candidate
+                    order += 1
+                    heapq.heappush(queue, (candidate, order, parent))
+        return dist
+
+    optimistic = distances(False)
+    lower = min((optimistic[n] for n in tops if n in optimistic), default=None)
+    verified = distances(True) if uncertain_callers or missing_frames else optimistic
+    complete = min((verified[n] for n in frontier if n in verified), default=None)
+    exact = complete is not None and complete == lower
+    return lower, exact, complete
 
 
 def _check_cha():
@@ -170,6 +162,10 @@ def _check_cha():
             self._callers = callers
         def get_xref_from(self):
             return [(None, cma, off) for cma, off in self._callers]
+        def get_method(self):
+            return None
+        def get_access_flags_string(self):
+            return "public"
     class FCA:
         def __init__(self, ext, impl, methods, external=False):
             self.extends, self.implements, self._m, self._ext = ext, impl, methods, external
@@ -179,17 +175,44 @@ def _check_cha():
     i_m = FMA("m", "()V", "LI;", callers=[(caller, 10)])      # вызывающий висит на I.m()
     c_m = FMA("m", "()V", "LC;")                               # у реализации прямого xref нет
     dx = type("DX", (), {})()
-    dx.classes = {"LI;": FCA(None, [], [i_m], external=False),
+    dx.classes = {"LA;": FCA("Landroid/app/Service;", [], [caller]),
+                  "LI;": FCA(None, [], [i_m], external=False),
                   "LB;": FCA("Ljava/lang/Object;", [], []),
                   "LC;": FCA("LB;", ["LI;"], [c_m])}
+    def find_method(owner, name, desc):
+        ca = dx.classes.get(owner)
+        return next((m for m in ca.get_methods() if (m.name, m.descriptor) == (name, desc)), None) if ca else None
+    dx.get_method_analysis_by_name = find_method
     _cha_supers.cache_clear()
     assert set(_cha_supers(dx, "LC;")) == {"LB;", "LI;"}, _cha_supers(dx, "LC;")
-    sites, used = cha_caller_sites(dx, c_m)
+    sites, used, reason = cha_caller_sites(dx, c_m)
+    assert reason is None
     assert used and (caller, 10) in sites, (sites, used)
     # у метода с прямым xref и без супертипов CHA ничего не добавляет
     _cha_supers.cache_clear()
-    sites2, used2 = cha_caller_sites(dx, i_m)
+    sites2, used2, reason = cha_caller_sites(dx, i_m)
+    assert reason is None
     assert used2 is False and (caller, 10) in sites2, (sites2, used2)
+    i_m._callers = [(caller, off) for off in range(_CHA_FANIN_CAP + 1)]
+    assert cha_caller_sites(dx, c_m) == ([], False, "fanin_capped")
+
+    hidden = FMA("post", "()V", "LApi;", callers=[(c_m, 4)])
+    dx.classes["LApi;"] = FCA(None, [], [hidden])
+    walk = backward_frames(dx, "Api", "post")
+    assert walk["dead_end_nodes"] == {(id(c_m), 4)}
+    assert walk["stop_reasons"] == {(id(c_m), 4): "fanin_capped"}
+    leaf = FMA("save", "()V", "LB;")
+    hidden._callers = [(c_m, 4), (leaf, 2)]
+    notes = slice_key(dx, "Api->post")["notes"]
+    assert {"dead_end", "dead_end:fanin_capped", "dead_end:no_callers"} <= set(notes)
+    hidden._callers = [(c_m, 4)]
+    i_m._callers = []
+    assert cha_caller_sites(dx, c_m) == ([], False, "no_callers")
+    c_m.name = "invoke"
+    dx.classes["LC;"].get_xref_new_instance = lambda: [(caller, 8)]
+    walk = backward_frames(dx, "Api", "post")
+    assert walk["frontier_nodes"] == {(id(caller), 8)}
+    assert not walk["dead_ends"] and not walk["stop_reasons"]
     print("  cha ok")
 
 
@@ -199,26 +222,22 @@ def _check_min_path():
     # дешёвый путь E-B-C-H = 0+0+1 = 1 страж.
     weight = {"E": 0, "A": 2, "B": 0, "C": 1, sink: 0}
     children = {"E": {"A", "B"}, "A": {"C"}, "B": {"C"}, "C": {sink}}
-    cost, exact = min_path_guards(weight, children, {"E"}, {"E"}, sink)
-    assert (cost, exact) == (1, True), (cost, exact)
+    assert min_path_guards(weight, children, {"E"}, {"E"}, sink) == (1, True, 1)
 
     # оборванный путь дешевле фронтира: frontier F (1 страж) -> C(1) -> H,
     # dead_end D (0) -> C(1) -> H. Настоящий UI-путь = 2, но через D может быть 1
-    # -> cost=2, exact=False (истинная стоимость может быть ниже).
+    # -> нижняя граница 1, лучший завершённый путь 2.
     weight = {"F": 1, "D": 0, "C": 1, sink: 0}
     children = {"F": {"C"}, "D": {"C"}, "C": {sink}}
-    cost, exact = min_path_guards(weight, children, {"F", "D"}, {"F"}, sink)
-    assert (cost, exact) == (2, False), (cost, exact)
+    assert min_path_guards(weight, children, {"F", "D"}, {"F"}, sink) == (1, False, 2)
 
     # ни один фронтир не дотянулся: только dead_end D(2)->C(1)->H -> нижняя оценка 3
-    cost, exact = min_path_guards({"D": 2, "C": 1, sink: 0},
-                                  {"D": {"C"}, "C": {sink}}, {"D"}, set(), sink)
-    assert (cost, exact) == (3, False), (cost, exact)
+    assert min_path_guards({"D": 2, "C": 1, sink: 0},
+                           {"D": {"C"}, "C": {sink}}, {"D"}, set(), sink) == (3, False, None)
 
     # цикл в графе вызовов не зацикливает и не удешевляет: A<->B, A->H, оба по 1
-    cost, exact = min_path_guards({"A": 1, "B": 1, sink: 0},
-                                  {"A": {"B", sink}, "B": {"A"}}, {"B"}, {"B"}, sink)
-    assert (cost, exact) == (2, True), (cost, exact)  # B->A->H = 1+1
+    assert min_path_guards({"A": 1, "B": 1, sink: 0},
+                           {"A": {"B", sink}, "B": {"A"}}, {"B"}, {"B"}, sink) == (2, True, 2)
     print("  min_path ok")
 
 
@@ -420,18 +439,22 @@ def method_key(ma):
     return f"{_fqcn(ma.class_name)}->{ma.name}"
 
 
-def resolve_call_sites(dx, cls, method):
+def _declarations(dx, cls, method, descriptor):
+    ca = dx.classes.get("L" + cls.replace(".", "/") + ";")
+    wanted = descriptor.replace(" ", "") if descriptor is not None else None
+    return [ma for ma in (ca.get_methods() if ca else ()) if ma.name == method
+            and (wanted is None or ma.descriptor.replace(" ", "") == wanted)]
+
+
+def resolve_call_sites(dx, cls, method, descriptor=None):
     """Все вызовы cls->method по XREF. Внешние методы не отсеиваются — метод
     может быть интерфейсным объявлением (у него самого нет кода, но есть
     xref_from от вызывающих через invoke-interface). Пусто, если метод не
     найден или XREF пуст (не ошибка)."""
     # Прямой lookup по dx.classes, не dx.find_methods: тот гоняет regex по ВСЕМ
     # классам APK на каждый вызов, а обход зовёт резолв на каждый кадр.
-    ca = dx.classes.get("L" + cls.replace(".", "/") + ";")
     sites = []
-    for ma in (ca.get_methods() if ca else ()):
-        if ma.name != method:
-            continue
+    for ma in _declarations(dx, cls, method, descriptor):
         for xf in ma.get_xref_from():
             caller_ma, off = xf[1], xf[-1]
             sites.append({"caller": method_key(caller_ma),
@@ -452,22 +475,24 @@ _FRAME_BUDGET = 4000     # потолок кадров на ключ: гаран
 _DEPTH_LIMIT = 6
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=4096)
 def _cha_supers(dx, class_desc):
     """Транзитивные супертипы класса (extends + implements), существующие в APK
     (внешние/Object отбрасываются). Кэш — обход зовёт на каждый кадр, иерархия
     у класса фиксирована."""
-    ca = dx.classes.get(class_desc)
-    if ca is None or ca.is_external():
-        return ()
+    pending = [class_desc]
+    seen = {class_desc, "Ljava/lang/Object;"}
     out = []
-    supers = ([ca.extends] if ca.extends else []) + list(ca.implements)
-    for s in supers:
-        if not s or s == "Ljava/lang/Object;":
+    while pending:
+        ca = dx.classes.get(pending.pop())
+        if ca is None or ca.is_external():
             continue
-        out.append(s)
-        out.extend(_cha_supers(dx, s))
-    return tuple(dict.fromkeys(out))  # дедуп, порядок сохранён
+        for s in (ca.extends, *ca.implements):
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+                pending.append(s)
+    return tuple(out)
 
 
 def cha_caller_sites(dx, ma):
@@ -493,27 +518,34 @@ def cha_caller_sites(dx, ma):
     (over-approximation на сотни мест) и взрывоопасен (каскадный fan-in не
     завершается) — кадр остаётся тупиком (честная нижняя оценка activation_cost).
 
-    Возвращает (sites, used_cha): sites — список (caller_ma, offset);
-    used_cha=True, если вызывающие найдены по CHA (прямой xref был пуст)."""
+    Возвращает (sites, used_cha, stop_reason): sites — список (caller_ma, offset);
+    used_cha=True, если вызывающие найдены по CHA (прямой xref был пуст).
+
+    При наличии прямых вызовов unexamined_dispatch отмечает дополнительные
+    места вызова супертипа: они могут удешевить путь. Для пустого результата
+    no_callers означает отсутствие xref по проверенным объявлениям, а
+    fanin_capped отмечает срабатывание предела §7.2. Последующий переход
+    к месту создания корутины может продолжить путь в обоих случаях."""
     direct = [(xf[1], xf[-1]) for xf in ma.get_xref_from()]
-    if direct:
-        return direct, False
     name, desc = ma.name, ma.descriptor
-    seen, sites = set(), []
+    seen, sites = set(direct), []
     for sdesc in _cha_supers(dx, ma.class_name):
-        sca = dx.classes.get(sdesc)
-        if sca is None:
+        sm = dx.get_method_analysis_by_name(sdesc, name, desc)
+        if sm is None:
             continue
-        for sm in sca.get_methods():
-            if sm.name == name and sm.descriptor == desc:
-                for xf in sm.get_xref_from():
-                    cma, off = xf[1], xf[-1]
-                    if (cma, off) not in seen:
-                        seen.add((cma, off))
-                        sites.append((cma, off))
-                        if len(sites) > _CHA_FANIN_CAP:
-                            return [], False  # общий интерфейс — не граница, тупик
-    return sites, bool(sites)
+        for xf in sm.get_xref_from():
+            cma, off = xf[1], xf[-1]
+            if (cma, off) in seen:
+                continue
+            if direct:
+                return direct, False, "unexamined_dispatch"
+            seen.add((cma, off))
+            sites.append((cma, off))
+            if len(sites) > _CHA_FANIN_CAP:
+                return [], False, "fanin_capped"
+    if direct:
+        return direct, False, None
+    return (sites, True, None) if sites else ([], False, "no_callers")
 
 
 def _reg(operand):
@@ -637,6 +669,7 @@ def _params(m):
     return result
 
 
+@lru_cache(maxsize=128)
 def frame_of(ma):
     """MethodAnalysis -> {cfg, params, block_at}. None, если у метода нет
     кода (интерфейс/внешний объявление — ExternalMethod без get_code вовсе,
@@ -661,11 +694,13 @@ def frame_of(ma):
             kind = "fallthrough" if tbb.get_start() == end else "branch"
             cfg.add_edge(bb.get_name(), tbb.get_name(), kind=kind)
     params = _params(m)
+    blocks = sorted(cfg.nodes, key=lambda n: cfg.nodes[n]["start"])
+    starts = [cfg.nodes[n]["start"] for n in blocks]
 
     def block_at(off):
-        for n in cfg.nodes:
-            if cfg.nodes[n]["start"] <= off < cfg.nodes[n]["end"]:
-                return n
+        idx = bisect_right(starts, off) - 1
+        if idx >= 0 and off < cfg.nodes[blocks[idx]]["end"]:
+            return blocks[idx]
         return None
 
     return {"cfg": cfg, "params": params, "block_at": block_at}
@@ -701,9 +736,29 @@ def _check_androguard(dx):
     print("  backward_frames ok")
 
 
-_FRONTIER_NAMES = {"onCreate", "onStart", "onResume", "onPause", "onStop",
-                   "onViewCreated", "onCreateView", "onClick", "onBind",
-                   "onReceive", "onHandleWork", "doWork", "onStartCommand"}
+_ACTIVITY = "Landroid/app/Activity;"
+_FRAGMENTS = ("Landroid/app/Fragment;", "Landroidx/fragment/app/Fragment;")
+_SERVICE = "Landroid/app/Service;"
+_LIFECYCLE_OWNERS = (_ACTIVITY, *_FRAGMENTS)
+_CALLBACK_OWNERS = {
+    ("onCreate", "(Landroid/os/Bundle;)V"): _LIFECYCLE_OWNERS,
+    ("onStart", "()V"): _LIFECYCLE_OWNERS,
+    ("onResume", "()V"): _LIFECYCLE_OWNERS,
+    ("onPause", "()V"): _LIFECYCLE_OWNERS,
+    ("onStop", "()V"): _LIFECYCLE_OWNERS,
+    ("onViewCreated", "(Landroid/view/View;Landroid/os/Bundle;)V"): _FRAGMENTS,
+    ("onCreateView", "(Landroid/view/LayoutInflater;Landroid/view/ViewGroup;"
+                     "Landroid/os/Bundle;)Landroid/view/View;"): _FRAGMENTS,
+    ("onClick", "(Landroid/view/View;)V"): ("Landroid/view/View$OnClickListener;",),
+    ("onCreate", "()V"): (_SERVICE, "Landroid/app/Application;"),
+    ("onCreate", "()Z"): ("Landroid/content/ContentProvider;",),
+    ("onBind", "(Landroid/content/Intent;)Landroid/os/IBinder;"): (_SERVICE,),
+    ("onStartCommand", "(Landroid/content/Intent;II)I"): (_SERVICE,),
+    ("onReceive", "(Landroid/content/Context;Landroid/content/Intent;)V"):
+        ("Landroid/content/BroadcastReceiver;",),
+    ("onHandleWork", "(Landroid/content/Intent;)V"): ("Landroidx/core/app/JobIntentService;",),
+    ("doWork", "()Landroidx/work/ListenableWorker$Result;"): ("Landroidx/work/Worker;",),
+}
 
 
 def is_plumbing(key, ma):
@@ -745,26 +800,20 @@ def is_plumbing(key, ma):
     return False
 
 
-def is_frontier(key, exported=()):
-    """UI/lifecycle/entry-колбэк — точка, где обратный обход останавливается
-    (дальше вверх — фреймворк, не наш код): имя метода из известного набора
-    колбэков жизненного цикла/UI, класс из android./androidx. (сам фреймворк
-    вызывает наш метод, выше в стеке ничего нашего нет), либо класс —
-    exported-компонент манифеста (§7.2: альтернативная точка входа — deep link,
-    виджет, вызов из другого приложения; выше по стеку наш код не идёт)."""
-    cls, _, name = key.partition("->")
-    if name in _FRONTIER_NAMES:
-        return True
-    if cls.startswith("android.") or cls.startswith("androidx."):
-        return True
-    return cls in exported
+def is_frontier(dx, ma):
+    """Recognize a framework callback from its declaration and DEX hierarchy."""
+    owners = _CALLBACK_OWNERS.get((ma.name, ma.descriptor.replace(" ", "")))
+    if not owners:
+        return False
+    flags = set(ma.get_access_flags_string().split())
+    if not flags.intersection({"public", "protected"}) or flags.intersection({"static", "abstract", "private"}):
+        return False
+    hierarchy = (ma.class_name, *_cha_supers(dx, ma.class_name))
+    return any(owner in hierarchy for owner in owners)
 
 
 def manifest_entry_classes(apk):
-    """FQCN exported-компонентов манифеста (activity/service/receiver/provider):
-    android:exported="true" ЛИБО есть intent-filter при отсутствии exported
-    (неявный exported до API 31). Это альтернативные точки входа (§7.2) —
-    фронтир обратного обхода наравне с UI-колбэками."""
+    """Collect component names from manifest export declarations and intent filters."""
     ns = "{http://schemas.android.com/apk/res/android}"
     out = set()
     try:
@@ -785,9 +834,9 @@ def manifest_entry_classes(apk):
 SINK = ("__sink__",)  # синтетический узел скрытого вызова в графе кадров (§7.1)
 
 
-def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, exported=()):
+def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, *, descriptor=None):
     """Обратный межпроцедурный обход от call-site'ов cls->method вверх по
-    графу вызовов до фронтира (UI/lifecycle/exported) или лимита глубины.
+    графу вызовов до известного UI/lifecycle-колбэка или лимита глубины.
     Плумбинг (is_plumbing) проходится насквозь — не попадает в frames и не
     тратит бюджет глубины (вверх от него идём с ТЕМ ЖЕ depth), но обход через
     его вызывающих продолжается. Циклы (рекурсия, coroutine resume через себя
@@ -805,18 +854,24 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, exported=()):
     fan-in терялся бы. frontier_nodes / dead_end_nodes / capped_nodes —
     максимальные кадры (входы обхода); plumbing_nodes — узлы-плумбинг
     (вес 0 в минимуме по путям)."""
-    sites = resolve_call_sites(dx, cls, method)
+    sites = resolve_call_sites(dx, cls, method, descriptor)
     if not sites:
         return {"reached": False, "call_sites": [], "frames": [],
                 "frontier": None, "depth": 0, "plumbing_skipped": [],
                 "depth_capped": False, "dead_ends": [], "edges": [], "cha_used": False,
-                "budget_hit": False, "frontier_nodes": set(), "dead_end_nodes": set(),
-                "capped_nodes": set(), "plumbing_nodes": set()}
+                "budget_hit": False, "uncertain_callers": set(), "unexamined_dispatch": set(),
+                "allocation_used": False,
+                "frontier_nodes": set(), "dead_end_nodes": set(),
+                "capped_nodes": set(), "plumbing_nodes": set(), "stop_reasons": {}}
+    stop_reasons = {}
     frames, skipped, frontier, dead_ends = [], [], None, []
     edges = []
     frontier_nodes, dead_end_nodes, capped_nodes, plumbing_nodes = set(), set(), set(), set()
     visited = set()
     cha_used = False
+    uncertain_callers = set()
+    unexamined_dispatch = set()
+    allocation_used = False
     budget_hit = False
     max_depth = 0
     depth_capped = False  # True, если ХОТЬ ОДИН путь упёрся в limit (OR по путям)
@@ -849,7 +904,7 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, exported=()):
         else:
             frames.append({"key": ckey, "ma": caller_ma, "node": node, "offset": off})
             max_depth = max(max_depth, depth + 1)
-            if is_frontier(ckey, exported):
+            if is_frontier(dx, caller_ma):
                 frontier = ckey
                 frontier_nodes.add(node)
                 continue  # путь дошёл до фронтира — выше по нему не поднимаемся
@@ -859,8 +914,12 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, exported=()):
                 capped_nodes.add(node)
                 continue  # этот путь упёрся в лимит глубины
         # шаг вверх: кто вызывает именно этот метод (с CHA — §7.2)
-        ups, used = cha_caller_sites(dx, caller_ma)
+        ups, used, reason = cha_caller_sites(dx, caller_ma)
         cha_used = cha_used or used
+        if used:
+            uncertain_callers.add(node)
+        elif reason == "unexamined_dispatch":
+            unexamined_dispatch.add(node)
         if not ups and caller_ma.name in _COROUTINE_FRAME_METHODS:
             # invoke/invokeSuspend/create лямбды зовёт рантайм через интерфейс
             # (Function*/Continuation) — XREF пуст. Точка активации лямбды — место
@@ -871,10 +930,13 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, exported=()):
             # апгрейд: проверять суперкласс и id слитой лямбды.
             ca = dx.classes.get(caller_ma.class_name)
             ups = list(ca.get_xref_new_instance()) if ca else []
+            if ups:
+                uncertain_callers.add(node)
+                allocation_used = True
         if not ups:
+            stop_reasons[node] = reason
             dead_ends.append(ckey)  # путь оборван не на фронтире: стражи выше не видны
-            if not plumbing:
-                dead_end_nodes.add(node)
+            dead_end_nodes.add(node)
         push = queue.appendleft if plumbing else queue.append  # плумбинг: та же глубина
         for ma, o in ups:
             push((node, ma, o, depth))  # node — потомок (вниз к скрытому вызову) для вызывающего
@@ -882,9 +944,11 @@ def backward_frames(dx, cls, method, limit=_DEPTH_LIMIT, exported=()):
             "frontier": frontier, "depth": max_depth,
             "plumbing_skipped": skipped, "depth_capped": depth_capped,
             "dead_ends": dead_ends, "edges": edges, "cha_used": cha_used,
+            "uncertain_callers": uncertain_callers, "unexamined_dispatch": unexamined_dispatch,
+            "allocation_used": allocation_used,
             "budget_hit": budget_hit,
             "frontier_nodes": frontier_nodes, "dead_end_nodes": dead_end_nodes,
-            "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes}
+            "capped_nodes": capped_nodes, "plumbing_nodes": plumbing_nodes, "stop_reasons": stop_reasons}
 
 
 def _check_walk_predicates():
@@ -899,9 +963,6 @@ def _check_walk_predicates():
     assert not is_plumbing("a.b.C$Factory->create", FakeMA("La/b/C$Factory;"))
     # синтетический лямбда-класс (последний $-сегмент — цифры) — плумбинг.
     assert is_plumbing("a.b.C$run$1->invoke", FakeMA("La/b/C$run$1;"))
-    assert is_frontier("androidx.fragment.app.Fragment->onViewCreated")
-    assert is_frontier("a.b.MyActivity->onCreate")
-    assert not is_frontier("a.b.SomeRepository->refresh")
     print("  walk_predicates ok")
 
 
@@ -920,15 +981,14 @@ def guards_of_frame(fr, criterion_offset):
     crit = fr["block_at"](criterion_offset)
     if crit is None:
         return []
-    exit_node = "__exit__"
-    g = cfg.copy()
-    terminals = [n for n in cfg.nodes if cfg.out_degree(n) == 0]
-    for n in terminals:
-        g.add_edge(n, exit_node)
-    if not terminals:  # ни одного терминала (см. post_idom) — синтетический fallback
-        g.add_edge(list(cfg.nodes)[-1], exit_node)
+    if "control_deps" not in fr:
+        exit_node = "__exit__"
+        g = cfg.copy()
+        g.add_node(exit_node)
+        g.add_edges_from((n, exit_node) for n in cfg if cfg.out_degree(n) == 0)
+        fr["control_deps"] = _direct_control_deps(g, exit_node)
     guards = []
-    for (branch, taken) in control_deps(g, crit, exit_node):
+    for (branch, taken) in _control_closure(fr["control_deps"], crit):
         insns = cfg.nodes[branch]["insns"]
         cond = next((i for i in reversed(insns)
                      if i.op.startswith("if") or i.op.endswith("-switch")), None)
@@ -1273,7 +1333,7 @@ def _is_coroutine_state_guard(guard):
     return _fqcn(owner_desc) == frame_cls
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=4096)
 def _is_continuation_class(dx, desc):
     """Класс-континуация suspend-функции: есть invokeSuspend (переопределение
     BaseContinuationImpl — имя переживает R8, в отличие от имени класса)."""
@@ -1413,20 +1473,21 @@ def _arg_recipes(dx, arg_types, depth=2):
     return recipes
 
 
-def slice_key(dx, key):
+def slice_key(dx, key, *, descriptor=None, include_arguments=True):
     """Полная запись среза для одного ключа (схема спеки §4): обход вверх
     (Task 4) до фронтира/лимита, на каждом семантическом кадре — стражи
     (guards_of_frame). Кадр без кода (frame_of -> None, напр. внешнее/
     abstract-объявление) не роняет обход — помечается inconclusive и
-    пропускается (Review Focus)."""
+    пропускается (Review Focus). Конвейер передаёт include_arguments=False,
+    поскольку отдельно строит срез аргументов по DEX-дескриптору."""
     cls, _, method = key.partition("->")
-    w = backward_frames(dx, cls, method, exported=getattr(dx, "_exported", ()))
+    w = backward_frames(dx, cls, method, descriptor=descriptor)
     rec = {"key": key, "cls": cls, "method": method,
            "reached": w["reached"],
            "call_sites": [{"caller": s["caller"], "offset": s["offset"]} for s in w["call_sites"]],
            "guards": [], "guard_count": 0, "guard_count_coroutine": 0,
            "guard_count_framework": 0, "activation_cost": None,
-           "activation_exact": False, "args": [],
+           "activation_exact": False, "best_known_complete_cost": None, "args": [],
            "frontier": w["frontier"], "depth": w["depth"],
            "plumbing_skipped": w["plumbing_skipped"], "inconclusive": False,
            "arg_types": [], "suspend": False, "data_cost": "none",
@@ -1434,25 +1495,27 @@ def slice_key(dx, key):
     # Типы аргументов скрытого метода — собираем ВО ВРЕМЯ среза (dx уже загружен),
     # чтобы activate.py синтезировал args по типам без отдельной androguard-загрузки.
     # Continuation у suspend убираем из семантических — рантайм досылает его сам.
-    _pt = _param_types(_hidden_desc(dx, cls, method))
-    rec["suspend"] = bool(_pt) and _pt[-1] == _CONT
-    rec["arg_types"] = [t for t in _pt if t != _CONT]
-    rec["data_cost"] = _data_cost(rec["arg_types"])
     # рецепты постройки объектных DTO-аргументов (тир object Таблицы IV): они
     # транзиентны, в куче их нет ($choose пусто) — activate.py строит их $new.
-    rec["arg_recipes"] = _arg_recipes(dx, rec["arg_types"])
+    if include_arguments:
+        _pt = _param_types(descriptor or _hidden_desc(dx, cls, method))
+        rec["suspend"] = bool(_pt) and _pt[-1] == _CONT
+        rec["arg_types"] = [t for t in _pt if t != _CONT]
+        rec["data_cost"] = _data_cost(rec["arg_types"])
+        rec["arg_recipes"] = _arg_recipes(dx, rec["arg_types"])
     if not w["reached"]:
         # BFScan печатает JADX-алиасы имён (обфускация): такого класса/метода в DEX
         # нет вовсе — это артефакт статики, а не категория No caller
-        ca = dx.classes.get("L" + cls.replace(".", "/") + ";")
-        known = ca is not None and any(m.name == method for m in ca.get_methods())
+        known = bool(_declarations(dx, cls, method, descriptor))
         rec["notes"].append("no_caller" if known else "key_not_in_dex")
         return rec
     all_guards, seen, weight = [], set(), {}
+    missing_frames = set()
     for f in w["frames"]:
         fr = frame_of(f["ma"])
-        if fr is None:
+        if fr is None or fr["block_at"](f["offset"]) is None:
             rec["inconclusive"] = True
+            missing_frames.add(f["node"])
             continue
         node_real = 0
         for g in guards_of_frame(fr, f["offset"]):
@@ -1489,10 +1552,17 @@ def slice_key(dx, key):
     children = {}
     for parent, child in w["edges"]:
         children.setdefault(parent, set()).add(child)
-    tops = w["frontier_nodes"] | w["dead_end_nodes"] | w["capped_nodes"]
-    cost, exact = min_path_guards(weight, children, tops, w["frontier_nodes"], SINK)
-    # обход оборван по бюджету -> граф неполон, в точную Таблицу IV не берём
+    tops = (w["frontier_nodes"] | w["dead_end_nodes"] | w["capped_nodes"]
+            | w["uncertain_callers"] | w["unexamined_dispatch"] | missing_frames)
+    if w["budget_hit"]:
+        # An unprocessed initial site may have no guards at all.
+        tops.add(SINK)
+    cost, exact, complete = min_path_guards(weight, children, tops, w["frontier_nodes"], SINK,
+                                           uncertain_callers=w["uncertain_callers"], missing_frames=missing_frames)
     rec["activation_cost"], rec["activation_exact"] = cost, exact and not w["budget_hit"]
+    rec["best_known_complete_cost"] = complete
+    if missing_frames:
+        rec["notes"].append("missing_frame")
     if cost is None:
         # ни один top (фронтир/dead_end/depth_cap) не дотянулся до скрытого вызова:
         # все пути обрываются на плумбинге — стоимость активации не определена
@@ -1501,7 +1571,7 @@ def slice_key(dx, key):
     # §5.7) — по ПЕРВОМУ call-site (данных-ось не требует нескольких путей,
     # как guard-сторона; симметрично её простоте).
     first = w["call_sites"][0]
-    fr0 = frame_of(first["caller_ma"])
+    fr0 = frame_of(first["caller_ma"]) if include_arguments else None
     if fr0 is not None:
         rec["args"] = args_of_call(fr0, first["offset"], cls, method)
         asrc = arg_sources_of_call(fr0, first["offset"], cls, method)
@@ -1515,10 +1585,16 @@ def slice_key(dx, key):
         rec["notes"].append("depth_cap")
     if w["dead_ends"]:
         rec["notes"].append("dead_end")
+        reasons = {w["stop_reasons"][node] for node in w["dead_end_nodes"]}
+        rec["notes"].extend(f"dead_end:{reason}" for reason in sorted(reasons))
     if w["cha_used"]:
         # хотя бы один вызывающий найден по CHA (полиморфный вызов) — путь, а
         # значит и activation_cost, возможно over-approximated (§7.2)
         rec["notes"].append("cha")
+    if w["allocation_used"]:
+        rec["notes"].append("allocation_xref")
+    if w["unexamined_dispatch"]:
+        rec["notes"].append("unexamined_dispatch")
     if w["budget_hit"]:
         # обход упёрся в потолок кадров (взрывной fan-in) — граф неполон,
         # activation_cost ненадёжен; ключ честно помечается
@@ -1599,7 +1675,10 @@ def report(records, meta=None):
     if meta:
         w(f"Приложение: {meta.get('package')} versionName={meta.get('versionName')} "
           f"versionCode={meta.get('versionCode')}")
+    if meta and "status" in meta and "build" in meta:
+        w(f"Сборка: {meta['build']} | Статус артефакта: {meta['status']}")
     total = len(records)
+    w(f"Записей среза: {total}. Распределения ниже рассчитаны по записям среза.")
     reached = sum(r["reached"] for r in records)
     not_in_dex = sum(1 for r in records if "key_not_in_dex" in r["notes"])
     no_caller = sum(1 for r in records if not r["reached"]) - not_in_dex
@@ -1607,13 +1686,17 @@ def report(records, meta=None):
     inconcl = sum(1 for r in records if r.get("inconclusive"))
     coroutine_total = sum(r.get("guard_count_coroutine", 0) for r in records)
     framework_total = sum(r.get("guard_count_framework", 0) for r in records)
-    w(f"Всего ключей: {total} | reached: {reached} | no_caller: {no_caller} | "
+    w(f"Всего ключей: {len({r['key'] for r in records})} | reached: {reached} | no_caller: {no_caller} | "
       f"key_not_in_dex: {not_in_dex} | inconclusive: {inconcl}")
     w(f"Обход оборван не на фронтире (dead_end, стражи выше пути не видны): {dead}")
+    for reason in ("fanin_capped", "no_callers"):
+        keys = {r["key"] for r in records if "dead_end:" + reason in r["notes"]}
+        w(f"  dead_end:{reason}: {len(keys)} уникальных ключей")
+    w("Подгруппы dead_end могут пересекаться и не суммируются.")
     w(f"Стражи state-machine корутин (флагованы, исключены из guard_count и топа источников): {coroutine_total}")
     w(f"Стражи фреймворка/компилятора (флагованы, исключены из guard_count и топа источников): {framework_total}")
     dist = Counter(min(r["guard_count"], 4) for r in records if r["reached"])
-    w("Распределение guard_count — ВЕРХНЯЯ оценка, объединение стражей всех путей:")
+    w("Распределение guard_count — объединение стражей на исследованных путях:")
     for k in range(5):
         label = "4+" if k == 4 else str(k)
         w(f"  {label} стражей: {dist.get(k, 0)}")
@@ -1623,40 +1706,56 @@ def report(records, meta=None):
     lower = [r for r in records if r["reached"] and not r.get("activation_exact")
              and r.get("activation_cost") is not None]
     adist = Counter(min(r["activation_cost"], 4) for r in exact)
-    w(f"Стоимость активации (минимум по путям), ТОЧНО (путь до UI-входа): {len(exact)} ключей — "
-      f"это и есть Таблица IV:")
+    w(f"Точный минимум по статической модели до колбэка: {len(exact)} записей")
     for k in range(5):
         label = "4+" if k == 4 else str(k)
         w(f"  {label} стражей: {adist.get(k, 0)}")
-    w(f"Нижняя оценка (обход не дошёл до UI-входа, истинная стоимость не меньше): {len(lower)} ключей")
-    undet = sum(1 for r in records if r["reached"] and r.get("activation_cost") is None)
-    w(f"Стоимость не определена (обход завершился только на плумбинге, нет семантического входа): {undet} ключей")
+    w(f"Нижняя оценка (точный минимум до входа не установлен): {len(lower)} записей")
+    undet = [r for r in records if r.get("activation_cost") is None]
+    w(f"Стоимость не определена: {len(undet)} записей, из них без найденного места вызова: "
+      f"{sum(not r['reached'] for r in undet)}")
     # Стоимость ДАННЫХ (HTTP-аналог тиров «+Data support» RQ3): по типам аргументов
     # скрытого метода. none=нет аргументов (активируется прямым вызовом), primitive=
     # только примитивы (дефолты), object=есть объектные арги (нужен живой инстанс/синтез).
-    dc = Counter(r.get("data_cost", "none") for r in records if r["reached"])
-    susp = sum(1 for r in records if r["reached"] and r.get("suspend"))
-    w(f"Стоимость данных (типы аргументов скрытого метода): "
-      f"none(без аргументов): {dc.get('none', 0)} | "
-      f"primitive(только примитивы): {dc.get('primitive', 0)} | "
-      f"object(есть объектные): {dc.get('object', 0)} | из них suspend: {susp}")
-    src = Counter(g["operand"]["detail"] for r in records for g in r["guards"]
+    if any("data_cost" in r for r in records):
+        dc = Counter(r.get("data_cost", "none") for r in records if r["reached"])
+        susp = sum(1 for r in records if r["reached"] and r.get("suspend"))
+        w(f"Стоимость данных (типы аргументов скрытого метода): "
+          f"none(без аргументов): {dc.get('none', 0)} | "
+          f"primitive(только примитивы): {dc.get('primitive', 0)} | "
+          f"object(есть объектные): {dc.get('object', 0)} | из них suspend: {susp}")
+    src = Counter(g["operand"]["detail"] for r in records for g in r.get("guards", ())
                   if not g["notes"] and g["operand"]["source_kind"] in ("invoke", "field", "instanceof")
                   and g["operand"]["detail"])
-    w("Топ источников стражей:")
+    if src:
+        w("Топ источников стражей:")
     for name, n in src.most_common(15):
         w(f"  {n:3d}  {name}")
     w("")
-    for r in records:
-        tag = "HIDDEN" if r["reached"] else "NO-CALLER"
-        ac = r.get("activation_cost")
-        acs = (f"{ac}{'' if r.get('activation_exact') else '+'}" if ac is not None else "?")
-        w(f"[{tag}] {r['key']}  activation_cost={acs} guard_count(union)={r['guard_count']} "
-          f"frontier={r['frontier']} notes={r['notes']}")
-        for g in r["guards"]:
-            o = g["operand"]
-            flag = f" [{','.join(g['notes'])}]" if g["notes"] else ""
-            w(f"    {g['opcode']} {g['sense']}  <- {o['source_kind']}:{o['detail']}  @{g['frame']}{flag}")
+    sections = [
+        ("Точная оценка (exact)", exact),
+        ("Нижняя оценка (lower)", lower),
+        ("Неопределённая стоимость (undet)", undet),
+    ]
+    for title, group in sections:
+        w(f"{title} — {len(group)}")
+        for r in group:
+            tag = "HIDDEN" if r["reached"] else "NO-CALLER"
+            ac = r.get("activation_cost")
+            acs = (f"{ac}{'' if r.get('activation_exact') else '+'}" if ac is not None else "?")
+            frontier = f"frontier={r['frontier']} " if "frontier" in r else ""
+            name = r["key"] + (r.get("descriptor") or "")
+            declaration = f"declaration_id={r['declaration_id']} " if "declaration_id" in r else ""
+            best = r.get("best_known_complete_cost")
+            best_text = str(best) if best is not None else "?"
+            w(f"[{tag}] {name}  {declaration}activation_cost={acs} best_known_complete_cost={best_text} "
+              f"guard_count(union)={r['guard_count']} "
+              f"{frontier}notes={r['notes']}")
+            for g in r.get("guards", ()):
+                o = g["operand"]
+                flag = f" [{','.join(g['notes'])}]" if g["notes"] else ""
+                w(f"    {g['opcode']} {g['sense']}  <- {o['source_kind']}:{o['detail']}  @{g['frame']}{flag}")
+        w("")
     return "\n".join(lines)
 
 
@@ -1706,6 +1805,12 @@ def _check_report():
     # общее число флагованных стражей каждого вида видно отдельной строкой
     assert "Стражи state-machine корутин" in txt and "1" in txt.split("корутин")[1].split("\n")[0]
     assert "Стражи фреймворка/компилятора" in txt and "1" in txt.split("компилятора")[1].split("\n")[0]
+    both = dict(recs[0], notes=["dead_end", "dead_end:fanin_capped", "dead_end:no_callers"])
+    grouped = report([dict(both, declaration_id=1), dict(both, declaration_id=2), recs[1]])
+    assert "Всего ключей: 2" in grouped
+    assert all(f"dead_end:{r}: 1 уникальных ключей" in grouped for r in ("fanin_capped", "no_callers"))
+    assert grouped.count("[HIDDEN] a->x") == 2
+    assert grouped.index("(exact)") < grouped.index("(lower)") < grouped.index("(undet)")
     print("  report ok")
 
 
@@ -1761,7 +1866,6 @@ def main():
     print(f"[срез] скрытых ключей: {len(keys)}; загрузка APK (androguard, ~1–2 мин)...",
           file=sys.stderr)
     apk_obj, dx = load_apk(args.apk)
-    dx._exported = manifest_entry_classes(apk_obj)  # §7.2: exported — фронтир обхода
     # Spec §4: паритет сборки со static+dynamic (как diff.py) — пакет/версия
     # из манифеста, который androguard уже распарсил внутри load_apk.
     meta = {"package": apk_obj.get_package(),
